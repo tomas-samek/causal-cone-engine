@@ -9,8 +9,8 @@
 
 use glam::IVec3;
 
-/// Field resolution — 128³ for v0.1 (2M cells, ~8MB at f32)
-pub const FIELD_SIZE: u32 = 128;
+/// Field resolution — 64³ (262K cells, ~4MB at f32)
+pub const FIELD_SIZE: u32 = 64;
 pub const FIELD_CELLS: usize = (FIELD_SIZE * FIELD_SIZE * FIELD_SIZE) as usize;
 
 /// A single deposit in the field
@@ -87,30 +87,35 @@ impl DiffField {
     fn spawn_demo_scene(&mut self) {
         let center = FIELD_SIZE as f32 / 2.0;
 
-        // A cluster of entities forming a "wall"
-        for x in 0..20 {
-            for y in 0..20 {
+        // Wall — 12x12 striped colors
+        for x in 0..12 {
+            for y in 0..12 {
+                let color = match (x + y) % 4 {
+                    0 => [0.2, 0.3, 1.0], // blue
+                    1 => [1.0, 0.9, 0.1], // yellow
+                    2 => [1.0, 0.2, 0.5], // pink
+                    _ => [0.1, 0.8, 0.7], // teal
+                };
                 self.entities.push(Entity {
                     position: glam::Vec3::new(
-                        center + x as f32 * 2.0 - 20.0,
-                        center + y as f32 * 2.0 - 20.0,
-                        center + 30.0, // wall 30 cells ahead
+                        center + x as f32 - 6.0,
+                        center + y as f32 - 6.0,
+                        center + 15.0, // wall 15 cells ahead
                     ),
                     velocity: glam::Vec3::ZERO,
                     deposit_magnitude: 2.0,
-                    color: [0.8, 0.6, 0.3], // warm wall color
+                    color,
                 });
             }
         }
 
-        // A sphere of entities
-        let sphere_center = glam::Vec3::new(center - 15.0, center, center + 20.0);
-        let sphere_radius = 8.0;
-        for i in 0..500 {
-            // Fibonacci sphere distribution
+        // Sphere — 200 entities
+        let sphere_center = glam::Vec3::new(center - 8.0, center, center + 10.0);
+        let sphere_radius = 4.0;
+        for i in 0..200 {
             let golden = (1.0 + 5.0_f32.sqrt()) / 2.0;
             let theta = 2.0 * std::f32::consts::PI * i as f32 / golden;
-            let phi = (1.0 - 2.0 * (i as f32 + 0.5) / 500.0).acos();
+            let phi = (1.0 - 2.0 * (i as f32 + 0.5) / 200.0).acos();
 
             let pos = sphere_center
                 + glam::Vec3::new(
@@ -123,30 +128,37 @@ impl DiffField {
                 position: pos,
                 velocity: glam::Vec3::ZERO,
                 deposit_magnitude: 1.5,
-                color: [0.3, 0.5, 0.9], // cool blue sphere
+                color: [0.3, 0.5, 0.9],
             });
         }
 
-        // A moving entity — orbiting point
+        // Moving red entity
         self.entities.push(Entity {
-            position: glam::Vec3::new(center, center + 10.0, center + 15.0),
-            velocity: glam::Vec3::new(0.3, 0.0, 0.1),
-            deposit_magnitude: 5.0,
-            color: [1.0, 0.2, 0.2], // bright red — hot moving object
+            position: glam::Vec3::new(center, center + 5.0, center + 8.0),
+            velocity: glam::Vec3::new(0.2, 0.0, 0.05),
+            deposit_magnitude: 4.0,
+            color: [1.0, 0.2, 0.2],
         });
 
-        // Floor plane
-        for x in 0..40 {
-            for z in 0..40 {
+        // LIGHT SOURCE — warm yellow, moves toward the wall
+        self.entities.push(Entity {
+            position: glam::Vec3::new(center, center, center - 5.0),
+            velocity: glam::Vec3::new(0.0, 0.0, 0.12),
+            deposit_magnitude: 6.0,
+            color: [1.0, 0.85, 0.3],
+        });
+
+        // Floor — 20x20
+        for x in 0..20 {
+            for z in 0..20 {
                 self.entities.push(Entity {
                     position: glam::Vec3::new(
-                        center + x as f32 * 2.0 - 40.0,
-                        center - 20.0, // below observer
-                        center + z as f32 * 2.0 - 20.0,
+                        center + x as f32 - 10.0,
+                        center - 10.0,
+                        center + z as f32 - 5.0,
                     ),
                     velocity: glam::Vec3::ZERO,
                     deposit_magnitude: 1.0,
-                    // Checkerboard pattern
                     color: if (x + z) % 2 == 0 {
                         [0.6, 0.6, 0.6]
                     } else {
@@ -157,9 +169,8 @@ impl DiffField {
         }
 
         log::info!(
-            "Demo scene: {} entities ({} wall + 500 sphere + 1 orbiter + 1600 floor)",
-            self.entities.len(),
-            20 * 20
+            "Demo scene: {} entities (144 wall + 200 sphere + 2 movers + 400 floor)",
+            self.entities.len()
         );
     }
 
@@ -199,10 +210,12 @@ impl DiffField {
         //
         // For v0.1 we do this on CPU. v0.2 moves this to a compute shader.
         // The spreading factor controls how fast deposits dilute.
-        let spread_factor: f32 = 0.005; // very gentle spreading
+        let spread_factor: f32 = 0.03; // balance: light reaches wall but entities stay sharp
 
         // We need a copy to read from while writing
         let old = self.cells.clone();
+
+        let decay: f32 = 0.99; // gentler decay — light reaches further before fading
 
         for z in 1..(FIELD_SIZE - 1) {
             for y in 1..(FIELD_SIZE - 1) {
@@ -210,43 +223,28 @@ impl DiffField {
                     let idx = Self::index(x, y, z);
                     let current = old[idx];
 
-                    if current.density < 0.001 {
-                        // Check if any neighbor has something to spread
-                        let neighbors = [
-                            old[Self::index(x - 1, y, z)],
-                            old[Self::index(x + 1, y, z)],
-                            old[Self::index(x, y - 1, z)],
-                            old[Self::index(x, y + 1, z)],
-                            old[Self::index(x, y, z - 1)],
-                            old[Self::index(x, y, z + 1)],
-                        ];
+                    // Every cell participates in diffusion — pull from neighbors
+                    let neighbors = [
+                        old[Self::index(x - 1, y, z)],
+                        old[Self::index(x + 1, y, z)],
+                        old[Self::index(x, y - 1, z)],
+                        old[Self::index(x, y + 1, z)],
+                        old[Self::index(x, y, z - 1)],
+                        old[Self::index(x, y, z + 1)],
+                    ];
 
-                        let neighbor_density: f32 =
-                            neighbors.iter().map(|n| n.density).sum::<f32>() / 6.0;
+                    let avg_d: f32 = neighbors.iter().map(|n| n.density).sum::<f32>() / 6.0;
+                    let avg_r: f32 = neighbors.iter().map(|n| n.color_r).sum::<f32>() / 6.0;
+                    let avg_g: f32 = neighbors.iter().map(|n| n.color_g).sum::<f32>() / 6.0;
+                    let avg_b: f32 = neighbors.iter().map(|n| n.color_b).sum::<f32>() / 6.0;
 
-                        if neighbor_density > 0.001 {
-                            let neighbor_r: f32 =
-                                neighbors.iter().map(|n| n.color_r).sum::<f32>() / 6.0;
-                            let neighbor_g: f32 =
-                                neighbors.iter().map(|n| n.color_g).sum::<f32>() / 6.0;
-                            let neighbor_b: f32 =
-                                neighbors.iter().map(|n| n.color_b).sum::<f32>() / 6.0;
-
-                            let cell = &mut self.cells[idx];
-                            cell.density += neighbor_density * spread_factor;
-                            cell.color_r += neighbor_r * spread_factor;
-                            cell.color_g += neighbor_g * spread_factor;
-                            cell.color_b += neighbor_b * spread_factor;
-                        }
-                    } else {
-                        // Cell has density — spread some to neighbors (handled by their reads)
-                        // Just apply mild decay to prevent infinite accumulation
-                        let cell = &mut self.cells[idx];
-                        cell.density *= 0.99;
-                        cell.color_r *= 0.99;
-                        cell.color_g *= 0.99;
-                        cell.color_b *= 0.99;
-                    }
+                    // Blend: cell moves toward neighbor average by spread_factor
+                    // Entities stay sharp because they re-deposit every tick
+                    let cell = &mut self.cells[idx];
+                    cell.density = (current.density * (1.0 - spread_factor) + avg_d * spread_factor) * decay;
+                    cell.color_r = (current.color_r * (1.0 - spread_factor) + avg_r * spread_factor) * decay;
+                    cell.color_g = (current.color_g * (1.0 - spread_factor) + avg_g * spread_factor) * decay;
+                    cell.color_b = (current.color_b * (1.0 - spread_factor) + avg_b * spread_factor) * decay;
                 }
             }
         }
