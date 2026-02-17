@@ -37,7 +37,7 @@ impl Observer {
     pub fn new() -> Self {
         Self {
             // Start in the middle of a 128³ field
-            position: Vec3::new(32.0, 32.0, 32.0),
+            position: Vec3::new(64.0, 64.0, 64.0),
             velocity: Vec3::ZERO,
             yaw: std::f32::consts::FRAC_PI_2, // face +Z toward the wall
             pitch: 0.0,

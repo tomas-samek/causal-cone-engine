@@ -136,7 +136,7 @@ impl Renderer {
             label: Some("Uniforms"),
             contents: bytemuck::cast_slice(&[Uniforms {
                 inv_view_proj: glam::Mat4::IDENTITY.to_cols_array(),
-                observer_pos: [32.0, 32.0, 32.0],
+                observer_pos: [64.0, 64.0, 64.0],
                 observer_speed: 0.0,
                 field_size: [FIELD_SIZE as f32; 3],
                 tick: 0.0,
