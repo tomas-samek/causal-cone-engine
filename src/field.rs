@@ -93,7 +93,7 @@ impl Entity {
             is_vacuum: false,
             scatter: 0.0,
             specular: 0.0,
-            reemit: 0.7, // surfaces re-emit 70% — only way to be visible
+            reemit: 0.3, // surfaces re-emit 30% — absorb most, not mirror-like
             reemit_r: 0.0,
             reemit_g: 0.0,
             reemit_b: 0.0,
@@ -133,7 +133,8 @@ impl DiffField {
         };
 
         field.spawn_demo_scene();
-        field.build_all_edges(3.5, 15.0);
+        field.build_connections(3.5);
+        field.build_radiation_links(15.0);
         field.deliveries = vec![EdgeDeposit::default(); field.entities.len()];
 
         field
@@ -152,26 +153,24 @@ impl DiffField {
             && z < FIELD_SIZE as i32
     }
 
-    /// Build all edges (connections + radiation links) into flat SoA arrays.
-    /// Two-phase: collect into temp per-entity vecs, then flatten for cache locality.
-    fn build_all_edges(&mut self, connect_dist: f32, radiation_dist: f32) {
+    /// Build connection edges and detect heat. Entities within connect_dist get bidirectional edges.
+    /// Also detects interior (heat) entities that are fully surrounded by absorbing neighbors.
+    fn build_connections(&mut self, connect_dist: f32) {
         let connect_dist_sq = connect_dist * connect_dist;
-        let radiation_dist_sq = radiation_dist * radiation_dist;
-        let radiation_min_sq = connect_dist * connect_dist; // radiation starts where connections end
         let n = self.entities.len();
 
         let positions: Vec<glam::Vec3> = self.entities.iter().map(|e| e.position).collect();
 
-        // Phase 1: collect edges into temp per-entity vecs
+        // Collect connection edges into temp per-entity vecs
         let mut temp_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut connection_edges = 0u64;
+        let mut connection_count = 0u64;
         for i in 0..n {
             for j in (i + 1)..n {
                 let dist_sq = positions[i].distance_squared(positions[j]);
                 if dist_sq < connect_dist_sq {
                     temp_edges[i].push(j);
                     temp_edges[j].push(i);
-                    connection_edges += 1;
+                    connection_count += 1;
                 }
             }
         }
@@ -179,11 +178,11 @@ impl DiffField {
         log::info!(
             "Graph built: {} entities, {} connection edges (avg {:.1} per entity)",
             n,
-            connection_edges,
-            (connection_edges * 2) as f32 / n as f32
+            connection_count,
+            (connection_count * 2) as f32 / n as f32
         );
 
-        // Detect interior (heat) entities before radiation links.
+        // Detect interior (heat) entities.
         // If an entity has absorbing neighbors covering all 6 cardinal directions,
         // its own emissions can't escape — energy turns to heat.
         let mut heat_count = 0;
@@ -214,23 +213,64 @@ impl DiffField {
             heat_count
         );
 
-        // Phase 2: radiation links — long-range surface-to-surface
-        let mut radiation_edges = 0u64;
+        // Flatten into SoA
+        self.flatten_edges(temp_edges);
+
+        log::info!(
+            "Edge SoA: {} connection edges, {:.1} MB contiguous",
+            self.edge_targets.len(),
+            (self.edge_targets.len() * (std::mem::size_of::<usize>() + std::mem::size_of::<EdgeDeposit>())) as f64 / 1_048_576.0
+        );
+    }
+
+    /// Build radiation links — direct surface-to-surface edges for non-vacuum, non-heat
+    /// entities within max_dist. Skips pairs already connected (dist < 3.5).
+    fn build_radiation_links(&mut self, max_dist: f32) {
+        let max_dist_sq = max_dist * max_dist;
+        let short_dist_sq = 3.5_f32 * 3.5;
+        let n = self.entities.len();
+
+        let positions: Vec<glam::Vec3> = self.entities.iter().map(|e| e.position).collect();
+
+        // Reconstruct per-entity edge lists from existing SoA
+        let mut temp_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, entity) in self.entities.iter().enumerate() {
+            let start = entity.edge_start as usize;
+            let end = start + entity.edge_count as usize;
+            for k in start..end {
+                temp_edges[i].push(self.edge_targets[k]);
+            }
+        }
+
+        // Add radiation links
+        let mut count = 0u64;
         for i in 0..n {
             if self.entities[i].is_vacuum || self.entities[i].is_heat { continue; }
             for j in (i + 1)..n {
                 if self.entities[j].is_vacuum || self.entities[j].is_heat { continue; }
                 let dist_sq = positions[i].distance_squared(positions[j]);
-                if dist_sq >= radiation_min_sq && dist_sq < radiation_dist_sq {
+                if dist_sq >= short_dist_sq && dist_sq < max_dist_sq {
                     temp_edges[i].push(j);
                     temp_edges[j].push(i);
-                    radiation_edges += 1;
+                    count += 1;
                 }
             }
         }
-        log::info!("Radiation links: {} direct surface-to-surface edges", radiation_edges);
+        log::info!("Radiation links: {} direct surface-to-surface edges", count);
 
-        // Phase 3: flatten into SoA
+        // Re-flatten into SoA
+        self.flatten_edges(temp_edges);
+
+        log::info!(
+            "Edge SoA: {} total directed edges ({} radiation), {:.1} MB contiguous",
+            self.edge_targets.len(),
+            count * 2,
+            (self.edge_targets.len() * (std::mem::size_of::<usize>() + std::mem::size_of::<EdgeDeposit>())) as f64 / 1_048_576.0
+        );
+    }
+
+    /// Flatten per-entity edge lists into SoA arrays for cache-friendly iteration.
+    fn flatten_edges(&mut self, temp_edges: Vec<Vec<usize>>) {
         let total: usize = temp_edges.iter().map(|e| e.len()).sum();
         self.edge_targets = Vec::with_capacity(total);
         self.edge_deposits = vec![EdgeDeposit::default(); total];
@@ -243,14 +283,6 @@ impl DiffField {
             }
             offset += edges.len() as u32;
         }
-
-        log::info!(
-            "Edge SoA: {} total directed edges ({} connection + {} radiation), {:.1} MB contiguous",
-            total,
-            connection_edges * 2,
-            radiation_edges * 2,
-            (total * (std::mem::size_of::<usize>() + std::mem::size_of::<EdgeDeposit>())) as f64 / 1_048_576.0
-        );
     }
 
     /// Fill an ellipsoid with entities
@@ -455,7 +487,7 @@ impl DiffField {
                 );
                 e.pass_through = 0.5;
                 e.specular = 0.3;     // waxy cuticle
-                e.reemit = 0.9;       // near-perfect re-emitter — floor is the main bounce surface
+                e.reemit = 0.3;       // low re-emission — shadows stay dark
                 self.entities.push(e);
             }
         }
@@ -467,7 +499,7 @@ impl DiffField {
         // Light propagates through this network. Dino body BLOCKS paths by absorbing.
         // Shadow = where dino interrupts vacuum relay chains between light and floor.
         let vac_spacing = 3.0;
-        let vac_start = glam::Vec3::new(center - 30.0, center - 14.0, center - 25.0);
+        let vac_start = glam::Vec3::new(center - 30.0, center - 8.0, center - 25.0);
         let vac_end = glam::Vec3::new(center + 30.0, center + 32.0, center + 25.0); // up to sun
 
         let mut vx = vac_start.x;
@@ -485,26 +517,24 @@ impl DiffField {
                         let mut e = Entity::new(
                             pos,
                             glam::Vec3::ZERO,
-                            0.01, // nearly invisible — vacuum doesn't glow
+                            0.0, // invisible — vacuum doesn't glow
                             [0.0, 0.0, 0.0],
                         );
                         e.pass_through = 0.95; // air is nearly transparent
                         e.is_vacuum = true;
-                        // Below sun = atmosphere. Upper atmosphere emits (sky dome).
-                        // Lower atmosphere just relays with blue scatter.
+                        // Below sun = atmosphere. Inverted gradient:
+                        // Bottom (near floor) = dense, high scatter/magnitude — delivers light to surfaces.
+                        // Top (near sun) = thin, sparse — just relays sunlight down.
                         if vy < sun_y {
                             let height_frac = (vy - (center - 13.0)) / (sun_y - (center - 13.0)); // 0=floor, 1=sun
-                            if height_frac > 0.7 {
-                                // Upper atmosphere — acts as sky dome emitter
-                                // Sun has had time to diffuse across the whole sky
-                                e.deposit_magnitude = 3.0;
-                                e.color = [0.8, 0.85, 1.0]; // warm sky white-blue
-                            } else {
-                                // Lower atmosphere — just relays with blue scatter
-                                e.scatter = 0.002;
-                                e.deposit_magnitude = 0.001;
-                                e.color = [0.3, 0.4, 1.0]; // Rayleigh blue
-                            }
+                            let bottom_weight = 1.0 - height_frac; // 1.0 at floor, 0.0 at sun
+                            e.scatter = 0.00002;
+                            e.deposit_magnitude = 0.1 + 4.0 * bottom_weight;
+                            e.color = [
+                                0.4 + 0.4 * bottom_weight,  // warmer near ground
+                                0.5 + 0.35 * bottom_weight,
+                                0.9 + 0.1 * height_frac,    // bluer up high
+                            ];
                         }
                         self.entities.push(e);
                     }
@@ -692,12 +722,15 @@ impl DiffField {
             if Self::in_bounds(ix, iy, iz) {
                 let idx = Self::index(ix as u32, iy as u32, iz as u32);
                 let mag = entity.deposit_magnitude;
+                let absorbed = 1.0 - entity.pass_through;
 
-                // Own deposit + incoming light + re-emission glow
-                let total_r = entity.color[0] * mag + entity.incoming.r + entity.reemit_r;
-                let total_g = entity.color[1] * mag + entity.incoming.g + entity.reemit_g;
-                let total_b = entity.color[2] * mag + entity.incoming.b + entity.reemit_b;
-                let total_d = mag + entity.incoming.density;
+                // Own emission (intrinsic glow) + absorbed incoming filtered by surface color.
+                // Only what the entity KEEPS is visible — photons that stopped here.
+                // Re-emission is derived from absorbed light, already folded into reemit_r/g/b.
+                let total_r = entity.color[0] * mag + entity.incoming.r * absorbed * entity.color[0] + entity.reemit_r;
+                let total_g = entity.color[1] * mag + entity.incoming.g * absorbed * entity.color[1] + entity.reemit_g;
+                let total_b = entity.color[2] * mag + entity.incoming.b * absorbed * entity.color[2] + entity.reemit_b;
+                let total_d = mag + entity.incoming.density * absorbed;
 
                 let cell = &mut self.cells[idx];
                 cell.density = (cell.density + total_d).min(50.0);

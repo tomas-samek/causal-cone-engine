@@ -7,7 +7,7 @@
 // A photon has no mass, no energy, no choice. It IS the stream.
 // The observer is not the stream. It moves through the stream.
 
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat4, Vec3};
 use std::collections::HashSet;
 use winit::keyboard::KeyCode;
 
