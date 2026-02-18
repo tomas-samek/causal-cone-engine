@@ -26,6 +26,11 @@ struct Uniforms {
     field_size: [f32; 3],
     /// Current tick
     tick: f32,
+    /// AABB of active solid geometry (for ray march culling)
+    aabb_min: [f32; 3],
+    _pad1: f32,
+    aabb_max: [f32; 3],
+    _pad2: f32,
 }
 
 pub struct Renderer {
@@ -46,6 +51,7 @@ pub struct Renderer {
 
     // The field data on CPU
     diff_field: DiffField,
+    last_uploaded_tick: u64,
 }
 
 impl Renderer {
@@ -97,7 +103,7 @@ impl Renderer {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::AutoNoVsync,
+            present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -136,10 +142,14 @@ impl Renderer {
             label: Some("Uniforms"),
             contents: bytemuck::cast_slice(&[Uniforms {
                 inv_view_proj: glam::Mat4::IDENTITY.to_cols_array(),
-                observer_pos: [64.0, 64.0, 64.0],
+                observer_pos: [64.0, 64.0, 95.0],
                 observer_speed: 0.0,
                 field_size: [FIELD_SIZE as f32; 3],
                 tick: 0.0,
+                aabb_min: [0.0; 3],
+                _pad1: 0.0,
+                aabb_max: [FIELD_SIZE as f32; 3],
+                _pad2: 0.0,
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -268,6 +278,7 @@ impl Renderer {
             field_texture,
             field_bind_group,
             diff_field,
+            last_uploaded_tick: 0,
         }
     }
 
@@ -280,35 +291,46 @@ impl Renderer {
         }
     }
 
-    /// Run one simulation tick — update field, upload to GPU
+    /// Run one simulation tick
     pub fn tick(&mut self, observer: &Observer) {
-        // Advance the diff field
         self.diff_field.tick();
-
-        // Upload field to GPU 3D texture
-        self.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.field_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            self.diff_field.as_bytes(),
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(FIELD_SIZE * std::mem::size_of::<FieldCell>() as u32),
-                rows_per_image: Some(FIELD_SIZE),
-            },
-            wgpu::Extent3d {
-                width: FIELD_SIZE,
-                height: FIELD_SIZE,
-                depth_or_array_layers: FIELD_SIZE,
-            },
-        );
     }
 
     /// Render one frame — sample the field from the observer's perspective
     pub fn render(&mut self, observer: &Observer) -> Result<(), wgpu::SurfaceError> {
+        // Upload only dirty slabs when simulation has advanced
+        if self.diff_field.tick != self.last_uploaded_tick {
+            let bytes_per_cell = std::mem::size_of::<FieldCell>();
+            let slab_bytes = (FIELD_SIZE * FIELD_SIZE) as usize * bytes_per_cell;
+            let field_bytes = self.diff_field.as_bytes();
+            let bytes_per_row = FIELD_SIZE * bytes_per_cell as u32;
+
+            for z in 0..FIELD_SIZE as usize {
+                if !self.diff_field.dirty_slabs[z] { continue; }
+                let offset = z * slab_bytes;
+                self.queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &self.field_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: 0, y: 0, z: z as u32 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &field_bytes[offset..offset + slab_bytes],
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(FIELD_SIZE),
+                    },
+                    wgpu::Extent3d {
+                        width: FIELD_SIZE,
+                        height: FIELD_SIZE,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            self.last_uploaded_tick = self.diff_field.tick;
+        }
+
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -327,6 +349,10 @@ impl Renderer {
             observer_speed: observer.speed(),
             field_size: [FIELD_SIZE as f32; 3],
             tick: self.diff_field.tick as f32,
+            aabb_min: self.diff_field.aabb_min.to_array(),
+            _pad1: 0.0,
+            aabb_max: self.diff_field.aabb_max.to_array(),
+            _pad2: 0.0,
         };
 
         self.queue

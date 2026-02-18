@@ -36,10 +36,10 @@ pub struct Observer {
 impl Observer {
     pub fn new() -> Self {
         Self {
-            // Start in the middle of a 128³ field
-            position: Vec3::new(64.0, 64.0, 64.0),
+            // Start in front of the dino's face, looking back at it
+            position: Vec3::new(64.0, 64.0, 95.0),
             velocity: Vec3::ZERO,
-            yaw: std::f32::consts::FRAC_PI_2, // face +Z toward the wall
+            yaw: -std::f32::consts::FRAC_PI_2, // face -Z toward the dino
             pitch: 0.0,
             base_fov: std::f32::consts::FRAC_PI_2, // 90 degrees
         }

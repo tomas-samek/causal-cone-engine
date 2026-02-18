@@ -17,6 +17,10 @@ struct Uniforms {
     observer_speed: f32,
     field_size: vec3<f32>,
     tick: f32,
+    aabb_min: vec3<f32>,
+    _pad1: f32,
+    aabb_max: vec3<f32>,
+    _pad2: f32,
 }
 
 @group(0) @binding(0)
@@ -97,14 +101,28 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var accumulated_color = vec3<f32>(0.0);
     var accumulated_alpha = 0.0;
 
+    // Ray-AABB intersection (slab method) — skip empty space
+    let inv_dir = 1.0 / ray_dir;
+    let t1 = (u.aabb_min - u.observer_pos) * inv_dir;
+    let t2 = (u.aabb_max - u.observer_pos) * inv_dir;
+    let t_min_v = min(t1, t2);
+    let t_max_v = max(t1, t2);
+    let t_enter = max(max(t_min_v.x, t_min_v.y), t_min_v.z);
+    let t_exit = min(min(t_max_v.x, t_max_v.y), t_max_v.z);
+
+    // If ray misses AABB entirely, return background
+    if t_enter > t_exit || t_exit < 0.0 {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+
     // March parameters
     let max_steps = 128u;
     var step_size = 0.5; // start with half-cell steps for precision
     let step_growth = 1.02; // each step slightly larger (logarithmic march)
     let density_threshold = 0.01; // minimum density to register as a hit
-    let max_distance = 200.0; // don't march beyond this
+    let max_distance = min(t_exit, 200.0); // clip to AABB exit
 
-    var distance = 1.0; // start 1 cell ahead (not at observer position)
+    var distance = max(t_enter, 1.0); // start at AABB entry (or 1 cell ahead if inside)
 
     for (var i = 0u; i < max_steps; i = i + 1u) {
         let sample_pos = u.observer_pos + ray_dir * f32(distance);
@@ -149,8 +167,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // Background: very dark blue, simulating empty vacuum
-    let background = vec3<f32>(0.02, 0.02, 0.05);
+    // Background: pitch black — the void beyond the field
+    let background = vec3<f32>(0.0, 0.0, 0.0);
     let final_color = accumulated_color + background * (1.0 - accumulated_alpha);
 
     // Velocity-dependent vignette — faster observer = darker edges
