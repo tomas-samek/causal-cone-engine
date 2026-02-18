@@ -11,6 +11,27 @@
 pub const FIELD_SIZE: u32 = 128;
 pub const FIELD_CELLS: usize = (FIELD_SIZE * FIELD_SIZE * FIELD_SIZE) as usize;
 
+// Entity group IDs for scene organization
+pub const GROUP_NONE: u16 = 0;
+pub const GROUP_BODY: u16 = 1;
+pub const GROUP_BELLY: u16 = 2;
+pub const GROUP_TAIL: u16 = 3;
+pub const GROUP_TAIL_TIP: u16 = 4;
+pub const GROUP_NECK: u16 = 5;
+pub const GROUP_HEAD: u16 = 6;
+pub const GROUP_JAW: u16 = 7;
+pub const GROUP_MOUTH: u16 = 8;
+pub const GROUP_EYE: u16 = 9;
+pub const GROUP_LEG_L: u16 = 10;
+pub const GROUP_FOOT_L: u16 = 11;
+pub const GROUP_LEG_R: u16 = 12;
+pub const GROUP_FOOT_R: u16 = 13;
+pub const GROUP_ARM_L: u16 = 14;
+pub const GROUP_ARM_R: u16 = 15;
+pub const GROUP_SUN: u16 = 16;
+pub const GROUP_FLOOR: u16 = 17;
+pub const GROUP_VACUUM: u16 = 18;
+
 /// A single deposit in the field
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
@@ -79,6 +100,8 @@ pub struct Entity {
     pub edge_count: u32,
     /// What arrived this tick from all incoming edges (read-only after delivery)
     pub incoming: EdgeDeposit,
+    /// Which body part / scene element this entity belongs to
+    pub group: u16,
 }
 
 impl Entity {
@@ -100,6 +123,7 @@ impl Entity {
             edge_start: 0,
             edge_count: 0,
             incoming: EdgeDeposit::default(),
+            group: GROUP_NONE,
         }
     }
 }
@@ -116,6 +140,7 @@ pub struct DiffField {
     // SoA edge storage — flat contiguous arrays for cache-friendly iteration
     edge_targets: Vec<usize>,
     edge_deposits: Vec<EdgeDeposit>,
+    edge_gammas: Vec<f32>,
 }
 
 impl DiffField {
@@ -130,6 +155,7 @@ impl DiffField {
             dirty_slabs: [true; FIELD_SIZE as usize],
             edge_targets: Vec::new(),
             edge_deposits: Vec::new(),
+            edge_gammas: Vec::new(),
         };
 
         field.spawn_demo_scene();
@@ -274,6 +300,7 @@ impl DiffField {
         let total: usize = temp_edges.iter().map(|e| e.len()).sum();
         self.edge_targets = Vec::with_capacity(total);
         self.edge_deposits = vec![EdgeDeposit::default(); total];
+        self.edge_gammas = vec![1.0; total];
         let mut offset = 0u32;
         for (i, edges) in temp_edges.iter().enumerate() {
             self.entities[i].edge_start = offset;
@@ -294,6 +321,7 @@ impl DiffField {
         magnitude: f32,
         spacing: f32,
         pass_through: f32,
+        group: u16,
     ) {
         let rx = radii.x;
         let ry = radii.y;
@@ -315,6 +343,7 @@ impl DiffField {
                             color,
                         );
                         e.pass_through = pass_through;
+                        e.group = group;
                         self.entities.push(e);
                     }
                     z += spacing;
@@ -340,104 +369,104 @@ impl DiffField {
         self.fill_ellipsoid(
             base + glam::Vec3::new(0.0, 5.0, 0.0),
             glam::Vec3::new(5.0, 6.0, 8.0),
-            green, 0.05, sp, 0.3, // nearly dark — visible only from reflected light
+            green, 0.05, sp, 0.3, GROUP_BODY,
         );
 
         // BELLY — slightly lighter, extends lower to catch floor bounce
         self.fill_ellipsoid(
             base + glam::Vec3::new(0.0, 1.0, 0.0),
             glam::Vec3::new(4.5, 4.0, 7.0),
-            belly, 0.05, sp, 0.45, // visible only from reflected light
+            belly, 0.05, sp, 0.45, GROUP_BELLY,
         );
 
         // TAIL — tapers backward (-Z)
         self.fill_ellipsoid(
             base + glam::Vec3::new(0.0, 5.5, -12.0),
             glam::Vec3::new(2.5, 2.5, 7.0),
-            green, 0.05, sp, 0.3,
+            green, 0.05, sp, 0.3, GROUP_TAIL,
         );
         self.fill_ellipsoid(
             base + glam::Vec3::new(0.0, 5.5, -20.0),
             glam::Vec3::new(1.2, 1.2, 4.0),
-            dark_green, 0.05, sp, 0.25,
+            dark_green, 0.05, sp, 0.25, GROUP_TAIL_TIP,
         );
 
         // NECK — tilted upward
         self.fill_ellipsoid(
             base + glam::Vec3::new(0.0, 10.0, 8.0),
             glam::Vec3::new(3.0, 5.0, 3.0),
-            green, 0.05, sp, 0.3,
+            green, 0.05, sp, 0.3, GROUP_NECK,
         );
 
         // HEAD — on top of neck
         self.fill_ellipsoid(
             base + glam::Vec3::new(0.0, 16.0, 10.0),
             glam::Vec3::new(3.5, 3.0, 5.0),
-            green, 0.05, sp, 0.3,
+            green, 0.05, sp, 0.3, GROUP_HEAD,
         );
 
         // JAW — below head, slightly forward
         self.fill_ellipsoid(
             base + glam::Vec3::new(0.0, 13.5, 12.0),
             glam::Vec3::new(2.5, 1.5, 4.0),
-            dark_green, 0.05, sp, 0.25,
+            dark_green, 0.05, sp, 0.25, GROUP_JAW,
         );
 
         // MOUTH interior
         self.fill_ellipsoid(
             base + glam::Vec3::new(0.0, 14.5, 13.0),
             glam::Vec3::new(2.0, 0.8, 3.0),
-            mouth, 0.05, sp, 0.15,
+            mouth, 0.05, sp, 0.15, GROUP_MOUTH,
         );
 
         // EYES — two small bright spheres (nearly opaque)
         self.fill_ellipsoid(
             base + glam::Vec3::new(3.0, 17.0, 12.0),
             glam::Vec3::new(0.8, 0.8, 0.8),
-            eye_color, 4.0, sp, 0.1,
+            eye_color, 4.0, sp, 0.1, GROUP_EYE,
         );
         self.fill_ellipsoid(
             base + glam::Vec3::new(-3.0, 17.0, 12.0),
             glam::Vec3::new(0.8, 0.8, 0.8),
-            eye_color, 4.0, sp, 0.1,
+            eye_color, 4.0, sp, 0.1, GROUP_EYE,
         );
 
         // LEFT LEG
         self.fill_ellipsoid(
             base + glam::Vec3::new(3.0, -3.0, 1.0),
             glam::Vec3::new(2.0, 5.0, 2.5),
-            dark_green, 0.05, sp, 0.25,
+            dark_green, 0.05, sp, 0.25, GROUP_LEG_L,
         );
         // LEFT FOOT
         self.fill_ellipsoid(
             base + glam::Vec3::new(3.0, -8.0, 2.0),
             glam::Vec3::new(2.5, 1.0, 4.0),
-            dark_green, 0.05, sp, 0.25,
+            dark_green, 0.05, sp, 0.25, GROUP_FOOT_L,
         );
 
         // RIGHT LEG
         self.fill_ellipsoid(
             base + glam::Vec3::new(-3.0, -3.0, 1.0),
             glam::Vec3::new(2.0, 5.0, 2.5),
-            dark_green, 0.05, sp, 0.25,
+            dark_green, 0.05, sp, 0.25, GROUP_LEG_R,
         );
         // RIGHT FOOT
         self.fill_ellipsoid(
             base + glam::Vec3::new(-3.0, -8.0, 2.0),
             glam::Vec3::new(2.5, 1.0, 4.0),
-            dark_green, 0.05, sp, 0.25,
+            dark_green, 0.05, sp, 0.25, GROUP_FOOT_R,
         );
 
         // TINY ARMS — classic T-Rex
         self.fill_ellipsoid(
             base + glam::Vec3::new(4.5, 6.0, 5.0),
             glam::Vec3::new(1.0, 2.5, 1.0),
-            green, 0.05, sp, 0.3,
+            green, 0.05, sp, 0.3, GROUP_ARM_R,
         );
         self.fill_ellipsoid(
             base + glam::Vec3::new(-4.5, 6.0, 5.0),
             glam::Vec3::new(1.0, 2.5, 1.0),
-            green, 0.05, sp, 0.3,
+            green, 0.05, sp, 0.3, GROUP_ARM_L,
         );
 
         // SUN — large flat disc high above the scene, like a sky panel.
@@ -461,6 +490,7 @@ impl DiffField {
                 );
                 light.pass_through = 1.0; // pure emitter
                 light.is_vacuum = true; // sun emits through graph, not visible in grid
+                light.group = GROUP_SUN;
                 self.entities.push(light);
             }
         }
@@ -488,6 +518,7 @@ impl DiffField {
                 e.pass_through = 0.5;
                 e.specular = 0.3;     // waxy cuticle
                 e.reemit = 0.3;       // low re-emission — shadows stay dark
+                e.group = GROUP_FLOOR;
                 self.entities.push(e);
             }
         }
@@ -522,6 +553,7 @@ impl DiffField {
                         );
                         e.pass_through = 0.95; // air is nearly transparent
                         e.is_vacuum = true;
+                        e.group = GROUP_VACUUM;
                         // Below sun = atmosphere. Inverted gradient:
                         // Bottom (near floor) = dense, high scatter/magnitude — delivers light to surfaces.
                         // Top (near sun) = thin, sparse — just relays sunlight down.
@@ -566,10 +598,10 @@ impl DiffField {
             let end = start + slab_size;
             let mut any_nonzero = false;
             for cell in &mut self.cells[start..end] {
-                cell.density *= 0.92;
-                cell.color_r *= 0.92;
-                cell.color_g *= 0.92;
-                cell.color_b *= 0.92;
+                cell.density *= 0.85;
+                cell.color_r *= 0.85;
+                cell.color_g *= 0.85;
+                cell.color_b *= 0.85;
                 if cell.density > 0.001 { any_nonzero = true; }
             }
             if !any_nonzero { self.dirty_slabs[z] = false; }
@@ -617,56 +649,62 @@ impl DiffField {
         // CUTOFF: if incoming is below threshold, don't pass it through (signal is dead).
         let cutoff: f32 = 0.01;
 
-        // Split borrow: read entities, write edge_deposits
+        // Split borrow: read entities, write edge_deposits/gammas
         let entities = &self.entities;
         let edge_deposits = &mut self.edge_deposits;
+        let edge_gammas = &self.edge_gammas;
         for entity in entities.iter() {
-            let n = entity.edge_count as f32;
-            if n == 0.0 { continue; }
+            if entity.edge_count == 0 { continue; }
+
+            let start = entity.edge_start as usize;
+            let end = start + entity.edge_count as usize;
+
+            // Sum gammas for weighted distribution (replaces even 1/n split)
+            let total_gamma: f32 = edge_gammas[start..end].iter().sum();
+            if total_gamma < 0.001 { continue; }
 
             let mag = entity.deposit_magnitude;
-            // Own emission + re-emission from absorbed light.
-            // Re-emission makes illuminated surfaces into secondary light sources.
-            let own_r = (entity.color[0] * mag + entity.reemit_r) / n;
-            let own_g = (entity.color[1] * mag + entity.reemit_g) / n;
-            let own_b = (entity.color[2] * mag + entity.reemit_b) / n;
-            let own_d = (mag + entity.reemit_r + entity.reemit_g + entity.reemit_b) / n;
+            // Own emission + re-emission (total, not per-edge yet)
+            let own_r = entity.color[0] * mag + entity.reemit_r;
+            let own_g = entity.color[1] * mag + entity.reemit_g;
+            let own_b = entity.color[2] * mag + entity.reemit_b;
+            let own_d = mag + entity.reemit_r + entity.reemit_g + entity.reemit_b;
 
-            // Pass-through has two components:
-            // 1. Specular: mirror bounce, unfiltered (waxy surface, wet, metallic)
-            // 2. Diffuse: color-filtered (the material's absorption spectrum)
-            // Vacuum just attenuates uniformly.
+            // Pass-through (total, not per-edge yet)
             let (pass_r, pass_g, pass_b, pass_d) = if entity.incoming.density > cutoff {
                 let pt = entity.pass_through;
                 if entity.is_vacuum {
                     (
-                        entity.incoming.r * pt / n,
-                        entity.incoming.g * pt / n,
-                        entity.incoming.b * pt / n,
-                        entity.incoming.density * pt / n,
+                        entity.incoming.r * pt,
+                        entity.incoming.g * pt,
+                        entity.incoming.b * pt,
+                        entity.incoming.density * pt,
                     )
                 } else {
                     let spec = entity.specular;
                     let diff = 1.0 - spec;
                     (
-                        (entity.incoming.r * spec + entity.incoming.r * diff * entity.color[0]) * pt / n,
-                        (entity.incoming.g * spec + entity.incoming.g * diff * entity.color[1]) * pt / n,
-                        (entity.incoming.b * spec + entity.incoming.b * diff * entity.color[2]) * pt / n,
-                        entity.incoming.density * pt / n,
+                        (entity.incoming.r * spec + entity.incoming.r * diff * entity.color[0]) * pt,
+                        (entity.incoming.g * spec + entity.incoming.g * diff * entity.color[1]) * pt,
+                        (entity.incoming.b * spec + entity.incoming.b * diff * entity.color[2]) * pt,
+                        entity.incoming.density * pt,
                     )
                 }
             } else {
                 (0.0, 0.0, 0.0, 0.0)
             };
 
-            // Push into each pipe (flat array, cache-friendly)
-            let start = entity.edge_start as usize;
-            let end = start + entity.edge_count as usize;
+            // Push into each pipe, weighted by gamma
+            let total_r = own_r + pass_r;
+            let total_g = own_g + pass_g;
+            let total_b = own_b + pass_b;
+            let total_d = own_d + pass_d;
             for k in start..end {
-                edge_deposits[k].r = own_r + pass_r;
-                edge_deposits[k].g = own_g + pass_g;
-                edge_deposits[k].b = own_b + pass_b;
-                edge_deposits[k].density = own_d + pass_d;
+                let w = edge_gammas[k] / total_gamma;
+                edge_deposits[k].r = total_r * w;
+                edge_deposits[k].g = total_g * w;
+                edge_deposits[k].b = total_b * w;
+                edge_deposits[k].density = total_d * w;
             }
         }
 
@@ -715,9 +753,23 @@ impl DiffField {
             aabb_min = aabb_min.min(entity.position - 1.0);
             aabb_max = aabb_max.max(entity.position + 1.0);
 
-            let ix = entity.position.x as i32;
-            let iy = entity.position.y as i32;
-            let iz = entity.position.z as i32;
+            // Tail wag: shift deposit position in X via sine wave.
+            // Tip has max amplitude, tapers toward body. Traveling wave along Z.
+            let mut deposit_pos = entity.position;
+            if entity.group == GROUP_TAIL || entity.group == GROUP_TAIL_TIP {
+                let time = self.tick as f32 / 30.0;
+                let frequency = std::f32::consts::PI; // ~2 sec period
+                let center_z = FIELD_SIZE as f32 / 2.0;
+                // z_frac: 0.0 at body junction (z=center), 1.0 at tail tip (z=center-24)
+                let z_frac = ((center_z - entity.position.z) / 24.0).clamp(0.0, 1.0);
+                let amplitude = 3.0 * z_frac; // tip swings 3 cells, body junction ~0
+                let phase = time * frequency + z_frac * 2.0; // traveling wave
+                deposit_pos.x += amplitude * phase.sin();
+            }
+
+            let ix = deposit_pos.x as i32;
+            let iy = deposit_pos.y as i32;
+            let iz = deposit_pos.z as i32;
 
             if Self::in_bounds(ix, iy, iz) {
                 let idx = Self::index(ix as u32, iy as u32, iz as u32);

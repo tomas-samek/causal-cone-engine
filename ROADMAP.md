@@ -1,6 +1,6 @@
 # Causal Cone Engine — Roadmap
 
-## v0.2: Dino looks good ✅ (current)
+## v0.2: Dino looks good ✅
 - Diff-field rendering with 128³ grid
 - Entity graph with connection + radiation edges
 - 3-phase light propagation (deliver → push → deposit)
@@ -14,10 +14,11 @@
 - Inverted atmosphere gradient: dense near floor, thin near sun
 - Tuned material properties: low scatter atmosphere, moderate re-emission
 
-## v0.3: Hierarchical entities (macro-patterns)
-- Parent-child entity relationships
-- Macro-patterns emerging from grouped sub-entities
-- Entity tree structure replacing flat storage
+## v0.3: Hierarchical entities (macro-patterns) ✅ (current)
+- Entity group system: 18 GROUP_* constants tagging every entity (body parts, sun, floor, vacuum)
+- Edge gamma infrastructure: per-edge weight multiplier for gamma-weighted light distribution
+- Tail wag animation: deposit-position offset via sine wave with traveling phase along tail
+- Faster grid decay (0.92 → 0.85) for cleaner animation trails
 
 ## v0.4: Observer-dependent resolution
 - Field resolution varies with observer distance
