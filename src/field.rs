@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 // Diff Field — the persistent 3D texture that IS the universe.
 //
 // Entities deposit into it. Light propagates through CONNECTIONS between entities,
@@ -8,7 +10,7 @@
 // Neighbor → accumulates incoming, adds to own deposit next tick (mixing)
 
 /// Field resolution — 128³ (2M cells, ~32MB at f32)
-pub const FIELD_SIZE: u32 = 128;
+pub const FIELD_SIZE: u32 = 256;
 pub const FIELD_CELLS: usize = (FIELD_SIZE * FIELD_SIZE * FIELD_SIZE) as usize;
 
 // Entity group IDs for scene organization
@@ -31,6 +33,7 @@ pub const GROUP_ARM_R: u16 = 15;
 pub const GROUP_SUN: u16 = 16;
 pub const GROUP_FLOOR: u16 = 17;
 pub const GROUP_VACUUM: u16 = 18;
+pub const GROUP_ROCK: u16 = 19;
 
 /// A single deposit in the field
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -102,6 +105,18 @@ pub struct Entity {
     pub incoming: EdgeDeposit,
     /// Which body part / scene element this entity belongs to
     pub group: u16,
+    /// Outward-pointing surface normal (for skin texture oscillation)
+    pub surface_normal: glam::Vec3,
+    /// Current oscillation phase (radians)
+    pub oscillation_phase: f32,
+    /// Oscillation frequency (radians per tick)
+    pub oscillation_freq: f32,
+    /// Max oscillation offset in voxels
+    pub oscillation_amplitude: f32,
+    /// Previous grid cell index for clearing (-1 = none)
+    pub prev_deposit_idx: i32,
+    /// Density-weighted average direction of incoming light (normalized after delivery)
+    pub incoming_dir: glam::Vec3,
 }
 
 impl Entity {
@@ -124,8 +139,24 @@ impl Entity {
             edge_count: 0,
             incoming: EdgeDeposit::default(),
             group: GROUP_NONE,
+            surface_normal: glam::Vec3::ZERO,
+            oscillation_phase: 0.0,
+            oscillation_freq: 0.0,
+            oscillation_amplitude: 0.0,
+            prev_deposit_idx: -1,
+            incoming_dir: glam::Vec3::ZERO,
         }
     }
+}
+
+/// How oscillation phase is assigned across entities in a group
+enum PhaseMode {
+    /// All entities get the same base phase (coherent scales)
+    Aligned(f32),
+    /// Phase varies by position along an axis (ripple effect)
+    Gradient(glam::Vec3),
+    /// Random phase per entity (smooth blended)
+    Random,
 }
 
 /// The diff field — CPU-side representation
@@ -134,6 +165,7 @@ pub struct DiffField {
     pub entities: Vec<Entity>,
     pub tick: u64,
     deliveries: Vec<EdgeDeposit>,
+    delivery_dirs: Vec<glam::Vec3>,
     pub aabb_min: glam::Vec3,
     pub aabb_max: glam::Vec3,
     pub dirty_slabs: [bool; FIELD_SIZE as usize],
@@ -150,6 +182,7 @@ impl DiffField {
             entities: Vec::new(),
             tick: 0,
             deliveries: Vec::new(),
+            delivery_dirs: Vec::new(),
             aabb_min: glam::Vec3::ZERO,
             aabb_max: glam::Vec3::splat(FIELD_SIZE as f32),
             dirty_slabs: [true; FIELD_SIZE as usize],
@@ -158,10 +191,32 @@ impl DiffField {
             edge_gammas: Vec::new(),
         };
 
-        field.spawn_demo_scene();
-        field.build_connections(3.5);
-        field.build_radiation_links(15.0);
+        let sp = field.spawn_demo_scene();
+        let connect_dist = (sp * 5.0).min(3.5);
+        let radiation_dist = (sp * 15.0).min(10.0);
+        field.build_connections(connect_dist);
+        field.build_radiation_links(radiation_dist, connect_dist);
+
+        // Skin texture: assign oscillation presets per body region.
+        // Frequencies ~1000x slower than tail wag — texture shifts glacially, not per-frame.
+        field.set_group_oscillation(GROUP_BODY,     0.0003, 0.3,  PhaseMode::Aligned(0.0));
+        field.set_group_oscillation(GROUP_HEAD,     0.0003, 0.3,  PhaseMode::Aligned(0.0));
+        field.set_group_oscillation(GROUP_NECK,     0.0003, 0.3,  PhaseMode::Aligned(0.0));
+        field.set_group_oscillation(GROUP_BELLY,    0.0005, 0.2,  PhaseMode::Random);
+        field.set_group_oscillation(GROUP_LEG_L,    0.0003, 0.15, PhaseMode::Aligned(0.0));
+        field.set_group_oscillation(GROUP_LEG_R,    0.0003, 0.15, PhaseMode::Aligned(0.0));
+        field.set_group_oscillation(GROUP_FOOT_L,   0.0003, 0.1,  PhaseMode::Aligned(0.0));
+        field.set_group_oscillation(GROUP_FOOT_R,   0.0003, 0.1,  PhaseMode::Aligned(0.0));
+        field.set_group_oscillation(GROUP_TAIL,     0.0004, 0.3,  PhaseMode::Gradient(glam::Vec3::Z));
+        field.set_group_oscillation(GROUP_TAIL_TIP, 0.0004, 0.3,  PhaseMode::Gradient(glam::Vec3::Z));
+        field.set_group_oscillation(GROUP_JAW,      0.0004, 0.2,  PhaseMode::Aligned(0.0));
+        field.set_group_oscillation(GROUP_MOUTH,    0.0004, 0.2,  PhaseMode::Aligned(0.0));
+        field.set_group_oscillation(GROUP_ARM_L,    0.0003, 0.15, PhaseMode::Aligned(0.0));
+        field.set_group_oscillation(GROUP_ARM_R,    0.0003, 0.15, PhaseMode::Aligned(0.0));
+        // EYE, SUN, FLOOR, VACUUM: freq=0, amplitude=0 by default — no oscillation
+
         field.deliveries = vec![EdgeDeposit::default(); field.entities.len()];
+        field.delivery_dirs = vec![glam::Vec3::ZERO; field.entities.len()];
 
         field
     }
@@ -179,6 +234,20 @@ impl DiffField {
             && z < FIELD_SIZE as i32
     }
 
+    /// Bin entity positions into a uniform spatial grid for O(n) neighbor queries.
+    fn spatial_hash(positions: &[glam::Vec3], cell_size: f32) -> HashMap<(i32, i32, i32), Vec<usize>> {
+        let mut map: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+        for (i, pos) in positions.iter().enumerate() {
+            let key = (
+                (pos.x / cell_size).floor() as i32,
+                (pos.y / cell_size).floor() as i32,
+                (pos.z / cell_size).floor() as i32,
+            );
+            map.entry(key).or_default().push(i);
+        }
+        map
+    }
+
     /// Build connection edges and detect heat. Entities within connect_dist get bidirectional edges.
     /// Also detects interior (heat) entities that are fully surrounded by absorbing neighbors.
     fn build_connections(&mut self, connect_dist: f32) {
@@ -187,25 +256,53 @@ impl DiffField {
 
         let positions: Vec<glam::Vec3> = self.entities.iter().map(|e| e.position).collect();
 
-        // Collect connection edges into temp per-entity vecs
+        // Collect connection edges via spatial hash (O(n) instead of O(n²))
+        let grid = Self::spatial_hash(&positions, connect_dist);
         let mut temp_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut connection_count = 0u64;
         for i in 0..n {
-            for j in (i + 1)..n {
-                let dist_sq = positions[i].distance_squared(positions[j]);
-                if dist_sq < connect_dist_sq {
-                    temp_edges[i].push(j);
-                    temp_edges[j].push(i);
-                    connection_count += 1;
+            let pos = positions[i];
+            let cx = (pos.x / connect_dist).floor() as i32;
+            let cy = (pos.y / connect_dist).floor() as i32;
+            let cz = (pos.z / connect_dist).floor() as i32;
+            for dz in -1..=1_i32 {
+                for dy in -1..=1_i32 {
+                    for dx in -1..=1_i32 {
+                        if let Some(bucket) = grid.get(&(cx + dx, cy + dy, cz + dz)) {
+                            for &j in bucket {
+                                if j <= i { continue; }
+                                let dist_sq = positions[i].distance_squared(positions[j]);
+                                if dist_sq < connect_dist_sq {
+                                    temp_edges[i].push(j);
+                                    temp_edges[j].push(i);
+                                    connection_count += 1;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
+        // Cap connection edges per entity — keep closest 26 (3x3x3 neighborhood)
+        let max_connections: usize = 26;
+        for i in 0..n {
+            if temp_edges[i].len() > max_connections {
+                temp_edges[i].sort_by(|&a, &b| {
+                    let da = positions[i].distance_squared(positions[a]);
+                    let db = positions[i].distance_squared(positions[b]);
+                    da.partial_cmp(&db).unwrap()
+                });
+                temp_edges[i].truncate(max_connections);
+            }
+        }
+
         log::info!(
-            "Graph built: {} entities, {} connection edges (avg {:.1} per entity)",
+            "Graph built: {} entities, {} connection edges (avg {:.1} per entity, capped at {})",
             n,
             connection_count,
-            (connection_count * 2) as f32 / n as f32
+            (connection_count * 2) as f32 / n as f32,
+            max_connections
         );
 
         // Detect interior (heat) entities.
@@ -239,6 +336,24 @@ impl DiffField {
             heat_count
         );
 
+        // Compute surface normals: each surface entity's normal points away from its neighbors.
+        for i in 0..n {
+            if self.entities[i].is_vacuum || self.entities[i].is_heat { continue; }
+            let pos = positions[i];
+            let mut neighbor_avg = glam::Vec3::ZERO;
+            let mut solid_count = 0u32;
+            for &t in &temp_edges[i] {
+                if self.entities[t].is_vacuum || self.entities[t].is_heat { continue; }
+                neighbor_avg += positions[t];
+                solid_count += 1;
+            }
+            if solid_count > 0 {
+                neighbor_avg /= solid_count as f32;
+                let normal = (pos - neighbor_avg).normalize_or_zero();
+                self.entities[i].surface_normal = normal;
+            }
+        }
+
         // Flatten into SoA
         self.flatten_edges(temp_edges);
 
@@ -249,11 +364,60 @@ impl DiffField {
         );
     }
 
+    /// Check if any solid entity blocks the line of sight between two positions.
+    /// Steps along the ray checking spatial hash cells for nearby blockers.
+    fn ray_blocked(
+        pos_a: glam::Vec3,
+        pos_b: glam::Vec3,
+        idx_a: usize,
+        idx_b: usize,
+        block_grid: &HashMap<(i32, i32, i32), Vec<usize>>,
+        cell_size: f32,
+        positions: &[glam::Vec3],
+        block_radius_sq: f32,
+    ) -> bool {
+        let ab = pos_b - pos_a;
+        let ab_len = ab.length();
+        if ab_len < 0.001 { return false; }
+        let ab_dir = ab / ab_len;
+
+        let step = cell_size;
+        let mut t = step;
+        while t < ab_len - step * 0.5 {
+            let sample = pos_a + ab_dir * t;
+            let cx = (sample.x / cell_size).floor() as i32;
+            let cy = (sample.y / cell_size).floor() as i32;
+            let cz = (sample.z / cell_size).floor() as i32;
+
+            for dz in -1..=1_i32 {
+                for dy in -1..=1_i32 {
+                    for dx in -1..=1_i32 {
+                        if let Some(bucket) = block_grid.get(&(cx + dx, cy + dy, cz + dz)) {
+                            for &eidx in bucket {
+                                if eidx == idx_a || eidx == idx_b { continue; }
+                                let ap = positions[eidx] - pos_a;
+                                let proj = ap.dot(ab_dir);
+                                if proj <= 0.0 || proj >= ab_len { continue; }
+                                let closest = pos_a + ab_dir * proj;
+                                let dist_sq = (positions[eidx] - closest).length_squared();
+                                if dist_sq < block_radius_sq {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            t += step;
+        }
+        false
+    }
+
     /// Build radiation links — direct surface-to-surface edges for non-vacuum, non-heat
-    /// entities within max_dist. Skips pairs already connected (dist < 3.5).
-    fn build_radiation_links(&mut self, max_dist: f32) {
+    /// entities within max_dist. Skips pairs already connected (dist < connect_dist).
+    fn build_radiation_links(&mut self, max_dist: f32, connect_dist: f32) {
         let max_dist_sq = max_dist * max_dist;
-        let short_dist_sq = 3.5_f32 * 3.5;
+        let short_dist_sq = connect_dist * connect_dist;
         let n = self.entities.len();
 
         let positions: Vec<glam::Vec3> = self.entities.iter().map(|e| e.position).collect();
@@ -268,29 +432,92 @@ impl DiffField {
             }
         }
 
-        // Add radiation links
-        let mut count = 0u64;
+        // Build blocking grid from solid entities for line-of-sight raycasting
+        let block_cell = connect_dist.max(1.0);
+        let block_radius_sq = (connect_dist * 0.3).powi(2);
+        let mut block_grid: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
         for i in 0..n {
             if self.entities[i].is_vacuum || self.entities[i].is_heat { continue; }
-            for j in (i + 1)..n {
-                if self.entities[j].is_vacuum || self.entities[j].is_heat { continue; }
-                let dist_sq = positions[i].distance_squared(positions[j]);
-                if dist_sq >= short_dist_sq && dist_sq < max_dist_sq {
-                    temp_edges[i].push(j);
-                    temp_edges[j].push(i);
-                    count += 1;
+            let pos = positions[i];
+            let key = (
+                (pos.x / block_cell).floor() as i32,
+                (pos.y / block_cell).floor() as i32,
+                (pos.z / block_cell).floor() as i32,
+            );
+            block_grid.entry(key).or_default().push(i);
+        }
+
+        // Add radiation links via spatial hash — collect candidates per entity, sorted by distance
+        let max_radiation: usize = 10; // cap per entity
+        let rad_grid = Self::spatial_hash(&positions, max_dist);
+        let mut radiation_candidates: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+        let mut blocked_count = 0u64;
+        for i in 0..n {
+            if self.entities[i].is_vacuum || self.entities[i].is_heat { continue; }
+            let pos = positions[i];
+            let cx = (pos.x / max_dist).floor() as i32;
+            let cy = (pos.y / max_dist).floor() as i32;
+            let cz = (pos.z / max_dist).floor() as i32;
+            for dz in -1..=1_i32 {
+                for dy in -1..=1_i32 {
+                    for dx in -1..=1_i32 {
+                        if let Some(bucket) = rad_grid.get(&(cx + dx, cy + dy, cz + dz)) {
+                            for &j in bucket {
+                                if j <= i { continue; }
+                                if self.entities[j].is_vacuum || self.entities[j].is_heat { continue; }
+                                let dist_sq = positions[i].distance_squared(positions[j]);
+                                if dist_sq >= short_dist_sq && dist_sq < max_dist_sq {
+                                    // Line-of-sight check: skip if solid entity blocks the path
+                                    if Self::ray_blocked(
+                                        pos, positions[j], i, j,
+                                        &block_grid, block_cell, &positions, block_radius_sq,
+                                    ) {
+                                        blocked_count += 1;
+                                        continue;
+                                    }
+                                    radiation_candidates[i].push((j, dist_sq));
+                                    radiation_candidates[j].push((i, dist_sq));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
-        log::info!("Radiation links: {} direct surface-to-surface edges", count);
+        // Keep only the closest max_radiation links per entity
+        let mut count = 0u64;
+        for i in 0..n {
+            let cands = &mut radiation_candidates[i];
+            cands.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            cands.truncate(max_radiation);
+            for &(target, _) in cands.iter() {
+                temp_edges[i].push(target);
+            }
+            count += cands.len() as u64;
+        }
+        log::info!(
+            "Radiation links: {} directed edges (capped at {} per entity, {} blocked by LOS)",
+            count, max_radiation, blocked_count
+        );
 
         // Re-flatten into SoA
         self.flatten_edges(temp_edges);
 
+        // Distance-weighted gammas: closer edges carry more energy (1/dist²).
+        // Applies to ALL edges (short-range + radiation).
+        for (i, entity) in self.entities.iter().enumerate() {
+            let start = entity.edge_start as usize;
+            let end = start + entity.edge_count as usize;
+            for k in start..end {
+                let target = self.edge_targets[k];
+                let dist_sq = positions[i].distance_squared(positions[target]);
+                self.edge_gammas[k] = 1.0 / dist_sq.max(0.1);
+            }
+        }
+
         log::info!(
-            "Edge SoA: {} total directed edges ({} radiation), {:.1} MB contiguous",
+            "Edge SoA: {} total directed edges, {:.1} MB contiguous",
             self.edge_targets.len(),
-            count * 2,
             (self.edge_targets.len() * (std::mem::size_of::<usize>() + std::mem::size_of::<EdgeDeposit>())) as f64 / 1_048_576.0
         );
     }
@@ -309,6 +536,24 @@ impl DiffField {
                 self.edge_targets.push(target);
             }
             offset += edges.len() as u32;
+        }
+    }
+
+    /// Assign oscillation parameters to all entities in a group.
+    fn set_group_oscillation(&mut self, group: u16, freq: f32, amplitude: f32, phase_mode: PhaseMode) {
+        for entity in &mut self.entities {
+            if entity.group != group { continue; }
+            entity.oscillation_freq = freq;
+            entity.oscillation_amplitude = amplitude;
+            entity.oscillation_phase = match &phase_mode {
+                PhaseMode::Aligned(base) => *base,
+                PhaseMode::Gradient(axis) => entity.position.dot(*axis),
+                PhaseMode::Random => {
+                    // Deterministic hash from position — no rand crate needed
+                    let h = entity.position.x * 127.1 + entity.position.y * 311.7 + entity.position.z * 74.7;
+                    (h.sin() * 43758.5453).fract() * std::f32::consts::TAU
+                }
+            };
         }
     }
 
@@ -354,7 +599,7 @@ impl DiffField {
         }
     }
 
-    fn spawn_demo_scene(&mut self) {
+    fn spawn_demo_scene(&mut self) -> f32 {
         let center = FIELD_SIZE as f32 / 2.0;
         // Dino faces +Z, centered in field
         let base = glam::Vec3::new(center, center - 5.0, center);
@@ -363,7 +608,7 @@ impl DiffField {
         let belly = [0.5, 0.65, 0.3];       // lighter belly
         let eye_color = [1.0, 0.8, 0.0];    // yellow eyes
         let mouth = [0.7, 0.2, 0.15];       // reddish mouth
-        let sp = 0.9; // tight spacing — surface stays solid after interior becomes heat
+        let sp = 0.4; // tight spacing — surface stays solid after interior becomes heat
 
         // BODY — large horizontal ellipsoid
         self.fill_ellipsoid(
@@ -469,6 +714,19 @@ impl DiffField {
             green, 0.05, sp, 0.3, GROUP_ARM_L,
         );
 
+        // ROCK — small boulder on the ground
+        let rock_color = [0.4, 0.35, 0.25];
+        self.fill_ellipsoid(
+            base + glam::Vec3::new(15.0, -4.5, 25.0),
+            glam::Vec3::new(15.0, 2.0, 15.0),
+            rock_color, 0.05, 0.8, 0.01, GROUP_ROCK,
+        );
+        // Bump reemit for rock entities
+        for e in self.entities.iter_mut().rev() {
+            if e.group != GROUP_ROCK { break; }
+            e.reemit = 0.1;
+        }
+
         // SUN — large flat disc high above the scene, like a sky panel.
         // Many emitters sending parallel light downward through vacuum network.
         // Offset slightly in +Z so shadow falls behind (toward -Z).
@@ -485,7 +743,7 @@ impl DiffField {
                         center + sz as f32 * sun_spacing,
                     ),
                     glam::Vec3::ZERO,
-                    50.0, // directional highlight — sky dome handles ambient fill
+                    20.0, // directional highlight — sky dome handles ambient fill
                     [1.0, 0.9, 0.5],
                 );
                 light.pass_through = 1.0; // pure emitter
@@ -584,6 +842,8 @@ impl DiffField {
             before_vacuum,
             self.entities.len() - before_vacuum
         );
+
+        sp
     }
 
     /// Run one simulation tick — push-driven pipe propagation
@@ -608,22 +868,30 @@ impl DiffField {
         }
 
         // Phase 1: DELIVER — each edge's pipe contents arrive at target.
-        // Flat SoA iteration for cache-friendly access.
+        // Also track incoming light direction (density-weighted) for directional propagation.
         self.deliveries.fill(EdgeDeposit::default());
-        for entity in &self.entities {
+        self.delivery_dirs.fill(glam::Vec3::ZERO);
+        for (_src_idx, entity) in self.entities.iter().enumerate() {
             let start = entity.edge_start as usize;
             let end = start + entity.edge_count as usize;
             for k in start..end {
                 let target = self.edge_targets[k];
-                self.deliveries[target].r += self.edge_deposits[k].r;
-                self.deliveries[target].g += self.edge_deposits[k].g;
-                self.deliveries[target].b += self.edge_deposits[k].b;
-                self.deliveries[target].density += self.edge_deposits[k].density;
+                let dep = &self.edge_deposits[k];
+                self.deliveries[target].r += dep.r;
+                self.deliveries[target].g += dep.g;
+                self.deliveries[target].b += dep.b;
+                self.deliveries[target].density += dep.density;
+                // Accumulate travel direction weighted by density
+                if dep.density > 0.001 {
+                    let dir = self.entities[target].position - entity.position;
+                    self.delivery_dirs[target] += dir.normalize_or_zero() * dep.density;
+                }
             }
         }
         // Apply deliveries + build re-emission for solid surfaces
         for (i, entity) in self.entities.iter_mut().enumerate() {
             entity.incoming = self.deliveries[i];
+            entity.incoming_dir = self.delivery_dirs[i].normalize_or_zero();
 
             // Solid surfaces absorb incoming light and become secondary emitters.
             // Each entity represents billions of atoms — coherent re-emission,
@@ -649,19 +917,37 @@ impl DiffField {
         // CUTOFF: if incoming is below threshold, don't pass it through (signal is dead).
         let cutoff: f32 = 0.01;
 
-        // Split borrow: read entities, write edge_deposits/gammas
+        // Split borrow: read entities, write edge_deposits
         let entities = &self.entities;
         let edge_deposits = &mut self.edge_deposits;
         let edge_gammas = &self.edge_gammas;
+        let edge_targets = &self.edge_targets;
+        let directionality: f32 = 0.8; // 0=isotropic, 1=fully directional
         for entity in entities.iter() {
             if entity.edge_count == 0 { continue; }
 
             let start = entity.edge_start as usize;
             let end = start + entity.edge_count as usize;
 
-            // Sum gammas for weighted distribution (replaces even 1/n split)
-            let total_gamma: f32 = edge_gammas[start..end].iter().sum();
-            if total_gamma < 0.001 { continue; }
+            // Compute effective weights: gamma × directional bias for vacuum
+            // Vacuum entities forward-bias light along incoming direction.
+            // Solid entities emit isotropically (no directional bias).
+            let has_dir = entity.is_vacuum && entity.incoming_dir.length_squared() > 0.01;
+            let mut total_weight: f32 = 0.0;
+            for k in start..end {
+                let mut w = edge_gammas[k];
+                if has_dir {
+                    let target = edge_targets[k];
+                    let edge_dir = (entities[target].position - entity.position).normalize_or_zero();
+                    let alignment = edge_dir.dot(entity.incoming_dir); // -1 to 1
+                    let bias = (1.0 + alignment * directionality) * 0.5; // 0.1..0.9
+                    w *= bias.max(0.01); // never fully zero
+                }
+                // Temporarily store effective weight in deposit's density field
+                edge_deposits[k].density = w;
+                total_weight += w;
+            }
+            if total_weight < 0.001 { continue; }
 
             let mag = entity.deposit_magnitude;
             // Own emission + re-emission (total, not per-edge yet)
@@ -694,13 +980,13 @@ impl DiffField {
                 (0.0, 0.0, 0.0, 0.0)
             };
 
-            // Push into each pipe, weighted by gamma
+            // Push into each pipe, weighted by effective weight (gamma × directional bias)
             let total_r = own_r + pass_r;
             let total_g = own_g + pass_g;
             let total_b = own_b + pass_b;
             let total_d = own_d + pass_d;
             for k in start..end {
-                let w = edge_gammas[k] / total_gamma;
+                let w = edge_deposits[k].density / total_weight;
                 edge_deposits[k].r = total_r * w;
                 edge_deposits[k].g = total_g * w;
                 edge_deposits[k].b = total_b * w;
@@ -753,9 +1039,15 @@ impl DiffField {
             aabb_min = aabb_min.min(entity.position - 1.0);
             aabb_max = aabb_max.max(entity.position + 1.0);
 
-            // Tail wag: shift deposit position in X via sine wave.
-            // Tip has max amplitude, tapers toward body. Traveling wave along Z.
+            // Skin texture: offset deposit along surface normal
             let mut deposit_pos = entity.position;
+            if entity.oscillation_amplitude > 0.0 {
+                let offset = entity.surface_normal * entity.oscillation_phase.sin() * entity.oscillation_amplitude;
+                deposit_pos += offset;
+            }
+
+            // Tail wag: shift deposit position in X via sine wave (adds on top of texture).
+            // Tip has max amplitude, tapers toward body. Traveling wave along Z.
             if entity.group == GROUP_TAIL || entity.group == GROUP_TAIL_TIP {
                 let time = self.tick as f32 / 30.0;
                 let frequency = std::f32::consts::PI; // ~2 sec period
@@ -767,30 +1059,81 @@ impl DiffField {
                 deposit_pos.x += amplitude * phase.sin();
             }
 
-            let ix = deposit_pos.x as i32;
-            let iy = deposit_pos.y as i32;
-            let iz = deposit_pos.z as i32;
+            // Trilinear 2x2x2 splat — each entity covers its 8 nearest grid cells,
+            // weighted by fractional position. Closes gaps between entities.
+            let base_x = deposit_pos.x.floor() as i32;
+            let base_y = deposit_pos.y.floor() as i32;
+            let base_z = deposit_pos.z.floor() as i32;
+            let fx = deposit_pos.x - base_x as f32;
+            let fy = deposit_pos.y - base_y as f32;
+            let fz = deposit_pos.z - base_z as f32;
 
-            if Self::in_bounds(ix, iy, iz) {
-                let idx = Self::index(ix as u32, iy as u32, iz as u32);
-                let mag = entity.deposit_magnitude;
-                let absorbed = 1.0 - entity.pass_through;
-
-                // Own emission (intrinsic glow) + absorbed incoming filtered by surface color.
-                // Only what the entity KEEPS is visible — photons that stopped here.
-                // Re-emission is derived from absorbed light, already folded into reemit_r/g/b.
-                let total_r = entity.color[0] * mag + entity.incoming.r * absorbed * entity.color[0] + entity.reemit_r;
-                let total_g = entity.color[1] * mag + entity.incoming.g * absorbed * entity.color[1] + entity.reemit_g;
-                let total_b = entity.color[2] * mag + entity.incoming.b * absorbed * entity.color[2] + entity.reemit_b;
-                let total_d = mag + entity.incoming.density * absorbed;
-
-                let cell = &mut self.cells[idx];
-                cell.density = (cell.density + total_d).min(50.0);
-                cell.color_r = (cell.color_r + total_r).min(50.0);
-                cell.color_g = (cell.color_g + total_g).min(50.0);
-                cell.color_b = (cell.color_b + total_b).min(50.0);
-                self.dirty_slabs[iz as usize] = true;
+            // Clear previous 2x2x2 footprint if base cell changed
+            let new_base_idx = if Self::in_bounds(base_x, base_y, base_z) {
+                Self::index(base_x as u32, base_y as u32, base_z as u32) as i32
+            } else { -1 };
+            if entity.prev_deposit_idx >= 0 && entity.prev_deposit_idx != new_base_idx {
+                let prev = entity.prev_deposit_idx as usize;
+                let pz = (prev / (FIELD_SIZE * FIELD_SIZE) as usize) as i32;
+                let py = ((prev % (FIELD_SIZE * FIELD_SIZE) as usize) / FIELD_SIZE as usize) as i32;
+                let px = (prev % FIELD_SIZE as usize) as i32;
+                for dz in 0..2i32 {
+                    for dy in 0..2i32 {
+                        for dx in 0..2i32 {
+                            let cx = px + dx;
+                            let cy = py + dy;
+                            let cz = pz + dz;
+                            if Self::in_bounds(cx, cy, cz) {
+                                let idx = Self::index(cx as u32, cy as u32, cz as u32);
+                                self.cells[idx] = FieldCell::default();
+                                self.dirty_slabs[cz as usize] = true;
+                            }
+                        }
+                    }
+                }
             }
+            entity.prev_deposit_idx = new_base_idx;
+
+            let mag = entity.deposit_magnitude;
+            let absorbed = 1.0 - entity.pass_through;
+
+            let total_r = entity.color[0] * mag + entity.incoming.r * absorbed * entity.color[0] + entity.reemit_r;
+            let total_g = entity.color[1] * mag + entity.incoming.g * absorbed * entity.color[1] + entity.reemit_g;
+            let total_b = entity.color[2] * mag + entity.incoming.b * absorbed * entity.color[2] + entity.reemit_b;
+            let total_d = mag + entity.incoming.density * absorbed;
+
+            // Deposit to 2x2x2 with trilinear weights.
+            // Boost 4x to compensate for energy spread — keeps surface solid.
+            let total_r = total_r * 4.0;
+            let total_g = total_g * 4.0;
+            let total_b = total_b * 4.0;
+            let total_d = total_d * 4.0;
+            for dz in 0..2i32 {
+                let wz = if dz == 0 { 1.0 - fz } else { fz };
+                for dy in 0..2i32 {
+                    let wy = if dy == 0 { 1.0 - fy } else { fy };
+                    for dx in 0..2i32 {
+                        let wx = if dx == 0 { 1.0 - fx } else { fx };
+                        let w = wx * wy * wz;
+                        if w < 0.001 { continue; }
+                        let cx = base_x + dx;
+                        let cy = base_y + dy;
+                        let cz = base_z + dz;
+                        if Self::in_bounds(cx, cy, cz) {
+                            let idx = Self::index(cx as u32, cy as u32, cz as u32);
+                            let cell = &mut self.cells[idx];
+                            cell.density = (cell.density + total_d * w).min(50.0);
+                            cell.color_r = (cell.color_r + total_r * w).min(50.0);
+                            cell.color_g = (cell.color_g + total_g * w).min(50.0);
+                            cell.color_b = (cell.color_b + total_b * w).min(50.0);
+                            self.dirty_slabs[cz as usize] = true;
+                        }
+                    }
+                }
+            }
+
+            // Advance oscillation phase
+            entity.oscillation_phase += entity.oscillation_freq;
         }
         self.aabb_min = aabb_min.max(glam::Vec3::ZERO);
         self.aabb_max = aabb_max.min(glam::Vec3::splat(FIELD_SIZE as f32));
