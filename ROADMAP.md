@@ -32,26 +32,38 @@
 - Field size 128³ → 512³ (134M cells, ~2GB CPU / ~1GB GPU)
 - Jaw animation: cyclic open/close on ~4 sec cycle, pivot at back of jaw
 
-## v0.5: Dynamic connector density based on distance
-- Graph topology becomes dynamic
-- Denser connections near observer, sparser far away
-- Runtime edge management
+## v0.5: Visual quality & metaball geometry ✅
+- Metaball body: replaced 16 overlapping ellipsoids with single metaball field pass. Smooth seamless joints — neck/body/legs/tail blend naturally. Kernel: weight × max(0, 1−r²), threshold 1.0. Color/material interpolated, group from strongest contributor.
+- Dynamic connector density: per-entity distance factor from observer scales edge gammas in Phase 2. Close = full weight, distant = 0.1× (topology fixed, signal strength varies).
+- ACES filmic tone mapping (replaced Reinhard) — better contrast and color preservation
+- Gradient normals: 6-sample central-difference density gradient for Lambert diffuse + rim light
+- Sky gradient: blue zenith → warm horizon → dark ground, with sun glow hotspot
+- Trilinear texture filtering: GPU interpolates between voxels, filling surface gaps
+- 3×3×3 tent-weight deposit: wider splat footprint with smooth falloff (replaced 2×2×2 trilinear)
+- Subsurface darkening: entities adjacent to a heat interior get 0.2× color, 0.15× magnitude
+- Opacity tuning: density × 0.3 (was 0.1) — body surfaces appear solid, atmosphere stays translucent
+- Color normalization fix: removed gray fallback, always divide by max(density, 0.05)
 
-## v0.6: Multiple objects interacting
+## v0.6: Shadow tuning & atmosphere
+- Atmosphere scatters too much light, overwhelming ground shadows (tail shadow should be visible on ground)
+- Reduce vacuum scatter / reemit to let shadows survive propagation
+- Potentially separate direct-light and ambient channels
+
+## v0.7: Multiple objects interacting
 - Multiple independent entity groups
 - Inter-object interaction rules
 - Leverages hierarchical entities from v0.3
 
-## v0.7: Sound propagation
+## v0.8: Sound propagation
 - Field carries additional signal types beyond light
 - Acoustic wave simulation through entity graph
 
-## v0.8: Water/reflection
+## v0.9: Water/reflection
 - Reflective surface simulation
 - Extends specular material properties
 - Dynamic reflection via field re-emission
 
-## v0.9: Scene scale (landscape, multiple creatures)
+## v0.10: Scene scale (landscape, multiple creatures)
 - Larger worlds beyond 512³
 - Hierarchical or streaming field
 - Multiple animated creatures

@@ -60,17 +60,45 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 // --- Fragment shader: field sampling ---
 
 // Sample the field at a world position. Returns density and color.
+// Uses trilinear filtering — GPU interpolates between voxels, filling gaps.
 fn sample_field(world_pos: vec3<f32>) -> vec4<f32> {
-    // Convert world position to integer cell coordinates
-    let cell = vec3<i32>(world_pos);
-
-    // Out of bounds check
-    let size = vec3<i32>(u.field_size);
-    if any(cell < vec3<i32>(0)) || any(cell >= size) {
+    let uvw = (world_pos + 0.5) / u.field_size; // cell center to normalized [0,1]
+    if any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0)) {
         return vec4<f32>(0.0);
     }
+    return textureSample(field_texture, field_sampler, uvw);
+}
 
-    return textureLoad(field_texture, cell, 0);
+// Sample density only (for gradient normal computation)
+fn sample_density(world_pos: vec3<f32>) -> f32 {
+    let uvw = (world_pos + 0.5) / u.field_size;
+    if any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0)) {
+        return 0.0;
+    }
+    return textureSample(field_texture, field_sampler, uvw).r;
+}
+
+// Compute surface normal from density gradient (central differences)
+fn compute_normal(pos: vec3<f32>) -> vec3<f32> {
+    let nx = sample_density(pos + vec3<f32>(1.0, 0.0, 0.0)) - sample_density(pos - vec3<f32>(1.0, 0.0, 0.0));
+    let ny = sample_density(pos + vec3<f32>(0.0, 1.0, 0.0)) - sample_density(pos - vec3<f32>(0.0, 1.0, 0.0));
+    let nz = sample_density(pos + vec3<f32>(0.0, 0.0, 1.0)) - sample_density(pos - vec3<f32>(0.0, 0.0, 1.0));
+    let grad = vec3<f32>(nx, ny, nz);
+    let len = length(grad);
+    if len < 0.001 {
+        return vec3<f32>(0.0, 1.0, 0.0); // default up normal for flat regions
+    }
+    return grad / len;
+}
+
+// ACES filmic tone mapping (approximation by Krzysztof Narkowicz)
+fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
 }
 
 @fragment
@@ -91,13 +119,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Ray direction from observer to this pixel's world point
     let ray_dir = normalize(world_pos - u.observer_pos);
 
-    // --- March through the field ---
-    // Logarithmic step sizes: close samples are dense, far samples are sparse.
-    // This gives high detail nearby and automatic LOD at distance.
-    //
-    // The observer hits nearby deposits first (short lag, recent diffs).
-    // Far deposits arrive later (long lag, old diffs). Lag IS distance.
+    // Sun direction — matches sun placement in spawn_demo_scene
+    // Sun is above and slightly forward (+Z), so light comes from upper-forward
+    let sun_dir = normalize(vec3<f32>(0.0, 0.8, 0.3));
 
+    // --- March through the field ---
     var accumulated_color = vec3<f32>(0.0);
     var accumulated_alpha = 0.0;
 
@@ -110,65 +136,93 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let t_enter = max(max(t_min_v.x, t_min_v.y), t_min_v.z);
     let t_exit = min(min(t_max_v.x, t_max_v.y), t_max_v.z);
 
-    // If ray misses AABB entirely, return background
-    if t_enter > t_exit || t_exit < 0.0 {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-    }
+    // If ray misses AABB entirely, skip to background
+    var hit_anything = false;
+    if t_enter <= t_exit && t_exit >= 0.0 {
+        // March parameters (tuned: 96 steps with faster growth covers >375 cells)
+        let max_steps = 96u;
+        var step_size = 0.6; // start with sub-cell steps for precision
+        let step_growth = 1.03; // each step slightly larger (logarithmic march)
+        let density_threshold = 0.01; // minimum density to register as a hit
+        let max_distance = min(t_exit, 200.0); // clip to AABB exit
 
-    // March parameters (tuned: 96 steps with faster growth covers >375 cells)
-    let max_steps = 96u;
-    var step_size = 0.6; // start with sub-cell steps for precision
-    let step_growth = 1.03; // each step slightly larger (logarithmic march)
-    let density_threshold = 0.01; // minimum density to register as a hit
-    let max_distance = min(t_exit, 200.0); // clip to AABB exit
+        var distance = max(t_enter, 1.0); // start at AABB entry (or 1 cell ahead if inside)
 
-    var distance = max(t_enter, 1.0); // start at AABB entry (or 1 cell ahead if inside)
+        for (var i = 0u; i < max_steps; i = i + 1u) {
+            let sample_pos = u.observer_pos + ray_dir * f32(distance);
 
-    for (var i = 0u; i < max_steps; i = i + 1u) {
-        let sample_pos = u.observer_pos + ray_dir * f32(distance);
+            let field_value = sample_field(sample_pos);
+            let density = field_value.r; // density is in red channel (first float)
 
-        let field_value = sample_field(sample_pos);
-        let density = field_value.r; // density is in red channel (first float)
+            if density > density_threshold {
+                hit_anything = true;
+                // We hit a deposit. Extract color.
+                // In our FieldCell: [density, color_r, color_g, color_b]
+                let color = field_value.gba; // RGB in green, blue, alpha channels
 
-        if density > density_threshold {
-            // We hit a deposit. Extract color.
-            // In our FieldCell: [density, color_r, color_g, color_b]
-            let color = field_value.gba; // RGB in green, blue, alpha channels
+                // Normalize color by density to get actual color
+                let norm_color = color / max(density, 0.05);
 
-            // Normalize color by density to get actual color
-            var norm_color = vec3<f32>(0.7, 0.7, 0.7);
-            if density > 0.5 {
-                norm_color = color / density;
+                // Gradient normal — compute surface orientation from density field
+                let normal = compute_normal(sample_pos);
+
+                // Diffuse shading: Lambert (N dot L), clamped with ambient floor
+                let n_dot_l = max(dot(normal, sun_dir), 0.0);
+                let ambient = 0.25; // ambient fill so shadows aren't pitch black
+                let diffuse = ambient + (1.0 - ambient) * n_dot_l;
+
+                // Rim light: subtle brightening at grazing angles (Fresnel-like)
+                let n_dot_v = abs(dot(normal, -ray_dir));
+                let rim = pow(1.0 - n_dot_v, 3.0) * 0.3;
+
+                let lit_color = norm_color * (diffuse + rim);
+
+                // Distance-based falloff — closer deposits are brighter
+                let falloff = 1.0 / (1.0 + distance * 0.02);
+
+                // Opacity from density — denser deposits are more opaque
+                let opacity = min(saturate(density * 0.3) * falloff, 1.0);
+
+                // Front-to-back compositing (like swimming through fog)
+                let contribution = lit_color * opacity * (1.0 - accumulated_alpha);
+                accumulated_color += contribution;
+                accumulated_alpha += opacity * (1.0 - accumulated_alpha);
+
+                // Early exit if nearly opaque
+                if accumulated_alpha > 0.92 {
+                    break;
+                }
             }
 
-            // Distance-based falloff — closer deposits are brighter
-            let falloff = 1.0 / (1.0 + distance * 0.02);
+            // Advance ray (logarithmic stepping)
+            distance += step_size;
+            step_size *= step_growth;
 
-            // Opacity from density — denser deposits are more opaque
-            let opacity = min(saturate(density * 0.1) * falloff, 1.0);
-
-            // Front-to-back compositing (like swimming through fog)
-            let contribution = norm_color * opacity * (1.0 - accumulated_alpha);
-            accumulated_color += contribution;
-            accumulated_alpha += opacity * (1.0 - accumulated_alpha);
-
-            // Early exit if nearly opaque
-            if accumulated_alpha > 0.92 {
+            if distance > max_distance {
                 break;
             }
         }
-
-        // Advance ray (logarithmic stepping)
-        distance += step_size;
-        step_size *= step_growth;
-
-        if distance > max_distance {
-            break;
-        }
     }
 
-    // Background: pitch black — the void beyond the field
-    let background = vec3<f32>(0.0, 0.0, 0.0);
+    // Sky gradient background — blue zenith fading to warm horizon
+    let sky_up = ray_dir.y; // -1 = down, 0 = horizon, +1 = up
+    let horizon_color = vec3<f32>(0.7, 0.6, 0.5);  // warm haze
+    let zenith_color = vec3<f32>(0.3, 0.5, 0.8);   // blue sky
+    let ground_color = vec3<f32>(0.15, 0.12, 0.1);  // dark ground
+    var background: vec3<f32>;
+    if sky_up > 0.0 {
+        // Sky: blend horizon to zenith
+        let t = saturate(sky_up * 2.0); // 0 at horizon, 1 at zenith
+        background = mix(horizon_color, zenith_color, t);
+    } else {
+        // Below horizon: blend horizon to dark ground
+        let t = saturate(-sky_up * 3.0);
+        background = mix(horizon_color, ground_color, t);
+    }
+    // Subtle sun glow near sun direction
+    let sun_alignment = max(dot(ray_dir, sun_dir), 0.0);
+    background += vec3<f32>(1.0, 0.8, 0.4) * pow(sun_alignment, 32.0) * 0.5;
+
     let final_color = accumulated_color + background * (1.0 - accumulated_alpha);
 
     // Velocity-dependent vignette — faster observer = darker edges
@@ -177,11 +231,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dist_from_center = length(in.uv - screen_center) * 2.0; // 0 at center, ~1.4 at corners
     let vignette = 1.0 - u.observer_speed * dist_from_center * 0.8;
 
-    // Tone mapping — simple Reinhard
-    let mapped = final_color / (final_color + vec3<f32>(1.0));
+    // ACES filmic tone mapping — better contrast and color than Reinhard
+    let mapped = aces_tonemap(final_color * max(vignette, 0.1));
 
     // Gamma correction
-    let gamma_corrected = pow(mapped * max(vignette, 0.1), vec3<f32>(1.0 / 2.2));
+    let gamma_corrected = pow(mapped, vec3<f32>(1.0 / 2.2));
 
     return vec4<f32>(gamma_corrected, 1.0);
 }

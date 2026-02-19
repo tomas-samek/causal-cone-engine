@@ -406,6 +406,23 @@ impl DiffField {
             }
         }
 
+        // Two-layer coloring: darken subsurface entities (those adjacent to heat/interior).
+        // Surface entities keep full color; entities touching the interior are the "under-skin"
+        // layer and get darkened. Creates visible depth when the surface oscillates.
+        let mut subsurface_count = 0;
+        for i in 0..n {
+            if self.entities[i].is_vacuum || self.entities[i].is_heat { continue; }
+            let has_heat_neighbor = temp_edges[i].iter().any(|&t| self.entities[t].is_heat);
+            if has_heat_neighbor {
+                self.entities[i].color[0] *= 0.2;
+                self.entities[i].color[1] *= 0.2;
+                self.entities[i].color[2] *= 0.2;
+                self.entities[i].deposit_magnitude *= 0.15;
+                subsurface_count += 1;
+            }
+        }
+        log::info!("Subsurface layer: {} entities darkened", subsurface_count);
+
         // Flatten into SoA
         self.flatten_edges(temp_edges);
 
@@ -773,116 +790,112 @@ impl DiffField {
         let mouth = [0.7, 0.2, 0.15];       // reddish mouth
         let sp = 0.4; // tight spacing — surface stays solid after interior becomes heat
 
-        // BODY — large horizontal ellipsoid
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(0.0, 5.0, 0.0),
-            glam::Vec3::new(5.0, 6.0, 8.0),
-            green, 0.05, sp, 0.3, GROUP_BODY,
-        );
+        // --- Dino body via metaball field ---
+        // Each body part is a metaball source. The combined field produces
+        // smooth, seamless geometry — joints blend naturally.
+        // Kernel: weight * max(0, 1 - r²)  where r² = (dx/rx)² + (dy/ry)² + (dz/rz)²
+        // Entity spawned where combined field > 1.0.
+        // Color/material interpolated from all contributors; group from strongest.
+        struct Metaball {
+            center: glam::Vec3,
+            radii: glam::Vec3,
+            weight: f32,
+            color: [f32; 3],
+            magnitude: f32,
+            pass_through: f32,
+            group: u16,
+        }
 
-        // BELLY — slightly lighter, extends lower to catch floor bounce
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(0.0, 1.0, 0.0),
-            glam::Vec3::new(4.5, 4.0, 7.0),
-            belly, 0.05, sp, 0.45, GROUP_BELLY,
-        );
+        let balls = [
+            Metaball { center: base + glam::Vec3::new(0.0, 5.0, 0.0),     radii: glam::Vec3::new(5.0, 6.0, 8.0),   weight: 5.0, color: green,      magnitude: 0.05, pass_through: 0.3,  group: GROUP_BODY },
+            Metaball { center: base + glam::Vec3::new(0.0, 1.0, 0.0),     radii: glam::Vec3::new(4.5, 4.0, 7.0),   weight: 5.0, color: belly,      magnitude: 0.05, pass_through: 0.45, group: GROUP_BELLY },
+            Metaball { center: base + glam::Vec3::new(0.0, 5.5, -12.0),   radii: glam::Vec3::new(2.5, 2.5, 7.0),   weight: 5.0, color: green,      magnitude: 0.05, pass_through: 0.3,  group: GROUP_TAIL },
+            Metaball { center: base + glam::Vec3::new(0.0, 5.5, -20.0),   radii: glam::Vec3::new(1.2, 1.2, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.05, pass_through: 0.25, group: GROUP_TAIL_TIP },
+            Metaball { center: base + glam::Vec3::new(0.0, 10.0, 8.0),    radii: glam::Vec3::new(3.0, 5.0, 3.0),   weight: 5.0, color: green,      magnitude: 0.05, pass_through: 0.3,  group: GROUP_NECK },
+            Metaball { center: base + glam::Vec3::new(0.0, 16.0, 10.0),   radii: glam::Vec3::new(3.5, 3.0, 5.0),   weight: 5.0, color: green,      magnitude: 0.05, pass_through: 0.3,  group: GROUP_HEAD },
+            Metaball { center: base + glam::Vec3::new(0.0, 13.5, 12.0),   radii: glam::Vec3::new(2.5, 1.5, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.05, pass_through: 0.25, group: GROUP_JAW },
+            Metaball { center: base + glam::Vec3::new(0.0, 14.5, 13.0),   radii: glam::Vec3::new(2.0, 0.8, 3.0),   weight: 5.0, color: mouth,      magnitude: 0.05, pass_through: 0.15, group: GROUP_MOUTH },
+            Metaball { center: base + glam::Vec3::new(3.0, 17.0, 12.0),   radii: glam::Vec3::new(0.8, 0.8, 0.8),   weight: 8.0, color: eye_color,  magnitude: 4.0,  pass_through: 0.1,  group: GROUP_EYE },
+            Metaball { center: base + glam::Vec3::new(-3.0, 17.0, 12.0),  radii: glam::Vec3::new(0.8, 0.8, 0.8),   weight: 8.0, color: eye_color,  magnitude: 4.0,  pass_through: 0.1,  group: GROUP_EYE },
+            Metaball { center: base + glam::Vec3::new(3.0, -3.0, 1.0),    radii: glam::Vec3::new(2.0, 5.0, 2.5),   weight: 5.0, color: dark_green, magnitude: 0.05, pass_through: 0.25, group: GROUP_LEG_L },
+            Metaball { center: base + glam::Vec3::new(3.0, -8.0, 2.0),    radii: glam::Vec3::new(2.5, 1.0, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.05, pass_through: 0.25, group: GROUP_FOOT_L },
+            Metaball { center: base + glam::Vec3::new(-3.0, -3.0, 1.0),   radii: glam::Vec3::new(2.0, 5.0, 2.5),   weight: 5.0, color: dark_green, magnitude: 0.05, pass_through: 0.25, group: GROUP_LEG_R },
+            Metaball { center: base + glam::Vec3::new(-3.0, -8.0, 2.0),   radii: glam::Vec3::new(2.5, 1.0, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.05, pass_through: 0.25, group: GROUP_FOOT_R },
+            Metaball { center: base + glam::Vec3::new(4.5, 6.0, 5.0),     radii: glam::Vec3::new(1.0, 2.5, 1.0),   weight: 5.0, color: green,      magnitude: 0.05, pass_through: 0.3,  group: GROUP_ARM_R },
+            Metaball { center: base + glam::Vec3::new(-4.5, 6.0, 5.0),    radii: glam::Vec3::new(1.0, 2.5, 1.0),   weight: 5.0, color: green,      magnitude: 0.05, pass_through: 0.3,  group: GROUP_ARM_L },
+        ];
 
-        // TAIL — tapers backward (-Z)
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(0.0, 5.5, -12.0),
-            glam::Vec3::new(2.5, 2.5, 7.0),
-            green, 0.05, sp, 0.3, GROUP_TAIL,
-        );
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(0.0, 5.5, -20.0),
-            glam::Vec3::new(1.2, 1.2, 4.0),
-            dark_green, 0.05, sp, 0.25, GROUP_TAIL_TIP,
-        );
+        // Bounding box of all metaball influence regions
+        let mut bb_min = glam::Vec3::splat(f32::MAX);
+        let mut bb_max = glam::Vec3::splat(f32::MIN);
+        for b in &balls {
+            bb_min = bb_min.min(b.center - b.radii);
+            bb_max = bb_max.max(b.center + b.radii);
+        }
 
-        // NECK — tilted upward
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(0.0, 10.0, 8.0),
-            glam::Vec3::new(3.0, 5.0, 3.0),
-            green, 0.05, sp, 0.3, GROUP_NECK,
-        );
+        // Sample the combined metaball field at entity spacing
+        let mut x = bb_min.x;
+        while x <= bb_max.x {
+            let mut y = bb_min.y;
+            while y <= bb_max.y {
+                let mut z = bb_min.z;
+                while z <= bb_max.z {
+                    let pos = glam::Vec3::new(x, y, z);
 
-        // HEAD — on top of neck
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(0.0, 16.0, 10.0),
-            glam::Vec3::new(3.5, 3.0, 5.0),
-            green, 0.05, sp, 0.3, GROUP_HEAD,
-        );
+                    // Accumulate field contributions from all sources
+                    let mut total_field = 0.0f32;
+                    let mut acc_r = 0.0f32;
+                    let mut acc_g = 0.0f32;
+                    let mut acc_b = 0.0f32;
+                    let mut acc_mag = 0.0f32;
+                    let mut acc_pt = 0.0f32;
+                    let mut best_group = 0u16;
+                    let mut best_c = 0.0f32;
 
-        // JAW — below head, slightly forward
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(0.0, 13.5, 12.0),
-            glam::Vec3::new(2.5, 1.5, 4.0),
-            dark_green, 0.05, sp, 0.25, GROUP_JAW,
-        );
+                    for b in &balls {
+                        let d = (pos - b.center) / b.radii;
+                        let r2 = d.x * d.x + d.y * d.y + d.z * d.z;
+                        if r2 >= 1.0 { continue; }
+                        let c = b.weight * (1.0 - r2);
+                        total_field += c;
+                        acc_r += b.color[0] * c;
+                        acc_g += b.color[1] * c;
+                        acc_b += b.color[2] * c;
+                        acc_mag += b.magnitude * c;
+                        acc_pt += b.pass_through * c;
+                        if c > best_c {
+                            best_c = c;
+                            best_group = b.group;
+                        }
+                    }
 
-        // MOUTH interior
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(0.0, 14.5, 13.0),
-            glam::Vec3::new(2.0, 0.8, 3.0),
-            mouth, 0.05, sp, 0.15, GROUP_MOUTH,
-        );
+                    if total_field > 1.0 {
+                        let inv = 1.0 / total_field;
+                        let mut e = Entity::new(
+                            pos,
+                            glam::Vec3::ZERO,
+                            acc_mag * inv,
+                            [acc_r * inv, acc_g * inv, acc_b * inv],
+                        );
+                        e.pass_through = acc_pt * inv;
+                        e.group = best_group;
+                        self.entities.push(e);
+                    }
 
-        // EYES — two small bright spheres (nearly opaque)
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(3.0, 17.0, 12.0),
-            glam::Vec3::new(0.8, 0.8, 0.8),
-            eye_color, 4.0, sp, 0.1, GROUP_EYE,
-        );
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(-3.0, 17.0, 12.0),
-            glam::Vec3::new(0.8, 0.8, 0.8),
-            eye_color, 4.0, sp, 0.1, GROUP_EYE,
-        );
-
-        // LEFT LEG
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(3.0, -3.0, 1.0),
-            glam::Vec3::new(2.0, 5.0, 2.5),
-            dark_green, 0.05, sp, 0.25, GROUP_LEG_L,
-        );
-        // LEFT FOOT
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(3.0, -8.0, 2.0),
-            glam::Vec3::new(2.5, 1.0, 4.0),
-            dark_green, 0.05, sp, 0.25, GROUP_FOOT_L,
-        );
-
-        // RIGHT LEG
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(-3.0, -3.0, 1.0),
-            glam::Vec3::new(2.0, 5.0, 2.5),
-            dark_green, 0.05, sp, 0.25, GROUP_LEG_R,
-        );
-        // RIGHT FOOT
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(-3.0, -8.0, 2.0),
-            glam::Vec3::new(2.5, 1.0, 4.0),
-            dark_green, 0.05, sp, 0.25, GROUP_FOOT_R,
-        );
-
-        // TINY ARMS — classic T-Rex
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(4.5, 6.0, 5.0),
-            glam::Vec3::new(1.0, 2.5, 1.0),
-            green, 0.05, sp, 0.3, GROUP_ARM_R,
-        );
-        self.fill_ellipsoid(
-            base + glam::Vec3::new(-4.5, 6.0, 5.0),
-            glam::Vec3::new(1.0, 2.5, 1.0),
-            green, 0.05, sp, 0.3, GROUP_ARM_L,
-        );
+                    z += sp;
+                }
+                y += sp;
+            }
+            x += sp;
+        }
+        log::info!("Metaball dino: {} entities", self.entities.len());
 
         // ROCK — small boulder on the ground
         let rock_color = [0.4, 0.35, 0.25];
         self.fill_ellipsoid(
             base + glam::Vec3::new(15.0, -4.5, 25.0),
             glam::Vec3::new(15.0, 2.0, 15.0),
-            rock_color, 0.05, 0.8, 0.01, GROUP_ROCK,
+            rock_color, 0.15, 0.8, 0.01, GROUP_ROCK,
         );
         // Bump reemit for rock entities
         for e in self.entities.iter_mut().rev() {
@@ -1122,6 +1135,16 @@ impl DiffField {
         let cutoff: f32 = 0.01;
         let directionality: f32 = 0.8; // 0=isotropic, 1=fully directional
 
+        // Dynamic connector density: scale gammas by observer distance.
+        // Close entities propagate at full weight; distant ones at reduced weight.
+        let inv_vp = view_proj.inverse();
+        let observer_pos = glam::Vec3::new(inv_vp.col(3).x, inv_vp.col(3).y, inv_vp.col(3).z);
+        let distance_factors: Vec<f32> = self.entities.iter().map(|e| {
+            let dist = (e.position - observer_pos).length();
+            // Full weight within 30 cells, linear falloff to 0.1 at 130+ cells
+            (1.0 - (dist - 30.0).max(0.0) / 100.0).clamp(0.1, 1.0)
+        }).collect();
+
         // Collect per-entity edge ranges for parallel slicing
         let edge_ranges: Vec<(usize, usize)> = self.entities.iter().map(|e| {
             (e.edge_start as usize, e.edge_count as usize)
@@ -1152,7 +1175,7 @@ impl DiffField {
             let mut total_weight: f32 = 0.0;
             for (local_k, dep) in deposits.iter_mut().enumerate() {
                 let k = start + local_k;
-                let mut w = edge_gammas[k];
+                let mut w = edge_gammas[k] * distance_factors[idx];
                 if has_dir {
                     let edge_dir = edge_dir_arr[k];
                     let alignment = edge_dir.dot(entity.incoming_dir);
@@ -1290,14 +1313,10 @@ impl DiffField {
                 deposit_pos.y -= z_frac * 1.5 * open_amount;
             }
 
-            // Trilinear 2x2x2 splat — each entity covers its 8 nearest grid cells,
-            // weighted by fractional position. Closes gaps between entities.
+            // 3x3x3 tent-weight splat — wider footprint fills surface gaps.
             let base_x = deposit_pos.x.floor() as i32;
             let base_y = deposit_pos.y.floor() as i32;
             let base_z = deposit_pos.z.floor() as i32;
-            let fx = deposit_pos.x - base_x as f32;
-            let fy = deposit_pos.y - base_y as f32;
-            let fz = deposit_pos.z - base_z as f32;
 
             // Clear previous 2x2x2 footprint if base cell changed
             let new_base_idx = if Self::in_bounds(base_x, base_y, base_z) {
@@ -1308,9 +1327,10 @@ impl DiffField {
                 let pz = (prev / (FIELD_SIZE * FIELD_SIZE) as usize) as i32;
                 let py = ((prev % (FIELD_SIZE * FIELD_SIZE) as usize) / FIELD_SIZE as usize) as i32;
                 let px = (prev % FIELD_SIZE as usize) as i32;
-                for dz in 0..2i32 {
-                    for dy in 0..2i32 {
-                        for dx in 0..2i32 {
+                // 3x3x3 centered clear — catches animation ghosts from tail/jaw swings
+                for dz in -1..2i32 {
+                    for dy in -1..2i32 {
+                        for dx in -1..2i32 {
                             let cx = px + dx;
                             let cy = py + dy;
                             let cz = pz + dz;
@@ -1333,18 +1353,21 @@ impl DiffField {
             let total_b = entity.color[2] * mag + entity.incoming.b * absorbed * entity.color[2] + entity.reemit_b;
             let total_d = mag + entity.incoming.density * absorbed;
 
-            // Deposit to 2x2x2 with trilinear weights.
-            // Boost 4x to compensate for energy spread — keeps surface solid.
-            let total_r = total_r * 4.0;
-            let total_g = total_g * 4.0;
-            let total_b = total_b * 4.0;
-            let total_d = total_d * 4.0;
-            for dz in 0..2i32 {
-                let wz = if dz == 0 { 1.0 - fz } else { fz };
-                for dy in 0..2i32 {
-                    let wy = if dy == 0 { 1.0 - fy } else { fy };
-                    for dx in 0..2i32 {
-                        let wx = if dx == 0 { 1.0 - fx } else { fx };
+            // Deposit to 3x3x3 with tent weights — wider footprint fills surface gaps.
+            // Boost 10x to compensate for wider spread.
+            let total_r = total_r * 10.0;
+            let total_g = total_g * 10.0;
+            let total_b = total_b * 10.0;
+            let total_d = total_d * 10.0;
+            for dz in -1..2i32 {
+                let cz_f = base_z as f32 + dz as f32 + 0.5;
+                let wz = (1.5 - (cz_f - deposit_pos.z).abs()).max(0.0);
+                for dy in -1..2i32 {
+                    let cy_f = base_y as f32 + dy as f32 + 0.5;
+                    let wy = (1.5 - (cy_f - deposit_pos.y).abs()).max(0.0);
+                    for dx in -1..2i32 {
+                        let cx_f = base_x as f32 + dx as f32 + 0.5;
+                        let wx = (1.5 - (cx_f - deposit_pos.x).abs()).max(0.0);
                         let w = wx * wy * wz;
                         if w < 0.001 { continue; }
                         let cx = base_x + dx;
