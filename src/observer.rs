@@ -37,7 +37,7 @@ impl Observer {
     pub fn new() -> Self {
         Self {
             // Start in front of the dino's face, looking back at it
-            position: Vec3::new(128.0, 128.0, 190.0),
+            position: Vec3::new(256.0, 256.0, 380.0),
             velocity: Vec3::ZERO,
             yaw: -std::f32::consts::FRAC_PI_2, // face -Z toward the dino
             pitch: 0.0,

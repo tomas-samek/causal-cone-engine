@@ -143,7 +143,7 @@ impl Renderer {
             label: Some("Uniforms"),
             contents: bytemuck::cast_slice(&[Uniforms {
                 inv_view_proj: glam::Mat4::IDENTITY.to_cols_array(),
-                observer_pos: [64.0, 64.0, 95.0],
+                observer_pos: [128.0, 128.0, 190.0],
                 observer_speed: 0.0,
                 field_size: [FIELD_SIZE as f32; 3],
                 tick: 0.0,
@@ -293,48 +293,63 @@ impl Renderer {
         }
     }
 
-    /// Run one simulation tick
+    /// Run one simulation tick with reactive pipeline
     pub fn tick(&mut self, observer: &Observer) {
-        self.diff_field.tick();
+        let aspect = self.size.width as f32 / self.size.height.max(1) as f32;
+        let view = observer.view_matrix();
+        let proj = observer.projection_matrix(aspect);
+        let view_proj = proj * view;
+        self.diff_field.tick(view_proj);
     }
 
     /// Render one frame — sample the field from the observer's perspective
     pub fn render(&mut self, observer: &Observer) -> Result<(), wgpu::SurfaceError> {
-        // Upload dirty slabs when simulation has advanced — convert f32→f16 per slab
+        // Upload dirty slabs when simulation has advanced — AABB-restricted f32→f16 per slab
         if self.diff_field.tick != self.last_uploaded_tick {
-            let slab_cells = (FIELD_SIZE * FIELD_SIZE) as usize;
-            let bytes_per_row = FIELD_SIZE * 4 * 2; // 4 channels × 2 bytes (f16)
+            let margin = 40.0f32;
+            let fs = FIELD_SIZE as usize;
+            let dx_min = (self.diff_field.aabb_min.x - margin).max(0.0) as usize;
+            let dx_max = ((self.diff_field.aabb_max.x + margin) as usize + 1).min(fs);
+            let dy_min = (self.diff_field.aabb_min.y - margin).max(0.0) as usize;
+            let dy_max = ((self.diff_field.aabb_max.y + margin) as usize + 1).min(fs);
+            let sub_w = dx_max - dx_min;
+            let sub_h = dy_max - dy_min;
+            let sub_bytes_per_row = sub_w as u32 * 4 * 2; // 4 channels × 2 bytes (f16)
 
             for z in 0..FIELD_SIZE as usize {
                 if !self.diff_field.dirty_slabs[z] { continue; }
 
-                // Convert f32 cells to f16 in the staging buffer
-                let slab_start = z * slab_cells;
-                let f32_slab = &self.diff_field.cells[slab_start..slab_start + slab_cells];
-                for (i, cell) in f32_slab.iter().enumerate() {
-                    let base = i * 4;
-                    self.upload_buf[base]     = half::f16::from_f32(cell.density).to_bits();
-                    self.upload_buf[base + 1] = half::f16::from_f32(cell.color_r).to_bits();
-                    self.upload_buf[base + 2] = half::f16::from_f32(cell.color_g).to_bits();
-                    self.upload_buf[base + 3] = half::f16::from_f32(cell.color_b).to_bits();
+                // Convert f32 cells to f16 — only the AABB sub-rectangle
+                let slab_base = z * fs * fs;
+                let mut buf_idx = 0;
+                for y in dy_min..dy_max {
+                    let row_base = slab_base + y * fs;
+                    for x in dx_min..dx_max {
+                        let cell = &self.diff_field.cells[row_base + x];
+                        self.upload_buf[buf_idx]     = half::f16::from_f32(cell.density).to_bits();
+                        self.upload_buf[buf_idx + 1] = half::f16::from_f32(cell.color_r).to_bits();
+                        self.upload_buf[buf_idx + 2] = half::f16::from_f32(cell.color_g).to_bits();
+                        self.upload_buf[buf_idx + 3] = half::f16::from_f32(cell.color_b).to_bits();
+                        buf_idx += 4;
+                    }
                 }
 
                 self.queue.write_texture(
                     wgpu::ImageCopyTexture {
                         texture: &self.field_texture,
                         mip_level: 0,
-                        origin: wgpu::Origin3d { x: 0, y: 0, z: z as u32 },
+                        origin: wgpu::Origin3d { x: dx_min as u32, y: dy_min as u32, z: z as u32 },
                         aspect: wgpu::TextureAspect::All,
                     },
-                    bytemuck::cast_slice(&self.upload_buf),
+                    bytemuck::cast_slice(&self.upload_buf[..buf_idx]),
                     wgpu::ImageDataLayout {
                         offset: 0,
-                        bytes_per_row: Some(bytes_per_row),
-                        rows_per_image: Some(FIELD_SIZE),
+                        bytes_per_row: Some(sub_bytes_per_row),
+                        rows_per_image: Some(sub_h as u32),
                     },
                     wgpu::Extent3d {
-                        width: FIELD_SIZE,
-                        height: FIELD_SIZE,
+                        width: sub_w as u32,
+                        height: sub_h as u32,
                         depth_or_array_layers: 1,
                     },
                 );

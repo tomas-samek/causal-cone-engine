@@ -10,8 +10,8 @@ use rayon::prelude::*;
 // Entity → sends deposit along connections to neighbors (propagation)
 // Neighbor → accumulates incoming, adds to own deposit next tick (mixing)
 
-/// Field resolution — 128³ (2M cells, ~32MB at f32)
-pub const FIELD_SIZE: u32 = 256;
+/// Field resolution — 512³ (~134M cells, ~2GB at f32)
+pub const FIELD_SIZE: u32 = 512;
 pub const FIELD_CELLS: usize = (FIELD_SIZE * FIELD_SIZE * FIELD_SIZE) as usize;
 
 // Entity group IDs for scene organization
@@ -118,6 +118,10 @@ pub struct Entity {
     pub prev_deposit_idx: i32,
     /// Density-weighted average direction of incoming light (normalized after delivery)
     pub incoming_dir: glam::Vec3,
+    /// Debounce: previous incoming density for change detection
+    pub prev_incoming_density: f32,
+    /// Debounce: consecutive ticks with stable incoming (skip when >= edge_count)
+    pub stable_ticks: u8,
 }
 
 impl Entity {
@@ -132,7 +136,7 @@ impl Entity {
             is_vacuum: false,
             scatter: 0.0,
             specular: 0.0,
-            reemit: 0.3, // surfaces re-emit 30% — absorb most, not mirror-like
+            reemit: 0.2, // surfaces re-emit 30% — absorb most, not mirror-like
             reemit_r: 0.0,
             reemit_g: 0.0,
             reemit_b: 0.0,
@@ -146,6 +150,8 @@ impl Entity {
             oscillation_amplitude: 0.0,
             prev_deposit_idx: -1,
             incoming_dir: glam::Vec3::ZERO,
+            prev_incoming_density: 0.0,
+            stable_ticks: 0,
         }
     }
 }
@@ -175,6 +181,14 @@ pub struct DiffField {
     edge_deposits: Vec<EdgeDeposit>,
     edge_gammas: Vec<f32>,
     edge_dirs: Vec<glam::Vec3>, // precomputed normalized direction per edge (source → target)
+    // Reverse edge index — for each target entity, which edges point to it
+    reverse_edge_sources: Vec<usize>, // source entity index
+    reverse_edge_k: Vec<usize>,      // SoA edge index into edge_deposits/dirs/etc.
+    reverse_start: Vec<u32>,          // per-target-entity start into reverse arrays
+    reverse_count: Vec<u32>,          // per-target-entity incoming edge count
+    // Per-tick active/visible sets (reused allocation)
+    active_set: Vec<bool>,
+    visible_set: Vec<bool>,
 }
 
 impl DiffField {
@@ -187,11 +201,17 @@ impl DiffField {
             delivery_dirs: Vec::new(),
             aabb_min: glam::Vec3::ZERO,
             aabb_max: glam::Vec3::splat(FIELD_SIZE as f32),
-            dirty_slabs: [true; FIELD_SIZE as usize],
+            dirty_slabs: [false; FIELD_SIZE as usize],
             edge_targets: Vec::new(),
             edge_deposits: Vec::new(),
             edge_gammas: Vec::new(),
             edge_dirs: Vec::new(),
+            reverse_edge_sources: Vec::new(),
+            reverse_edge_k: Vec::new(),
+            reverse_start: Vec::new(),
+            reverse_count: Vec::new(),
+            active_set: Vec::new(),
+            visible_set: Vec::new(),
         };
 
         let sp = field.spawn_demo_scene();
@@ -230,6 +250,25 @@ impl DiffField {
 
         field.deliveries = vec![EdgeDeposit::default(); field.entities.len()];
         field.delivery_dirs = vec![glam::Vec3::ZERO; field.entities.len()];
+
+        // Build reverse edge index for pull-based delivery
+        field.build_reverse_edges();
+
+        let n = field.entities.len();
+        field.active_set = vec![false; n];
+        field.visible_set = vec![false; n];
+
+        // Seed AABB from solid entity positions so Phase 0 is tight from tick 1
+        let mut aabb_min = glam::Vec3::splat(FIELD_SIZE as f32);
+        let mut aabb_max = glam::Vec3::ZERO;
+        for e in &field.entities {
+            if !e.is_vacuum && !e.is_heat {
+                aabb_min = aabb_min.min(e.position - 1.0);
+                aabb_max = aabb_max.max(e.position + 1.0);
+            }
+        }
+        field.aabb_min = aabb_min.max(glam::Vec3::ZERO);
+        field.aabb_max = aabb_max.min(glam::Vec3::splat(FIELD_SIZE as f32));
 
         field
     }
@@ -555,6 +594,114 @@ impl DiffField {
         }
     }
 
+    /// Build reverse edge index: for each entity, which edges (from other entities) point TO it.
+    /// Enables pull-based Phase 1 delivery and backward BFS for active set computation.
+    fn build_reverse_edges(&mut self) {
+        let n = self.entities.len();
+        let total = self.edge_targets.len();
+
+        // Count incoming edges per target entity
+        let mut counts = vec![0u32; n];
+        for &target in &self.edge_targets {
+            counts[target] += 1;
+        }
+
+        // Prefix sum for reverse_start
+        self.reverse_start = vec![0u32; n];
+        self.reverse_count = counts.clone();
+        let mut offset = 0u32;
+        for i in 0..n {
+            self.reverse_start[i] = offset;
+            offset += counts[i];
+        }
+
+        // Fill reverse arrays — need source entity for each edge
+        self.reverse_edge_sources = vec![0usize; total];
+        self.reverse_edge_k = vec![0usize; total];
+        let mut fill_pos: Vec<u32> = self.reverse_start.clone();
+
+        for (i, entity) in self.entities.iter().enumerate() {
+            let start = entity.edge_start as usize;
+            let end = start + entity.edge_count as usize;
+            for k in start..end {
+                let target = self.edge_targets[k];
+                let pos = fill_pos[target] as usize;
+                self.reverse_edge_sources[pos] = i;
+                self.reverse_edge_k[pos] = k;
+                fill_pos[target] += 1;
+            }
+        }
+
+        log::info!(
+            "Reverse edge index: {} entries for {} entities",
+            total, n
+        );
+    }
+
+    /// Compute active (pipeline chain) and visible (deposits to grid) sets from the observer's
+    /// view-projection matrix. Only active entities get Phase 1-2 processing; only visible
+    /// entities deposit to the grid in Phase 3.
+    fn compute_active_set(&mut self, view_proj: glam::Mat4) {
+        let n = self.entities.len();
+
+        // Extract frustum planes from view-proj (Gribb-Hartmann method)
+        let m = view_proj;
+        let row0 = glam::Vec4::new(m.col(0).x, m.col(1).x, m.col(2).x, m.col(3).x);
+        let row1 = glam::Vec4::new(m.col(0).y, m.col(1).y, m.col(2).y, m.col(3).y);
+        let row2 = glam::Vec4::new(m.col(0).z, m.col(1).z, m.col(2).z, m.col(3).z);
+        let row3 = glam::Vec4::new(m.col(0).w, m.col(1).w, m.col(2).w, m.col(3).w);
+
+        let mut planes = [
+            row3 + row0, // left
+            row3 - row0, // right
+            row3 + row1, // bottom
+            row3 - row1, // top
+            row3 + row2, // near
+            row3 - row2, // far
+        ];
+
+        for plane in &mut planes {
+            let len = glam::Vec3::new(plane.x, plane.y, plane.z).length();
+            if len > 0.0 { *plane /= len; }
+        }
+
+        let margin = 10.0; // cells of margin around frustum for light bleed
+
+        // Single pass: classify each entity as visible, active, or neither.
+        // Emitters (deposit_magnitude >= 1.0) are always active — they're light sources.
+        // In-frustum non-vacuum solids are visible (deposit to grid).
+        // In-frustum entities (including vacuum) are active (participate in pipeline).
+        for i in 0..n {
+            let entity = &self.entities[i];
+
+            // Emitters always active (sun, eyes, etc.)
+            if entity.deposit_magnitude >= 1.0 {
+                self.active_set[i] = true;
+                self.visible_set[i] = false; // emitters may be vacuum (sun)
+                continue;
+            }
+
+            if entity.is_heat {
+                self.active_set[i] = false;
+                self.visible_set[i] = false;
+                continue;
+            }
+
+            let pos = entity.position;
+            let mut inside = true;
+            for plane in &planes {
+                let dist = plane.x * pos.x + plane.y * pos.y + plane.z * pos.z + plane.w;
+                if dist < -margin {
+                    inside = false;
+                    break;
+                }
+            }
+
+            self.active_set[i] = inside;
+            self.visible_set[i] = inside && !entity.is_vacuum;
+        }
+    }
+
     /// Assign oscillation parameters to all entities in a group.
     fn set_group_oscillation(&mut self, group: u16, freq: f32, amplitude: f32, phase_mode: PhaseMode) {
         for entity in &mut self.entities {
@@ -863,23 +1010,46 @@ impl DiffField {
     }
 
     /// Run one simulation tick — push-driven pipe propagation
-    pub fn tick(&mut self) {
-        // depletion is now per-entity via pass_through
+    pub fn tick(&mut self, view_proj: glam::Mat4) {
+        // Compute active set: which entity chains feed into what the observer sees
+        self.compute_active_set(view_proj);
 
-        // Phase 0: decay the grid — parallel over dirty slabs
-        let slab_size = (FIELD_SIZE * FIELD_SIZE) as usize;
-        self.cells
-            .par_chunks_mut(slab_size)
-            .zip(self.dirty_slabs.par_iter_mut())
-            .for_each(|(slab, dirty)| {
-                if !*dirty { return; }
-                let mut any_nonzero = false;
-                for cell in slab.iter_mut() {
+        // Phase 0: AABB-restricted decay — only touch cells near geometry
+        // The AABB from previous tick tells us where deposits exist.
+        // Margin of 40 covers vacuum scatter region generously.
+        let margin = 40.0f32;
+        let fs = FIELD_SIZE as usize;
+        let dx_min = (self.aabb_min.x - margin).max(0.0) as usize;
+        let dx_max = ((self.aabb_max.x + margin) as usize + 1).min(fs);
+        let dy_min = (self.aabb_min.y - margin).max(0.0) as usize;
+        let dy_max = ((self.aabb_max.y + margin) as usize + 1).min(fs);
+        let dz_min = (self.aabb_min.z - margin).max(0.0) as usize;
+        let dz_max = ((self.aabb_max.z + margin) as usize + 1).min(fs);
+
+        for z in 0..fs {
+            if !self.dirty_slabs[z] { continue; }
+
+            if z < dz_min || z >= dz_max {
+                // Outside AABB z range — stale deposits, clear and mark clean
+                let slab_base = z * fs * fs;
+                for cell in &mut self.cells[slab_base..slab_base + fs * fs] {
+                    *cell = FieldCell::default();
+                }
+                self.dirty_slabs[z] = false;
+                continue;
+            }
+
+            // Within AABB z range — decay only the AABB sub-rectangle
+            let slab_base = z * fs * fs;
+            let mut any_nonzero = false;
+            for y in dy_min..dy_max {
+                let row_base = slab_base + y * fs;
+                for x in dx_min..dx_max {
+                    let cell = &mut self.cells[row_base + x];
                     cell.density *= 0.85;
                     cell.color_r *= 0.85;
                     cell.color_g *= 0.85;
                     cell.color_b *= 0.85;
-                    // Hard zero: kill near-zero cells so slabs can become clean
                     if cell.density < 0.001 {
                         cell.density = 0.0;
                         cell.color_r = 0.0;
@@ -889,11 +1059,12 @@ impl DiffField {
                         any_nonzero = true;
                     }
                 }
-                if !any_nonzero { *dirty = false; }
-            });
+            }
+            if !any_nonzero { self.dirty_slabs[z] = false; }
+        }
 
-        // Phase 1: DELIVER — each edge's pipe contents arrive at target.
-        // Also track incoming light direction (density-weighted) for directional propagation.
+        // Phase 1: PUSH-BASED DELIVER with active filtering.
+        // Sequential SoA reads for cache-friendly iteration. Skip writes to inactive targets.
         self.deliveries.fill(EdgeDeposit::default());
         self.delivery_dirs.fill(glam::Vec3::ZERO);
         for (_src_idx, entity) in self.entities.iter().enumerate() {
@@ -901,37 +1072,46 @@ impl DiffField {
             let end = start + entity.edge_count as usize;
             for k in start..end {
                 let target = self.edge_targets[k];
+                if !self.active_set[target] { continue; }
                 let dep = &self.edge_deposits[k];
                 self.deliveries[target].r += dep.r;
                 self.deliveries[target].g += dep.g;
                 self.deliveries[target].b += dep.b;
                 self.deliveries[target].density += dep.density;
-                // Accumulate travel direction weighted by density (precomputed edge dir)
                 if dep.density > 0.001 {
                     self.delivery_dirs[target] += self.edge_dirs[k] * dep.density;
                 }
             }
         }
-        // Apply deliveries + build re-emission for solid surfaces
-        for (i, entity) in self.entities.iter_mut().enumerate() {
+        // Apply deliveries + build re-emission + debounce tracking for active entities
+        let n = self.entities.len();
+        for i in 0..n {
+            if !self.active_set[i] { continue; }
+            let entity = &mut self.entities[i];
+            let new_density = self.deliveries[i].density;
             entity.incoming = self.deliveries[i];
             entity.incoming_dir = self.delivery_dirs[i].normalize_or_zero();
 
-            // Solid surfaces absorb incoming light and become secondary emitters.
-            // Each entity represents billions of atoms — coherent re-emission,
-            // not relay-node pass-through. Color-filtered by surface.
-            // Capped to prevent runaway feedback.
-            if !entity.is_vacuum && entity.reemit > 0.0 && self.deliveries[i].density > 0.01 {
+            // Debounce: detect if incoming has changed
+            let diff = (new_density - entity.prev_incoming_density).abs();
+            let threshold = 0.01 * entity.prev_incoming_density.abs().max(0.01);
+            if diff < threshold {
+                entity.stable_ticks = entity.stable_ticks.saturating_add(1);
+            } else {
+                entity.stable_ticks = 0;
+            }
+            entity.prev_incoming_density = new_density;
+
+            if !entity.is_vacuum && entity.reemit > 0.0 && new_density > 0.01 {
                 let re = entity.reemit;
-                let cap = 50.0; // high cap — floor needs to blast light upward to belly
+                let cap = 50.0;
                 entity.reemit_r = (self.deliveries[i].r * re * entity.color[0]).min(cap);
                 entity.reemit_g = (self.deliveries[i].g * re * entity.color[1]).min(cap);
                 entity.reemit_b = (self.deliveries[i].b * re * entity.color[2]).min(cap);
             }
 
-            // Heat nodes wake up if enough light reaches them through neighbors
-            if entity.is_heat && self.deliveries[i].density > 1.0 {
-                entity.is_heat = false; // light penetrated — no longer invisible
+            if entity.is_heat && new_density > 1.0 {
+                entity.is_heat = false;
             }
         }
 
@@ -950,20 +1130,16 @@ impl DiffField {
         let entities = &self.entities;
         let edge_gammas = &self.edge_gammas;
         let edge_dir_arr = &self.edge_dirs;
+        let active = &self.active_set;
         let edge_deposits = &mut self.edge_deposits;
 
-        // Build a slice of mutable sub-slices, one per entity's edge range.
-        // Since ranges are non-overlapping and contiguous, we split once and index.
         let edge_deposit_slice = edge_deposits.as_mut_slice();
-
-        // SAFETY: each entity writes to its own non-overlapping [start..start+count) range,
-        // assigned by flatten_edges. We encode the pointer as usize (Send+Sync) and
-        // reconstruct inside the closure.
         let edge_base = edge_deposit_slice.as_mut_ptr() as usize;
         let edge_len = edge_deposit_slice.len();
 
-        entities.par_iter().zip(edge_ranges.par_iter()).for_each(|(entity, &(start, count))| {
-            if count == 0 { return; }
+        entities.par_iter().enumerate().zip(edge_ranges.par_iter()).for_each(|((idx, entity), &(start, count))| {
+            // Skip inactive entities and debounced entities (stable input for edge_count ticks)
+            if count == 0 || !active[idx] || entity.stable_ticks >= entity.edge_count.max(1) as u8 { return; }
             let end = start + count;
 
             let deposits = unsafe {
@@ -1030,11 +1206,11 @@ impl DiffField {
             }
         });
 
-        // Phase 3: entities deposit to grid (for rendering)
+        // Phase 3: entities deposit to grid (only visible entities)
         let mut aabb_min = glam::Vec3::splat(FIELD_SIZE as f32);
         let mut aabb_max = glam::Vec3::splat(0.0);
-        for entity in &mut self.entities {
-            // Move entity
+        for (ent_idx, entity) in self.entities.iter_mut().enumerate() {
+            // Move entity (all entities, not just visible — keeps positions consistent)
             entity.position += entity.velocity;
 
             // Bounce
@@ -1048,9 +1224,9 @@ impl DiffField {
             // Heat: interior, light can't escape. Always skip.
             if entity.is_heat { continue; }
 
-            // Vacuum with atmosphere: scatter a tiny fraction into the grid.
-            // This IS air — molecules redirecting photons, creating ambient light.
+            // Vacuum with atmosphere: scatter into grid only if active
             if entity.is_vacuum {
+                if !self.active_set[ent_idx] { continue; }
                 if entity.scatter > 0.0 && entity.incoming.density > 0.1 {
                     let ix = entity.position.x as i32;
                     let iy = entity.position.y as i32;
@@ -1075,6 +1251,9 @@ impl DiffField {
             aabb_min = aabb_min.min(entity.position - 1.0);
             aabb_max = aabb_max.max(entity.position + 1.0);
 
+            // Skip deposit for non-visible solid entities (reactive: only render subscribed chains)
+            if !self.visible_set[ent_idx] { continue; }
+
             // Skin texture: offset deposit along surface normal
             let mut deposit_pos = entity.position;
             if entity.oscillation_amplitude > 0.0 {
@@ -1093,6 +1272,22 @@ impl DiffField {
                 let amplitude = 3.0 * z_frac; // tip swings 3 cells, body junction ~0
                 let phase = time * frequency + z_frac * 2.0; // traveling wave
                 deposit_pos.x += amplitude * phase.sin();
+            }
+
+            // Jaw open/close: rotate jaw downward around pivot at back of jaw.
+            // Front of jaw swings down, back stays nearly fixed. Mouth follows.
+            if entity.group == GROUP_JAW || entity.group == GROUP_MOUTH {
+                let time = self.tick as f32 / 30.0;
+                let frequency = std::f32::consts::PI * 0.5; // ~4 sec full cycle
+                let center = FIELD_SIZE as f32 / 2.0;
+                let pivot_z = center + 8.0;  // back of jaw (base z-offset from center)
+
+                // z_frac: 0 at pivot (back), 1 at front of jaw
+                let z_frac = ((entity.position.z - pivot_z) / 8.0).clamp(0.0, 1.0);
+
+                // Jaw only opens DOWN (abs), never pushes up into head
+                let open_amount = (time * frequency).sin().abs();
+                deposit_pos.y -= z_frac * 1.5 * open_amount;
             }
 
             // Trilinear 2x2x2 splat — each entity covers its 8 nearest grid cells,
