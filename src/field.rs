@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use rayon::prelude::*;
 
 // Diff Field — the persistent 3D texture that IS the universe.
 //
@@ -173,6 +174,7 @@ pub struct DiffField {
     edge_targets: Vec<usize>,
     edge_deposits: Vec<EdgeDeposit>,
     edge_gammas: Vec<f32>,
+    edge_dirs: Vec<glam::Vec3>, // precomputed normalized direction per edge (source → target)
 }
 
 impl DiffField {
@@ -189,9 +191,20 @@ impl DiffField {
             edge_targets: Vec::new(),
             edge_deposits: Vec::new(),
             edge_gammas: Vec::new(),
+            edge_dirs: Vec::new(),
         };
 
         let sp = field.spawn_demo_scene();
+
+        // Sort entities by grid cell index (z-major) for cache-friendly Phase 3 deposits.
+        // Must happen before build_connections which assigns edge indices.
+        field.entities.sort_by_key(|e| {
+            let x = e.position.x as u32;
+            let y = e.position.y as u32;
+            let z = e.position.z as u32;
+            z * FIELD_SIZE * FIELD_SIZE + y * FIELD_SIZE + x
+        });
+
         let connect_dist = (sp * 5.0).min(3.5);
         let radiation_dist = (sp * 15.0).min(10.0);
         field.build_connections(connect_dist);
@@ -526,14 +539,17 @@ impl DiffField {
     fn flatten_edges(&mut self, temp_edges: Vec<Vec<usize>>) {
         let total: usize = temp_edges.iter().map(|e| e.len()).sum();
         self.edge_targets = Vec::with_capacity(total);
+        self.edge_dirs = Vec::with_capacity(total);
         self.edge_deposits = vec![EdgeDeposit::default(); total];
         self.edge_gammas = vec![1.0; total];
         let mut offset = 0u32;
         for (i, edges) in temp_edges.iter().enumerate() {
             self.entities[i].edge_start = offset;
             self.entities[i].edge_count = edges.len() as u32;
+            let pos_i = self.entities[i].position;
             for &target in edges {
                 self.edge_targets.push(target);
+                self.edge_dirs.push((self.entities[target].position - pos_i).normalize_or_zero());
             }
             offset += edges.len() as u32;
         }
@@ -850,22 +866,31 @@ impl DiffField {
     pub fn tick(&mut self) {
         // depletion is now per-entity via pass_through
 
-        // Phase 0: decay the grid — only dirty slabs
+        // Phase 0: decay the grid — parallel over dirty slabs
         let slab_size = (FIELD_SIZE * FIELD_SIZE) as usize;
-        for z in 0..FIELD_SIZE as usize {
-            if !self.dirty_slabs[z] { continue; }
-            let start = z * slab_size;
-            let end = start + slab_size;
-            let mut any_nonzero = false;
-            for cell in &mut self.cells[start..end] {
-                cell.density *= 0.85;
-                cell.color_r *= 0.85;
-                cell.color_g *= 0.85;
-                cell.color_b *= 0.85;
-                if cell.density > 0.001 { any_nonzero = true; }
-            }
-            if !any_nonzero { self.dirty_slabs[z] = false; }
-        }
+        self.cells
+            .par_chunks_mut(slab_size)
+            .zip(self.dirty_slabs.par_iter_mut())
+            .for_each(|(slab, dirty)| {
+                if !*dirty { return; }
+                let mut any_nonzero = false;
+                for cell in slab.iter_mut() {
+                    cell.density *= 0.85;
+                    cell.color_r *= 0.85;
+                    cell.color_g *= 0.85;
+                    cell.color_b *= 0.85;
+                    // Hard zero: kill near-zero cells so slabs can become clean
+                    if cell.density < 0.001 {
+                        cell.density = 0.0;
+                        cell.color_r = 0.0;
+                        cell.color_g = 0.0;
+                        cell.color_b = 0.0;
+                    } else {
+                        any_nonzero = true;
+                    }
+                }
+                if !any_nonzero { *dirty = false; }
+            });
 
         // Phase 1: DELIVER — each edge's pipe contents arrive at target.
         // Also track incoming light direction (density-weighted) for directional propagation.
@@ -881,10 +906,9 @@ impl DiffField {
                 self.deliveries[target].g += dep.g;
                 self.deliveries[target].b += dep.b;
                 self.deliveries[target].density += dep.density;
-                // Accumulate travel direction weighted by density
+                // Accumulate travel direction weighted by density (precomputed edge dir)
                 if dep.density > 0.001 {
-                    let dir = self.entities[target].position - entity.position;
-                    self.delivery_dirs[target] += dir.normalize_or_zero() * dep.density;
+                    self.delivery_dirs[target] += self.edge_dirs[k] * dep.density;
                 }
             }
         }
@@ -911,52 +935,65 @@ impl DiffField {
             }
         }
 
-        // Phase 2: PUSH — each entity pushes new content into its pipes.
+        // Phase 2: PUSH — each entity pushes new content into its pipes (parallel).
         // New content = entity's own emission + pass-through of incoming (depleted).
         // This REPLACES what was in the pipe (old content was delivered in Phase 1).
-        // CUTOFF: if incoming is below threshold, don't pass it through (signal is dead).
+        // Safe to parallelize: each entity writes to its own non-overlapping edge range.
         let cutoff: f32 = 0.01;
-
-        // Split borrow: read entities, write edge_deposits
-        let entities = &self.entities;
-        let edge_deposits = &mut self.edge_deposits;
-        let edge_gammas = &self.edge_gammas;
-        let edge_targets = &self.edge_targets;
         let directionality: f32 = 0.8; // 0=isotropic, 1=fully directional
-        for entity in entities.iter() {
-            if entity.edge_count == 0 { continue; }
 
-            let start = entity.edge_start as usize;
-            let end = start + entity.edge_count as usize;
+        // Collect per-entity edge ranges for parallel slicing
+        let edge_ranges: Vec<(usize, usize)> = self.entities.iter().map(|e| {
+            (e.edge_start as usize, e.edge_count as usize)
+        }).collect();
 
-            // Compute effective weights: gamma × directional bias for vacuum
-            // Vacuum entities forward-bias light along incoming direction.
-            // Solid entities emit isotropically (no directional bias).
+        let entities = &self.entities;
+        let edge_gammas = &self.edge_gammas;
+        let edge_dir_arr = &self.edge_dirs;
+        let edge_deposits = &mut self.edge_deposits;
+
+        // Build a slice of mutable sub-slices, one per entity's edge range.
+        // Since ranges are non-overlapping and contiguous, we split once and index.
+        let edge_deposit_slice = edge_deposits.as_mut_slice();
+
+        // SAFETY: each entity writes to its own non-overlapping [start..start+count) range,
+        // assigned by flatten_edges. We encode the pointer as usize (Send+Sync) and
+        // reconstruct inside the closure.
+        let edge_base = edge_deposit_slice.as_mut_ptr() as usize;
+        let edge_len = edge_deposit_slice.len();
+
+        entities.par_iter().zip(edge_ranges.par_iter()).for_each(|(entity, &(start, count))| {
+            if count == 0 { return; }
+            let end = start + count;
+
+            let deposits = unsafe {
+                assert!(end <= edge_len);
+                let ptr = edge_base as *mut EdgeDeposit;
+                std::slice::from_raw_parts_mut(ptr.add(start), count)
+            };
+
             let has_dir = entity.is_vacuum && entity.incoming_dir.length_squared() > 0.01;
             let mut total_weight: f32 = 0.0;
-            for k in start..end {
+            for (local_k, dep) in deposits.iter_mut().enumerate() {
+                let k = start + local_k;
                 let mut w = edge_gammas[k];
                 if has_dir {
-                    let target = edge_targets[k];
-                    let edge_dir = (entities[target].position - entity.position).normalize_or_zero();
-                    let alignment = edge_dir.dot(entity.incoming_dir); // -1 to 1
-                    let bias = (1.0 + alignment * directionality) * 0.5; // 0.1..0.9
-                    w *= bias.max(0.01); // never fully zero
+                    let edge_dir = edge_dir_arr[k];
+                    let alignment = edge_dir.dot(entity.incoming_dir);
+                    let bias = (1.0 + alignment * directionality) * 0.5;
+                    w *= bias.max(0.01);
                 }
-                // Temporarily store effective weight in deposit's density field
-                edge_deposits[k].density = w;
+                dep.density = w;
                 total_weight += w;
             }
-            if total_weight < 0.001 { continue; }
+            if total_weight < 0.001 { return; }
 
             let mag = entity.deposit_magnitude;
-            // Own emission + re-emission (total, not per-edge yet)
             let own_r = entity.color[0] * mag + entity.reemit_r;
             let own_g = entity.color[1] * mag + entity.reemit_g;
             let own_b = entity.color[2] * mag + entity.reemit_b;
             let own_d = mag + entity.reemit_r + entity.reemit_g + entity.reemit_b;
 
-            // Pass-through (total, not per-edge yet)
             let (pass_r, pass_g, pass_b, pass_d) = if entity.incoming.density > cutoff {
                 let pt = entity.pass_through;
                 if entity.is_vacuum {
@@ -980,19 +1017,18 @@ impl DiffField {
                 (0.0, 0.0, 0.0, 0.0)
             };
 
-            // Push into each pipe, weighted by effective weight (gamma × directional bias)
             let total_r = own_r + pass_r;
             let total_g = own_g + pass_g;
             let total_b = own_b + pass_b;
             let total_d = own_d + pass_d;
-            for k in start..end {
-                let w = edge_deposits[k].density / total_weight;
-                edge_deposits[k].r = total_r * w;
-                edge_deposits[k].g = total_g * w;
-                edge_deposits[k].b = total_b * w;
-                edge_deposits[k].density = total_d * w;
+            for dep in deposits.iter_mut() {
+                let w = dep.density / total_weight;
+                dep.r = total_r * w;
+                dep.g = total_g * w;
+                dep.b = total_b * w;
+                dep.density = total_d * w;
             }
-        }
+        });
 
         // Phase 3: entities deposit to grid (for rendering)
         let mut aabb_min = glam::Vec3::splat(FIELD_SIZE as f32);

@@ -115,10 +115,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
 
-    // March parameters
-    let max_steps = 128u;
-    var step_size = 0.5; // start with half-cell steps for precision
-    let step_growth = 1.02; // each step slightly larger (logarithmic march)
+    // March parameters (tuned: 96 steps with faster growth covers >375 cells)
+    let max_steps = 96u;
+    var step_size = 0.6; // start with sub-cell steps for precision
+    let step_growth = 1.03; // each step slightly larger (logarithmic march)
     let density_threshold = 0.01; // minimum density to register as a hit
     let max_distance = min(t_exit, 200.0); // clip to AABB exit
 
@@ -152,8 +152,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             accumulated_color += contribution;
             accumulated_alpha += opacity * (1.0 - accumulated_alpha);
 
-            // Early exit if fully opaque
-            if accumulated_alpha > 0.95 {
+            // Early exit if nearly opaque
+            if accumulated_alpha > 0.92 {
                 break;
             }
         }

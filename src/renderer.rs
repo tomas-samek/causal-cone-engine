@@ -6,7 +6,7 @@
 // No meshes. No draw calls. No lights. No shadows.
 // Just a 3D texture and a camera swimming through it.
 
-use crate::field::{DiffField, FieldCell, FIELD_CELLS, FIELD_SIZE};
+use crate::field::{DiffField, FIELD_SIZE};
 use crate::observer::Observer;
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
@@ -52,6 +52,7 @@ pub struct Renderer {
     // The field data on CPU
     diff_field: DiffField,
     last_uploaded_tick: u64,
+    upload_buf: Vec<u16>, // f16 staging buffer for slab-by-slab upload
 }
 
 impl Renderer {
@@ -121,7 +122,7 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::Rgba32Float,
+            format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -279,6 +280,7 @@ impl Renderer {
             field_bind_group,
             diff_field,
             last_uploaded_tick: 0,
+            upload_buf: vec![0u16; (FIELD_SIZE * FIELD_SIZE * 4) as usize],
         }
     }
 
@@ -298,16 +300,25 @@ impl Renderer {
 
     /// Render one frame — sample the field from the observer's perspective
     pub fn render(&mut self, observer: &Observer) -> Result<(), wgpu::SurfaceError> {
-        // Upload only dirty slabs when simulation has advanced
+        // Upload dirty slabs when simulation has advanced — convert f32→f16 per slab
         if self.diff_field.tick != self.last_uploaded_tick {
-            let bytes_per_cell = std::mem::size_of::<FieldCell>();
-            let slab_bytes = (FIELD_SIZE * FIELD_SIZE) as usize * bytes_per_cell;
-            let field_bytes = self.diff_field.as_bytes();
-            let bytes_per_row = FIELD_SIZE * bytes_per_cell as u32;
+            let slab_cells = (FIELD_SIZE * FIELD_SIZE) as usize;
+            let bytes_per_row = FIELD_SIZE * 4 * 2; // 4 channels × 2 bytes (f16)
 
             for z in 0..FIELD_SIZE as usize {
                 if !self.diff_field.dirty_slabs[z] { continue; }
-                let offset = z * slab_bytes;
+
+                // Convert f32 cells to f16 in the staging buffer
+                let slab_start = z * slab_cells;
+                let f32_slab = &self.diff_field.cells[slab_start..slab_start + slab_cells];
+                for (i, cell) in f32_slab.iter().enumerate() {
+                    let base = i * 4;
+                    self.upload_buf[base]     = half::f16::from_f32(cell.density).to_bits();
+                    self.upload_buf[base + 1] = half::f16::from_f32(cell.color_r).to_bits();
+                    self.upload_buf[base + 2] = half::f16::from_f32(cell.color_g).to_bits();
+                    self.upload_buf[base + 3] = half::f16::from_f32(cell.color_b).to_bits();
+                }
+
                 self.queue.write_texture(
                     wgpu::ImageCopyTexture {
                         texture: &self.field_texture,
@@ -315,7 +326,7 @@ impl Renderer {
                         origin: wgpu::Origin3d { x: 0, y: 0, z: z as u32 },
                         aspect: wgpu::TextureAspect::All,
                     },
-                    &field_bytes[offset..offset + slab_bytes],
+                    bytemuck::cast_slice(&self.upload_buf),
                     wgpu::ImageDataLayout {
                         offset: 0,
                         bytes_per_row: Some(bytes_per_row),
