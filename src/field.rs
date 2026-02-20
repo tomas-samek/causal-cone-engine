@@ -813,22 +813,22 @@ impl DiffField {
         }
 
         let balls = [
-            Metaball { center: base + glam::Vec3::new(0.0, 5.0, 0.0),     radii: glam::Vec3::new(5.0, 6.0, 8.0),   weight: 5.0, color: green,      magnitude: 0.05, pass_through: 0.3,  group: GROUP_BODY },
-            Metaball { center: base + glam::Vec3::new(0.0, 1.0, 0.0),     radii: glam::Vec3::new(4.5, 4.0, 7.0),   weight: 5.0, color: belly,      magnitude: 0.05, pass_through: 0.45, group: GROUP_BELLY },
-            Metaball { center: base + glam::Vec3::new(0.0, 5.5, -12.0),   radii: glam::Vec3::new(2.5, 2.5, 7.0),   weight: 5.0, color: green,      magnitude: 0.05, pass_through: 0.3,  group: GROUP_TAIL },
-            Metaball { center: base + glam::Vec3::new(0.0, 5.5, -20.0),   radii: glam::Vec3::new(1.2, 1.2, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.05, pass_through: 0.25, group: GROUP_TAIL_TIP },
-            Metaball { center: base + glam::Vec3::new(0.0, 10.0, 8.0),    radii: glam::Vec3::new(3.0, 5.0, 3.0),   weight: 5.0, color: green,      magnitude: 0.05, pass_through: 0.3,  group: GROUP_NECK },
-            Metaball { center: base + glam::Vec3::new(0.0, 16.0, 10.0),   radii: glam::Vec3::new(3.5, 3.0, 5.0),   weight: 5.0, color: green,      magnitude: 0.05, pass_through: 0.3,  group: GROUP_HEAD },
-            Metaball { center: base + glam::Vec3::new(0.0, 13.5, 12.0),   radii: glam::Vec3::new(2.5, 1.5, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.05, pass_through: 0.25, group: GROUP_JAW },
-            Metaball { center: base + glam::Vec3::new(0.0, 14.5, 13.0),   radii: glam::Vec3::new(2.0, 0.8, 3.0),   weight: 5.0, color: mouth,      magnitude: 0.05, pass_through: 0.15, group: GROUP_MOUTH },
+            Metaball { center: base + glam::Vec3::new(0.0, 5.0, 0.0),     radii: glam::Vec3::new(5.0, 6.0, 8.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_BODY },
+            Metaball { center: base + glam::Vec3::new(0.0, 1.0, 0.0),     radii: glam::Vec3::new(4.5, 4.0, 7.0),   weight: 5.0, color: belly,      magnitude: 0.2,  pass_through: 0.06, group: GROUP_BELLY },
+            Metaball { center: base + glam::Vec3::new(0.0, 5.5, -12.0),   radii: glam::Vec3::new(2.5, 2.5, 7.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_TAIL },
+            Metaball { center: base + glam::Vec3::new(0.0, 5.5, -20.0),   radii: glam::Vec3::new(1.2, 1.2, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_TAIL_TIP },
+            Metaball { center: base + glam::Vec3::new(0.0, 10.0, 8.0),    radii: glam::Vec3::new(3.0, 5.0, 3.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_NECK },
+            Metaball { center: base + glam::Vec3::new(0.0, 16.0, 10.0),   radii: glam::Vec3::new(3.5, 3.0, 5.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_HEAD },
+            Metaball { center: base + glam::Vec3::new(0.0, 13.5, 12.0),   radii: glam::Vec3::new(2.5, 1.5, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_JAW },
+            Metaball { center: base + glam::Vec3::new(0.0, 14.5, 13.0),   radii: glam::Vec3::new(2.0, 0.8, 3.0),   weight: 5.0, color: mouth,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_MOUTH },
             Metaball { center: base + glam::Vec3::new(3.0, 17.0, 12.0),   radii: glam::Vec3::new(0.8, 0.8, 0.8),   weight: 8.0, color: eye_color,  magnitude: 4.0,  pass_through: 0.1,  group: GROUP_EYE },
             Metaball { center: base + glam::Vec3::new(-3.0, 17.0, 12.0),  radii: glam::Vec3::new(0.8, 0.8, 0.8),   weight: 8.0, color: eye_color,  magnitude: 4.0,  pass_through: 0.1,  group: GROUP_EYE },
-            Metaball { center: base + glam::Vec3::new(3.0, -3.0, 1.0),    radii: glam::Vec3::new(2.0, 5.0, 2.5),   weight: 5.0, color: dark_green, magnitude: 0.05, pass_through: 0.25, group: GROUP_LEG_L },
-            Metaball { center: base + glam::Vec3::new(3.0, -8.0, 2.0),    radii: glam::Vec3::new(2.5, 1.0, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.05, pass_through: 0.25, group: GROUP_FOOT_L },
-            Metaball { center: base + glam::Vec3::new(-3.0, -3.0, 1.0),   radii: glam::Vec3::new(2.0, 5.0, 2.5),   weight: 5.0, color: dark_green, magnitude: 0.05, pass_through: 0.25, group: GROUP_LEG_R },
-            Metaball { center: base + glam::Vec3::new(-3.0, -8.0, 2.0),   radii: glam::Vec3::new(2.5, 1.0, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.05, pass_through: 0.25, group: GROUP_FOOT_R },
-            Metaball { center: base + glam::Vec3::new(4.5, 6.0, 5.0),     radii: glam::Vec3::new(1.0, 2.5, 1.0),   weight: 5.0, color: green,      magnitude: 0.05, pass_through: 0.3,  group: GROUP_ARM_R },
-            Metaball { center: base + glam::Vec3::new(-4.5, 6.0, 5.0),    radii: glam::Vec3::new(1.0, 2.5, 1.0),   weight: 5.0, color: green,      magnitude: 0.05, pass_through: 0.3,  group: GROUP_ARM_L },
+            Metaball { center: base + glam::Vec3::new(3.0, -3.0, 1.0),    radii: glam::Vec3::new(2.0, 5.0, 2.5),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_LEG_L },
+            Metaball { center: base + glam::Vec3::new(3.0, -8.0, 2.0),    radii: glam::Vec3::new(2.5, 1.0, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_FOOT_L },
+            Metaball { center: base + glam::Vec3::new(-3.0, -3.0, 1.0),   radii: glam::Vec3::new(2.0, 5.0, 2.5),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_LEG_R },
+            Metaball { center: base + glam::Vec3::new(-3.0, -8.0, 2.0),   radii: glam::Vec3::new(2.5, 1.0, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_FOOT_R },
+            Metaball { center: base + glam::Vec3::new(4.5, 6.0, 5.0),     radii: glam::Vec3::new(1.0, 2.5, 1.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_ARM_R },
+            Metaball { center: base + glam::Vec3::new(-4.5, 6.0, 5.0),    radii: glam::Vec3::new(1.0, 2.5, 1.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_ARM_L },
         ];
 
         // Bounding box of all metaball influence regions
