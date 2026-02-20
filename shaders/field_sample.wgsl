@@ -168,7 +168,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
                 // Diffuse shading: Lambert (N dot L), clamped with ambient floor
                 let n_dot_l = max(dot(normal, sun_dir), 0.0);
-                let ambient = 0.25; // ambient fill so shadows aren't pitch black
+                let ambient = 0.10; // ambient fill so shadows aren't pitch black
                 let diffuse = ambient + (1.0 - ambient) * n_dot_l;
 
                 // Rim light: subtle brightening at grazing angles (Fresnel-like)
