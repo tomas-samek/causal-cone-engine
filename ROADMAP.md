@@ -49,7 +49,11 @@
 - Radial density profile: scatter/magnitude peaked at dino center, Gaussian-like falloff
 - Per-tick atmospheric modulation: scatter/magnitude follow live AABB center
 - Shader ambient floor: 0.25 → 0.10 for deeper ground shadows
-- Observer start position: z=380 → z=310 for closer view
+- Observer start position: z=380 → z=310 for a closer view
+- Gamma surface model: replaced BFS hollow shell (~27K entities) with ~27 skeleton entities using anisotropic gaussian deposits. Each skeleton point deposits an ellipsoidal blob matching its metaball radii — overlapping gaussians merge into continuous density field. ~200× fewer cell writes per tick.
+- Receptor shell: lightweight BFS surface entities (spacing 1.0) catch atmosphere light via radiation links. Skeleton handles density, receptors handle lighting — two systems writing to the same grid.
+- Midpoint entities: interpolated skeleton points at joints (body↔neck, neck↔head, body↔tail, etc.) for smoother blending between body parts.
+- Cleanup: removed BFS builder, grid_pos/is_subsurface fields, metaball field evaluator simplified to surface detection only.
 
 ## v0.7: Multiple objects interacting
 - Multiple independent entity groups

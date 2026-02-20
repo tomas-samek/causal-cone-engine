@@ -126,6 +126,9 @@ pub struct Entity {
     pub prev_incoming_density: f32,
     /// Debounce: consecutive ticks with stable incoming (skip when >= edge_count)
     pub stable_ticks: u8,
+    /// Anisotropic deposit extent (rx, ry, rz). When non-zero, Phase 3 uses gaussian
+    /// deposit with these radii instead of the tent kernel.
+    pub deposit_radii: glam::Vec3,
 }
 
 impl Entity {
@@ -158,6 +161,7 @@ impl Entity {
             incoming_dir: glam::Vec3::ZERO,
             prev_incoming_density: 0.0,
             stable_ticks: 0,
+            deposit_radii: glam::Vec3::ZERO,
         }
     }
 }
@@ -195,6 +199,67 @@ pub struct DiffField {
     // Per-tick active/visible sets (reused allocation)
     active_set: Vec<bool>,
     visible_set: Vec<bool>,
+}
+
+// ── Metaball source definitions for skeleton + receptor placement ──────────
+
+struct MetaballSource {
+    center: glam::Vec3,
+    radii: glam::Vec3,
+    color: [f32; 3],
+    magnitude: f32,
+    pass_through: f32,
+    group: u16,
+}
+
+struct MetaballSample {
+    total_field: f32,
+    color: [f32; 3],
+    pass_through: f32,
+    group: u16,
+}
+
+fn evaluate_metaball_field(pos: glam::Vec3, balls: &[MetaballSource]) -> MetaballSample {
+    let mut total_field = 0.0f32;
+    let mut acc_r = 0.0f32;
+    let mut acc_g = 0.0f32;
+    let mut acc_b = 0.0f32;
+    let mut acc_pt = 0.0f32;
+    let mut best_group = GROUP_NONE;
+    let mut best_c = 0.0f32;
+
+    for b in balls {
+        let d = (pos - b.center) / b.radii;
+        let r2 = d.x * d.x + d.y * d.y + d.z * d.z;
+        if r2 >= 1.0 { continue; }
+        let c = 1.0 - r2;
+        total_field += c;
+        acc_r += b.color[0] * c;
+        acc_g += b.color[1] * c;
+        acc_b += b.color[2] * c;
+        acc_pt += b.pass_through * c;
+        if c > best_c {
+            best_c = c;
+            best_group = b.group;
+        }
+    }
+
+    if total_field > 0.0 {
+        let inv = 1.0 / total_field;
+        MetaballSample {
+            total_field,
+            color: [acc_r * inv, acc_g * inv, acc_b * inv],
+            pass_through: acc_pt * inv,
+            group: best_group,
+        }
+    } else {
+        MetaballSample {
+            total_field: 0.0,
+            color: [0.0; 3],
+            pass_through: 0.0,
+            group: GROUP_NONE,
+        }
+    }
 }
 
 impl DiffField {
@@ -306,18 +371,18 @@ impl DiffField {
         map
     }
 
-    /// Build connection edges and detect heat. Entities within connect_dist get bidirectional edges.
-    /// Also detects interior (heat) entities that are fully surrounded by absorbing neighbors.
+    /// Build connection edges and detect heat via spatial hash.
     fn build_connections(&mut self, connect_dist: f32) {
         let connect_dist_sq = connect_dist * connect_dist;
         let n = self.entities.len();
 
         let positions: Vec<glam::Vec3> = self.entities.iter().map(|e| e.position).collect();
 
-        // Collect connection edges via spatial hash (O(n) instead of O(n²))
-        let grid = Self::spatial_hash(&positions, connect_dist);
         let mut temp_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut connection_count = 0u64;
+
+        // Spatial hash for all edges
+        let grid = Self::spatial_hash(&positions, connect_dist);
+        let mut edge_count = 0u64;
         for i in 0..n {
             let pos = positions[i];
             let cx = (pos.x / connect_dist).floor() as i32;
@@ -333,7 +398,7 @@ impl DiffField {
                                 if dist_sq < connect_dist_sq {
                                     temp_edges[i].push(j);
                                     temp_edges[j].push(i);
-                                    connection_count += 1;
+                                    edge_count += 1;
                                 }
                             }
                         }
@@ -356,11 +421,8 @@ impl DiffField {
         }
 
         log::info!(
-            "Graph built: {} entities, {} connection edges (avg {:.1} per entity, capped at {})",
-            n,
-            connection_count,
-            (connection_count * 2) as f32 / n as f32,
-            max_connections
+            "Graph built: {} entities, {} edges (capped at {} per entity)",
+            n, edge_count, max_connections
         );
 
         // Detect interior (heat) entities.
@@ -412,22 +474,21 @@ impl DiffField {
             }
         }
 
-        // Two-layer coloring: darken subsurface entities (those adjacent to heat/interior).
-        // Surface entities keep full color; entities touching the interior are the "under-skin"
-        // layer and get darkened. Creates visible depth when the surface oscillates.
-        let mut subsurface_count = 0;
+        // Darken entities adjacent to heat (depth shading for rock, etc.)
+        let mut darkened_count = 0;
         for i in 0..n {
             if self.entities[i].is_vacuum || self.entities[i].is_heat { continue; }
-            let has_heat_neighbor = temp_edges[i].iter().any(|&t| self.entities[t].is_heat);
-            if has_heat_neighbor {
+            if temp_edges[i].iter().any(|&t| self.entities[t].is_heat) {
                 self.entities[i].color[0] *= 0.2;
                 self.entities[i].color[1] *= 0.2;
                 self.entities[i].color[2] *= 0.2;
                 self.entities[i].deposit_magnitude *= 0.15;
-                subsurface_count += 1;
+                darkened_count += 1;
             }
         }
-        log::info!("Subsurface layer: {} entities darkened", subsurface_count);
+        if darkened_count > 0 {
+            log::info!("Heat-adjacent darkening: {} entities", darkened_count);
+        }
 
         // Flatten into SoA
         self.flatten_edges(temp_edges);
@@ -697,10 +758,11 @@ impl DiffField {
         for i in 0..n {
             let entity = &self.entities[i];
 
-            // Emitters always active (sun, eyes, etc.)
-            if entity.deposit_magnitude >= 1.0 {
+            // Vacuum emitters always active (sun) — they push light through graph
+            // but don't deposit to grid themselves.
+            if entity.is_vacuum && entity.deposit_magnitude >= 1.0 {
                 self.active_set[i] = true;
-                self.visible_set[i] = false; // emitters may be vacuum (sun)
+                self.visible_set[i] = false;
                 continue;
             }
 
@@ -785,6 +847,105 @@ impl DiffField {
         }
     }
 
+    /// Place lightweight receptor entities at the metaball isosurface via BFS.
+    /// Receptors catch light from atmosphere radiation links and deposit it to the grid.
+    /// They add negligible density — skeleton entities handle body opacity.
+    fn build_receptor_shell(
+        &mut self,
+        balls: &[MetaballSource],
+        spacing: f32,
+        seed: glam::Vec3,
+    ) {
+        use std::collections::{VecDeque, HashSet};
+
+        let threshold = 1.0f32;
+
+        let seed_grid = (
+            (seed.x / spacing).round() as i32,
+            (seed.y / spacing).round() as i32,
+            (seed.z / spacing).round() as i32,
+        );
+
+        const DIRS: [(i32, i32, i32); 6] = [
+            (1, 0, 0), (-1, 0, 0),
+            (0, 1, 0), (0, -1, 0),
+            (0, 0, 1), (0, 0, -1),
+        ];
+
+        // BFS flood fill to discover all "inside" cells
+        let mut inside: HashMap<(i32, i32, i32), MetaballSample> = HashMap::new();
+        let mut queue: VecDeque<(i32, i32, i32)> = VecDeque::new();
+        let mut visited: HashSet<(i32, i32, i32)> = HashSet::new();
+
+        let seed_world = glam::Vec3::new(
+            seed_grid.0 as f32 * spacing,
+            seed_grid.1 as f32 * spacing,
+            seed_grid.2 as f32 * spacing,
+        );
+        let seed_sample = evaluate_metaball_field(seed_world, balls);
+        if seed_sample.total_field < threshold {
+            log::warn!("Receptor shell: seed outside metaball field");
+            return;
+        }
+
+        visited.insert(seed_grid);
+        queue.push_back(seed_grid);
+        inside.insert(seed_grid, seed_sample);
+
+        while let Some(cell) = queue.pop_front() {
+            for &(dx, dy, dz) in &DIRS {
+                let neighbor = (cell.0 + dx, cell.1 + dy, cell.2 + dz);
+                if visited.contains(&neighbor) { continue; }
+                visited.insert(neighbor);
+                let world_pos = glam::Vec3::new(
+                    neighbor.0 as f32 * spacing,
+                    neighbor.1 as f32 * spacing,
+                    neighbor.2 as f32 * spacing,
+                );
+                let sample = evaluate_metaball_field(world_pos, balls);
+                if sample.total_field >= threshold {
+                    inside.insert(neighbor, sample);
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+
+        // Surface cells: at least one 6-neighbor is NOT inside
+        let mut surface_cells: Vec<(i32, i32, i32)> = Vec::new();
+        for &cell in inside.keys() {
+            let is_surface = DIRS.iter().any(|&(dx, dy, dz)| {
+                !inside.contains_key(&(cell.0 + dx, cell.1 + dy, cell.2 + dz))
+            });
+            if is_surface {
+                surface_cells.push(cell);
+            }
+        }
+        surface_cells.sort(); // deterministic order
+
+        // Create lightweight receptor entities at surface cells
+        for &cell in &surface_cells {
+            let sample = &inside[&cell];
+            let world_pos = glam::Vec3::new(
+                cell.0 as f32 * spacing,
+                cell.1 as f32 * spacing,
+                cell.2 as f32 * spacing,
+            );
+            let mut e = Entity::new(
+                world_pos,
+                glam::Vec3::ZERO,
+                0.01, // negligible self-emission — light comes via radiation links
+                sample.color,
+            );
+            e.pass_through = sample.pass_through; // absorbs ~97% of incoming light
+            e.group = sample.group;
+            e.reemit = 0.3; // re-emit absorbed light as colored deposit
+            self.entities.push(e);
+        }
+
+        log::info!("Receptor shell: {} surface entities at spacing {}",
+            surface_cells.len(), spacing);
+    }
+
     fn spawn_demo_scene(&mut self) -> f32 {
         let center = FIELD_SIZE as f32 / 2.0;
         // Dino faces +Z, centered in field
@@ -796,105 +957,93 @@ impl DiffField {
         let mouth = [0.7, 0.2, 0.15];       // reddish mouth
         let sp = 0.3; // tight spacing — surface stays solid after interior becomes heat
 
-        // --- Dino body via metaball field ---
+        // --- Dino body via BFS flood-fill of metaball field ---
         // Each body part is a metaball source. The combined field produces
         // smooth, seamless geometry — joints blend naturally.
-        // Kernel: weight * max(0, 1 - r²)  where r² = (dx/rx)² + (dy/ry)² + (dz/rz)²
-        // Entity spawned where combined field > 1.0.
-        // Color/material interpolated from all contributors; group from strongest.
-        struct Metaball {
-            center: glam::Vec3,
-            radii: glam::Vec3,
-            weight: f32,
-            color: [f32; 3],
-            magnitude: f32,
-            pass_through: f32,
-            group: u16,
-        }
-
+        // BFS grows from body center, creating only surface + subsurface shell.
         let balls = [
-            Metaball { center: base + glam::Vec3::new(0.0, 5.0, 0.0),     radii: glam::Vec3::new(5.0, 6.0, 8.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_BODY },
-            Metaball { center: base + glam::Vec3::new(0.0, 1.0, 0.0),     radii: glam::Vec3::new(4.5, 4.0, 7.0),   weight: 5.0, color: belly,      magnitude: 0.2,  pass_through: 0.06, group: GROUP_BELLY },
-            Metaball { center: base + glam::Vec3::new(0.0, 5.5, -12.0),   radii: glam::Vec3::new(2.5, 2.5, 7.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_TAIL },
-            Metaball { center: base + glam::Vec3::new(0.0, 5.5, -20.0),   radii: glam::Vec3::new(1.2, 1.2, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_TAIL_TIP },
-            Metaball { center: base + glam::Vec3::new(0.0, 10.0, 8.0),    radii: glam::Vec3::new(3.0, 5.0, 3.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_NECK },
-            Metaball { center: base + glam::Vec3::new(0.0, 16.0, 10.0),   radii: glam::Vec3::new(3.5, 3.0, 5.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_HEAD },
-            Metaball { center: base + glam::Vec3::new(0.0, 13.5, 12.0),   radii: glam::Vec3::new(2.5, 1.5, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_JAW },
-            Metaball { center: base + glam::Vec3::new(0.0, 14.5, 13.0),   radii: glam::Vec3::new(2.0, 0.8, 3.0),   weight: 5.0, color: mouth,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_MOUTH },
-            Metaball { center: base + glam::Vec3::new(3.0, 17.0, 12.0),   radii: glam::Vec3::new(0.8, 0.8, 0.8),   weight: 8.0, color: eye_color,  magnitude: 4.0,  pass_through: 0.1,  group: GROUP_EYE },
-            Metaball { center: base + glam::Vec3::new(-3.0, 17.0, 12.0),  radii: glam::Vec3::new(0.8, 0.8, 0.8),   weight: 8.0, color: eye_color,  magnitude: 4.0,  pass_through: 0.1,  group: GROUP_EYE },
-            Metaball { center: base + glam::Vec3::new(3.0, -3.0, 1.0),    radii: glam::Vec3::new(2.0, 5.0, 2.5),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_LEG_L },
-            Metaball { center: base + glam::Vec3::new(3.0, -8.0, 2.0),    radii: glam::Vec3::new(2.5, 1.0, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_FOOT_L },
-            Metaball { center: base + glam::Vec3::new(-3.0, -3.0, 1.0),   radii: glam::Vec3::new(2.0, 5.0, 2.5),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_LEG_R },
-            Metaball { center: base + glam::Vec3::new(-3.0, -8.0, 2.0),   radii: glam::Vec3::new(2.5, 1.0, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_FOOT_R },
-            Metaball { center: base + glam::Vec3::new(4.5, 6.0, 5.0),     radii: glam::Vec3::new(1.0, 2.5, 1.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_ARM_R },
-            Metaball { center: base + glam::Vec3::new(-4.5, 6.0, 5.0),    radii: glam::Vec3::new(1.0, 2.5, 1.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_ARM_L },
+            MetaballSource { center: base + glam::Vec3::new(0.0, 5.0, 0.0),     radii: glam::Vec3::new(5.0, 6.0, 8.0),   color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_BODY },
+            MetaballSource { center: base + glam::Vec3::new(0.0, 1.0, 0.0),     radii: glam::Vec3::new(4.5, 4.0, 7.0),   color: belly,      magnitude: 0.2,  pass_through: 0.06, group: GROUP_BELLY },
+            MetaballSource { center: base + glam::Vec3::new(0.0, 5.5, -12.0),   radii: glam::Vec3::new(2.5, 2.5, 7.0),   color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_TAIL },
+            MetaballSource { center: base + glam::Vec3::new(0.0, 5.5, -20.0),   radii: glam::Vec3::new(1.2, 1.2, 4.0),   color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_TAIL_TIP },
+            MetaballSource { center: base + glam::Vec3::new(0.0, 10.0, 8.0),    radii: glam::Vec3::new(3.0, 5.0, 3.0),   color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_NECK },
+            MetaballSource { center: base + glam::Vec3::new(0.0, 16.0, 10.0),   radii: glam::Vec3::new(3.5, 3.0, 5.0),   color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_HEAD },
+            MetaballSource { center: base + glam::Vec3::new(0.0, 13.5, 12.0),   radii: glam::Vec3::new(2.5, 1.5, 4.0),   color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_JAW },
+            MetaballSource { center: base + glam::Vec3::new(0.0, 14.5, 13.0),   radii: glam::Vec3::new(2.0, 0.8, 3.0),   color: mouth,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_MOUTH },
+            MetaballSource { center: base + glam::Vec3::new(3.0, 17.0, 12.0),   radii: glam::Vec3::new(0.8, 0.8, 0.8),   color: eye_color,  magnitude: 4.0,  pass_through: 0.1,  group: GROUP_EYE },
+            MetaballSource { center: base + glam::Vec3::new(-3.0, 17.0, 12.0),  radii: glam::Vec3::new(0.8, 0.8, 0.8),   color: eye_color,  magnitude: 4.0,  pass_through: 0.1,  group: GROUP_EYE },
+            MetaballSource { center: base + glam::Vec3::new(3.0, -3.0, 1.0),    radii: glam::Vec3::new(2.0, 5.0, 2.5),   color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_LEG_L },
+            MetaballSource { center: base + glam::Vec3::new(3.0, -8.0, 2.0),    radii: glam::Vec3::new(2.5, 1.0, 4.0),   color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_FOOT_L },
+            MetaballSource { center: base + glam::Vec3::new(-3.0, -3.0, 1.0),   radii: glam::Vec3::new(2.0, 5.0, 2.5),   color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_LEG_R },
+            MetaballSource { center: base + glam::Vec3::new(-3.0, -8.0, 2.0),   radii: glam::Vec3::new(2.5, 1.0, 4.0),   color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_FOOT_R },
+            MetaballSource { center: base + glam::Vec3::new(4.5, 6.0, 5.0),     radii: glam::Vec3::new(1.0, 2.5, 1.0),   color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_ARM_R },
+            MetaballSource { center: base + glam::Vec3::new(-4.5, 6.0, 5.0),    radii: glam::Vec3::new(1.0, 2.5, 1.0),   color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_ARM_L },
         ];
 
-        // Bounding box of all metaball influence regions
-        let mut bb_min = glam::Vec3::splat(f32::MAX);
-        let mut bb_max = glam::Vec3::splat(f32::MIN);
+        // Skeleton placement: one entity per metaball source with wide gaussian deposit.
+        // Each skeleton entity's deposit_radii match its metaball shape — overlapping
+        // gaussians merge into a continuous density field with no gaps.
+        let skeleton_multiplier = 100.0;
         for b in &balls {
-            bb_min = bb_min.min(b.center - b.radii);
-            bb_max = bb_max.max(b.center + b.radii);
+            // Eyes already have high magnitude (4.0) + small radii — don't multiply
+            let mag = if b.group == GROUP_EYE {
+                b.magnitude
+            } else {
+                b.magnitude * skeleton_multiplier
+            };
+            let mut e = Entity::new(
+                b.center,
+                glam::Vec3::ZERO,
+                mag,
+                b.color,
+            );
+            e.pass_through = b.pass_through;
+            e.group = b.group;
+            e.deposit_radii = b.radii;
+            self.entities.push(e);
         }
 
-        // Sample the combined metaball field at entity spacing
-        let mut x = bb_min.x;
-        while x <= bb_max.x {
-            let mut y = bb_min.y;
-            while y <= bb_max.y {
-                let mut z = bb_min.z;
-                while z <= bb_max.z {
-                    let pos = glam::Vec3::new(x, y, z);
-
-                    // Accumulate field contributions from all sources
-                    let mut total_field = 0.0f32;
-                    let mut acc_r = 0.0f32;
-                    let mut acc_g = 0.0f32;
-                    let mut acc_b = 0.0f32;
-                    let mut acc_mag = 0.0f32;
-                    let mut acc_pt = 0.0f32;
-                    let mut best_group = 0u16;
-                    let mut best_c = 0.0f32;
-
-                    for b in &balls {
-                        let d = (pos - b.center) / b.radii;
-                        let r2 = d.x * d.x + d.y * d.y + d.z * d.z;
-                        if r2 >= 1.0 { continue; }
-                        let c = b.weight * (1.0 - r2);
-                        total_field += c;
-                        acc_r += b.color[0] * c;
-                        acc_g += b.color[1] * c;
-                        acc_b += b.color[2] * c;
-                        acc_mag += b.magnitude * c;
-                        acc_pt += b.pass_through * c;
-                        if c > best_c {
-                            best_c = c;
-                            best_group = b.group;
-                        }
-                    }
-
-                    if total_field > 1.0 {
-                        let inv = 1.0 / total_field;
-                        let mut e = Entity::new(
-                            pos,
-                            glam::Vec3::ZERO,
-                            acc_mag * inv,
-                            [acc_r * inv, acc_g * inv, acc_b * inv],
-                        );
-                        e.pass_through = acc_pt * inv;
-                        e.group = best_group;
-                        self.entities.push(e);
-                    }
-
-                    z += sp;
-                }
-                y += sp;
-            }
-            x += sp;
+        // Midpoint entities between connected metaballs for smoother joint blending.
+        // Each midpoint gets interpolated radii, color, and magnitude.
+        let connections: &[(usize, usize)] = &[
+            (0, 4),  // body ↔ neck
+            (4, 5),  // neck ↔ head
+            (0, 2),  // body ↔ tail
+            (2, 3),  // tail ↔ tail tip
+            (0, 10), // body ↔ leg L
+            (10, 11),// leg L ↔ foot L
+            (0, 12), // body ↔ leg R
+            (12, 13),// leg R ↔ foot R
+            (0, 14), // body ↔ arm R
+            (0, 15), // body ↔ arm L
+            (5, 6),  // head ↔ jaw
+        ];
+        for &(a, b_idx) in connections {
+            let ba = &balls[a];
+            let bb = &balls[b_idx];
+            let mid_pos = (ba.center + bb.center) * 0.5;
+            let mid_radii = (ba.radii + bb.radii) * 0.5;
+            let mid_mag = (ba.magnitude + bb.magnitude) * 0.5 * skeleton_multiplier;
+            let mid_color = [
+                (ba.color[0] + bb.color[0]) * 0.5,
+                (ba.color[1] + bb.color[1]) * 0.5,
+                (ba.color[2] + bb.color[2]) * 0.5,
+            ];
+            let mid_pt = (ba.pass_through + bb.pass_through) * 0.5;
+            let mut e = Entity::new(mid_pos, glam::Vec3::ZERO, mid_mag, mid_color);
+            e.pass_through = mid_pt;
+            e.group = ba.group; // use source group
+            e.deposit_radii = mid_radii;
+            self.entities.push(e);
         }
-        log::info!("Metaball dino: {} entities", self.entities.len());
+
+        log::info!("Skeleton dino: {} entities ({} metaball + {} midpoint)",
+            balls.len() + connections.len(), balls.len(), connections.len());
+
+        // Receptor shell: lightweight surface entities that catch light from atmosphere.
+        // Skeleton handles body density; receptors handle lighting via radiation links.
+        let receptor_spacing = 1.0;
+        self.build_receptor_shell(&balls, receptor_spacing, balls[0].center);
 
         // ROCK — small boulder on the ground
         let rock_color = [0.4, 0.35, 0.25];
@@ -1326,8 +1475,13 @@ impl DiffField {
             }
 
             // Track AABB from non-vacuum entities (tight box around solid geometry)
-            aabb_min = aabb_min.min(entity.position - 1.0);
-            aabb_max = aabb_max.max(entity.position + 1.0);
+            let extent = if entity.deposit_radii != glam::Vec3::ZERO {
+                entity.deposit_radii * 2.0
+            } else {
+                glam::Vec3::splat(1.0)
+            };
+            aabb_min = aabb_min.min(entity.position - extent);
+            aabb_max = aabb_max.max(entity.position + extent);
 
             // Skip deposit for non-visible solid entities (reactive: only render subscribed chains)
             if !self.visible_set[ent_idx] { continue; }
@@ -1368,22 +1522,19 @@ impl DiffField {
                 deposit_pos.y -= z_frac * 1.5 * open_amount;
             }
 
-            // Tent-weight splat: 5x5x5 for body parts (fills gaps at 0.4 spacing),
-            // 3x3x3 for floor/rock (already dense enough).
-            let is_body = entity.group != GROUP_FLOOR && entity.group != GROUP_ROCK;
-            let tent_half = if is_body { 2i32 } else { 1i32 };
-            let tent_radius = if is_body { 2.5f32 } else { 1.5f32 };
-
-            // Jitter body deposit positions to break Moiré ring artifacts from
-            // regular 0.4 spacing. Deterministic hash per entity position.
-            if is_body {
-                let h1 = (entity.position.x * 127.1 + entity.position.y * 311.7 + entity.position.z * 74.7).sin() * 43758.5453;
-                let h2 = (entity.position.x * 269.5 + entity.position.y * 183.3 + entity.position.z * 246.1).sin() * 43758.5453;
-                let h3 = (entity.position.x * 420.3 + entity.position.y * 631.2 + entity.position.z * 154.8).sin() * 43758.5453;
-                deposit_pos.x += (h1.fract() - 0.5) * 0.6;
-                deposit_pos.y += (h2.fract() - 0.5) * 0.6;
-                deposit_pos.z += (h3.fract() - 0.5) * 0.6;
-            }
+            // Determine deposit extent: skeleton entities use wide gaussian,
+            // floor/rock use compact tent kernel.
+            let use_gaussian = entity.deposit_radii != glam::Vec3::ZERO;
+            let (half_x, half_y, half_z) = if use_gaussian {
+                // 2× radii so gaussians overlap heavily between adjacent skeleton
+                // points and fade smoothly (exp(-4) ≈ 0.02 at boundary).
+                ((entity.deposit_radii.x * 2.0).ceil() as i32,
+                 (entity.deposit_radii.y * 2.0).ceil() as i32,
+                 (entity.deposit_radii.z * 2.0).ceil() as i32)
+            } else {
+                (1i32, 1i32, 1i32) // 3x3x3 tent for floor/rock
+            };
+            let tent_radius = 1.5f32; // only used for non-gaussian
 
             let base_x = deposit_pos.x.floor() as i32;
             let base_y = deposit_pos.y.floor() as i32;
@@ -1398,9 +1549,9 @@ impl DiffField {
                 let pz = (prev / (FIELD_SIZE * FIELD_SIZE) as usize) as i32;
                 let py = ((prev % (FIELD_SIZE * FIELD_SIZE) as usize) / FIELD_SIZE as usize) as i32;
                 let px = (prev % FIELD_SIZE as usize) as i32;
-                for dz in -tent_half..(tent_half + 1) {
-                    for dy in -tent_half..(tent_half + 1) {
-                        for dx in -tent_half..(tent_half + 1) {
+                for dz in -half_z..=half_z {
+                    for dy in -half_y..=half_y {
+                        for dx in -half_x..=half_x {
                             let cx = px + dx;
                             let cy = py + dy;
                             let cz = pz + dz;
@@ -1425,28 +1576,40 @@ impl DiffField {
 
             // Decoupled boost: body gets high density boost (opaque surface) with
             // moderate color boost (natural brightness, no overexposure).
-            // Density and color saturate independently at the 50.0 cell cap — if both
-            // used the same high boost, norm_color = color/density would drift to 1.0.
+            let is_body = use_gaussian;
             let (density_boost, color_boost) = if is_body { (40.0, 10.0) } else { (10.0, 10.0) };
             let total_r = total_r * color_boost;
             let total_g = total_g * color_boost;
             let total_b = total_b * color_boost;
             let total_d = total_d * density_boost;
-            for dz in -tent_half..(tent_half + 1) {
-                let cz_f = base_z as f32 + dz as f32 + 0.5;
-                let wz = (tent_radius - (cz_f - deposit_pos.z).abs()).max(0.0);
-                for dy in -tent_half..(tent_half + 1) {
-                    let cy_f = base_y as f32 + dy as f32 + 0.5;
-                    let wy = (tent_radius - (cy_f - deposit_pos.y).abs()).max(0.0);
-                    for dx in -tent_half..(tent_half + 1) {
-                        let cx_f = base_x as f32 + dx as f32 + 0.5;
-                        let wx = (tent_radius - (cx_f - deposit_pos.x).abs()).max(0.0);
-                        let w = wx * wy * wz;
-                        if w < 0.001 { continue; }
-                        let cx = base_x + dx;
+
+            if use_gaussian {
+                // Skeleton entity: anisotropic gaussian deposit.
+                // weight = exp(-((dx/rx)² + (dy/ry)² + (dz/rz)²))
+                let rx = entity.deposit_radii.x;
+                let ry = entity.deposit_radii.y;
+                let rz = entity.deposit_radii.z;
+                let inv_rx2 = 1.0 / (rx * rx);
+                let inv_ry2 = 1.0 / (ry * ry);
+                let inv_rz2 = 1.0 / (rz * rz);
+                for dz in -half_z..=half_z {
+                    let cz = base_z + dz;
+                    if cz < 0 || cz >= FIELD_SIZE as i32 { continue; }
+                    let fz = cz as f32 + 0.5 - deposit_pos.z;
+                    let ez = fz * fz * inv_rz2;
+                    for dy in -half_y..=half_y {
                         let cy = base_y + dy;
-                        let cz = base_z + dz;
-                        if Self::in_bounds(cx, cy, cz) {
+                        if cy < 0 || cy >= FIELD_SIZE as i32 { continue; }
+                        let fy = cy as f32 + 0.5 - deposit_pos.y;
+                        let eyz = fy * fy * inv_ry2 + ez;
+                        if eyz > 4.0 { continue; } // exp(-4) ≈ 0.02, skip negligible
+                        for dx in -half_x..=half_x {
+                            let cx = base_x + dx;
+                            if cx < 0 || cx >= FIELD_SIZE as i32 { continue; }
+                            let fx = cx as f32 + 0.5 - deposit_pos.x;
+                            let exponent = fx * fx * inv_rx2 + eyz;
+                            if exponent > 4.0 { continue; }
+                            let w = (-exponent).exp();
                             let idx = Self::index(cx as u32, cy as u32, cz as u32);
                             let cell = &mut self.cells[idx];
                             cell.density = (cell.density + total_d * w).min(50.0);
@@ -1454,6 +1617,34 @@ impl DiffField {
                             cell.color_g = (cell.color_g + total_g * w).min(50.0);
                             cell.color_b = (cell.color_b + total_b * w).min(50.0);
                             self.dirty_slabs[cz as usize] = true;
+                        }
+                    }
+                }
+            } else {
+                // Tent kernel for floor/rock entities
+                for dz in -half_z..=half_z {
+                    let cz_f = base_z as f32 + dz as f32 + 0.5;
+                    let wz = (tent_radius - (cz_f - deposit_pos.z).abs()).max(0.0);
+                    for dy in -half_y..=half_y {
+                        let cy_f = base_y as f32 + dy as f32 + 0.5;
+                        let wy = (tent_radius - (cy_f - deposit_pos.y).abs()).max(0.0);
+                        for dx in -half_x..=half_x {
+                            let cx_f = base_x as f32 + dx as f32 + 0.5;
+                            let wx = (tent_radius - (cx_f - deposit_pos.x).abs()).max(0.0);
+                            let w = wx * wy * wz;
+                            if w < 0.001 { continue; }
+                            let cx = base_x + dx;
+                            let cy = base_y + dy;
+                            let cz = base_z + dz;
+                            if Self::in_bounds(cx, cy, cz) {
+                                let idx = Self::index(cx as u32, cy as u32, cz as u32);
+                                let cell = &mut self.cells[idx];
+                                cell.density = (cell.density + total_d * w).min(50.0);
+                                cell.color_r = (cell.color_r + total_r * w).min(50.0);
+                                cell.color_g = (cell.color_g + total_g * w).min(50.0);
+                                cell.color_b = (cell.color_b + total_b * w).min(50.0);
+                                self.dirty_slabs[cz as usize] = true;
+                            }
                         }
                     }
                 }
