@@ -813,22 +813,22 @@ impl DiffField {
         }
 
         let balls = [
-            Metaball { center: base + glam::Vec3::new(0.0, 5.0, 0.0),     radii: glam::Vec3::new(5.0, 6.0, 8.0),   weight: 5.0, color: green,      magnitude: 0.4,  pass_through: 0.03, group: GROUP_BODY },
-            Metaball { center: base + glam::Vec3::new(0.0, 1.0, 0.0),     radii: glam::Vec3::new(4.5, 4.0, 7.0),   weight: 5.0, color: belly,      magnitude: 0.4,  pass_through: 0.06, group: GROUP_BELLY },
-            Metaball { center: base + glam::Vec3::new(0.0, 5.5, -12.0),   radii: glam::Vec3::new(2.5, 2.5, 7.0),   weight: 5.0, color: green,      magnitude: 0.4,  pass_through: 0.03, group: GROUP_TAIL },
-            Metaball { center: base + glam::Vec3::new(0.0, 5.5, -20.0),   radii: glam::Vec3::new(1.2, 1.2, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.4,  pass_through: 0.03, group: GROUP_TAIL_TIP },
-            Metaball { center: base + glam::Vec3::new(0.0, 10.0, 8.0),    radii: glam::Vec3::new(3.0, 5.0, 3.0),   weight: 5.0, color: green,      magnitude: 0.4,  pass_through: 0.03, group: GROUP_NECK },
-            Metaball { center: base + glam::Vec3::new(0.0, 16.0, 10.0),   radii: glam::Vec3::new(3.5, 3.0, 5.0),   weight: 5.0, color: green,      magnitude: 0.4,  pass_through: 0.03, group: GROUP_HEAD },
-            Metaball { center: base + glam::Vec3::new(0.0, 13.5, 12.0),   radii: glam::Vec3::new(2.5, 1.5, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.4,  pass_through: 0.03, group: GROUP_JAW },
-            Metaball { center: base + glam::Vec3::new(0.0, 14.5, 13.0),   radii: glam::Vec3::new(2.0, 0.8, 3.0),   weight: 5.0, color: mouth,      magnitude: 0.4,  pass_through: 0.03, group: GROUP_MOUTH },
+            Metaball { center: base + glam::Vec3::new(0.0, 5.0, 0.0),     radii: glam::Vec3::new(5.0, 6.0, 8.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_BODY },
+            Metaball { center: base + glam::Vec3::new(0.0, 1.0, 0.0),     radii: glam::Vec3::new(4.5, 4.0, 7.0),   weight: 5.0, color: belly,      magnitude: 0.2,  pass_through: 0.06, group: GROUP_BELLY },
+            Metaball { center: base + glam::Vec3::new(0.0, 5.5, -12.0),   radii: glam::Vec3::new(2.5, 2.5, 7.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_TAIL },
+            Metaball { center: base + glam::Vec3::new(0.0, 5.5, -20.0),   radii: glam::Vec3::new(1.2, 1.2, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_TAIL_TIP },
+            Metaball { center: base + glam::Vec3::new(0.0, 10.0, 8.0),    radii: glam::Vec3::new(3.0, 5.0, 3.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_NECK },
+            Metaball { center: base + glam::Vec3::new(0.0, 16.0, 10.0),   radii: glam::Vec3::new(3.5, 3.0, 5.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_HEAD },
+            Metaball { center: base + glam::Vec3::new(0.0, 13.5, 12.0),   radii: glam::Vec3::new(2.5, 1.5, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_JAW },
+            Metaball { center: base + glam::Vec3::new(0.0, 14.5, 13.0),   radii: glam::Vec3::new(2.0, 0.8, 3.0),   weight: 5.0, color: mouth,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_MOUTH },
             Metaball { center: base + glam::Vec3::new(3.0, 17.0, 12.0),   radii: glam::Vec3::new(0.8, 0.8, 0.8),   weight: 8.0, color: eye_color,  magnitude: 4.0,  pass_through: 0.1,  group: GROUP_EYE },
             Metaball { center: base + glam::Vec3::new(-3.0, 17.0, 12.0),  radii: glam::Vec3::new(0.8, 0.8, 0.8),   weight: 8.0, color: eye_color,  magnitude: 4.0,  pass_through: 0.1,  group: GROUP_EYE },
-            Metaball { center: base + glam::Vec3::new(3.0, -3.0, 1.0),    radii: glam::Vec3::new(2.0, 5.0, 2.5),   weight: 5.0, color: dark_green, magnitude: 0.4,  pass_through: 0.03, group: GROUP_LEG_L },
-            Metaball { center: base + glam::Vec3::new(3.0, -8.0, 2.0),    radii: glam::Vec3::new(2.5, 1.0, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.4,  pass_through: 0.03, group: GROUP_FOOT_L },
-            Metaball { center: base + glam::Vec3::new(-3.0, -3.0, 1.0),   radii: glam::Vec3::new(2.0, 5.0, 2.5),   weight: 5.0, color: dark_green, magnitude: 0.4,  pass_through: 0.03, group: GROUP_LEG_R },
-            Metaball { center: base + glam::Vec3::new(-3.0, -8.0, 2.0),   radii: glam::Vec3::new(2.5, 1.0, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.4,  pass_through: 0.03, group: GROUP_FOOT_R },
-            Metaball { center: base + glam::Vec3::new(4.5, 6.0, 5.0),     radii: glam::Vec3::new(1.0, 2.5, 1.0),   weight: 5.0, color: green,      magnitude: 0.4,  pass_through: 0.03, group: GROUP_ARM_R },
-            Metaball { center: base + glam::Vec3::new(-4.5, 6.0, 5.0),    radii: glam::Vec3::new(1.0, 2.5, 1.0),   weight: 5.0, color: green,      magnitude: 0.4,  pass_through: 0.03, group: GROUP_ARM_L },
+            Metaball { center: base + glam::Vec3::new(3.0, -3.0, 1.0),    radii: glam::Vec3::new(2.0, 5.0, 2.5),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_LEG_L },
+            Metaball { center: base + glam::Vec3::new(3.0, -8.0, 2.0),    radii: glam::Vec3::new(2.5, 1.0, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_FOOT_L },
+            Metaball { center: base + glam::Vec3::new(-3.0, -3.0, 1.0),   radii: glam::Vec3::new(2.0, 5.0, 2.5),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_LEG_R },
+            Metaball { center: base + glam::Vec3::new(-3.0, -8.0, 2.0),   radii: glam::Vec3::new(2.5, 1.0, 4.0),   weight: 5.0, color: dark_green, magnitude: 0.2,  pass_through: 0.03, group: GROUP_FOOT_R },
+            Metaball { center: base + glam::Vec3::new(4.5, 6.0, 5.0),     radii: glam::Vec3::new(1.0, 2.5, 1.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_ARM_R },
+            Metaball { center: base + glam::Vec3::new(-4.5, 6.0, 5.0),    radii: glam::Vec3::new(1.0, 2.5, 1.0),   weight: 5.0, color: green,      magnitude: 0.2,  pass_through: 0.03, group: GROUP_ARM_L },
         ];
 
         // Bounding box of all metaball influence regions
@@ -1368,12 +1368,17 @@ impl DiffField {
                 deposit_pos.y -= z_frac * 1.5 * open_amount;
             }
 
-            // 3x3x3 tent-weight splat — wider footprint fills surface gaps.
+            // Tent-weight splat: 5x5x5 for body parts (fills gaps at 0.4 spacing),
+            // 3x3x3 for floor/rock (already dense enough).
+            let is_body = entity.group != GROUP_FLOOR && entity.group != GROUP_ROCK;
+            let tent_half = if is_body { 2i32 } else { 1i32 };
+            let tent_radius = if is_body { 2.5f32 } else { 1.5f32 };
+
             let base_x = deposit_pos.x.floor() as i32;
             let base_y = deposit_pos.y.floor() as i32;
             let base_z = deposit_pos.z.floor() as i32;
 
-            // Clear previous 2x2x2 footprint if base cell changed
+            // Clear previous footprint if base cell changed
             let new_base_idx = if Self::in_bounds(base_x, base_y, base_z) {
                 Self::index(base_x as u32, base_y as u32, base_z as u32) as i32
             } else { -1 };
@@ -1382,10 +1387,9 @@ impl DiffField {
                 let pz = (prev / (FIELD_SIZE * FIELD_SIZE) as usize) as i32;
                 let py = ((prev % (FIELD_SIZE * FIELD_SIZE) as usize) / FIELD_SIZE as usize) as i32;
                 let px = (prev % FIELD_SIZE as usize) as i32;
-                // 3x3x3 centered clear — catches animation ghosts from tail/jaw swings
-                for dz in -1..2i32 {
-                    for dy in -1..2i32 {
-                        for dx in -1..2i32 {
+                for dz in -tent_half..(tent_half + 1) {
+                    for dy in -tent_half..(tent_half + 1) {
+                        for dx in -tent_half..(tent_half + 1) {
                             let cx = px + dx;
                             let cy = py + dy;
                             let cz = pz + dz;
@@ -1408,21 +1412,21 @@ impl DiffField {
             let total_b = entity.color[2] * mag + entity.incoming.b * absorbed * entity.color[2] + entity.reemit_b;
             let total_d = mag + entity.incoming.density * absorbed;
 
-            // Deposit to 3x3x3 with tent weights — wider footprint fills surface gaps.
-            // Boost 10x to compensate for wider spread.
-            let total_r = total_r * 10.0;
-            let total_g = total_g * 10.0;
-            let total_b = total_b * 10.0;
-            let total_d = total_d * 10.0;
-            for dz in -1..2i32 {
+            // Boost compensates for spread: 10x for 3x3x3, 15x for 5x5x5
+            let boost = if is_body { 15.0 } else { 10.0 };
+            let total_r = total_r * boost;
+            let total_g = total_g * boost;
+            let total_b = total_b * boost;
+            let total_d = total_d * boost;
+            for dz in -tent_half..(tent_half + 1) {
                 let cz_f = base_z as f32 + dz as f32 + 0.5;
-                let wz = (1.5 - (cz_f - deposit_pos.z).abs()).max(0.0);
-                for dy in -1..2i32 {
+                let wz = (tent_radius - (cz_f - deposit_pos.z).abs()).max(0.0);
+                for dy in -tent_half..(tent_half + 1) {
                     let cy_f = base_y as f32 + dy as f32 + 0.5;
-                    let wy = (1.5 - (cy_f - deposit_pos.y).abs()).max(0.0);
-                    for dx in -1..2i32 {
+                    let wy = (tent_radius - (cy_f - deposit_pos.y).abs()).max(0.0);
+                    for dx in -tent_half..(tent_half + 1) {
                         let cx_f = base_x as f32 + dx as f32 + 0.5;
-                        let wx = (1.5 - (cx_f - deposit_pos.x).abs()).max(0.0);
+                        let wx = (tent_radius - (cx_f - deposit_pos.x).abs()).max(0.0);
                         let w = wx * wy * wz;
                         if w < 0.001 { continue; }
                         let cx = base_x + dx;
