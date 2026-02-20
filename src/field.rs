@@ -1374,6 +1374,17 @@ impl DiffField {
             let tent_half = if is_body { 2i32 } else { 1i32 };
             let tent_radius = if is_body { 2.5f32 } else { 1.5f32 };
 
+            // Jitter body deposit positions to break Moiré ring artifacts from
+            // regular 0.4 spacing. Deterministic hash per entity position.
+            if is_body {
+                let h1 = (entity.position.x * 127.1 + entity.position.y * 311.7 + entity.position.z * 74.7).sin() * 43758.5453;
+                let h2 = (entity.position.x * 269.5 + entity.position.y * 183.3 + entity.position.z * 246.1).sin() * 43758.5453;
+                let h3 = (entity.position.x * 420.3 + entity.position.y * 631.2 + entity.position.z * 154.8).sin() * 43758.5453;
+                deposit_pos.x += (h1.fract() - 0.5) * 0.6;
+                deposit_pos.y += (h2.fract() - 0.5) * 0.6;
+                deposit_pos.z += (h3.fract() - 0.5) * 0.6;
+            }
+
             let base_x = deposit_pos.x.floor() as i32;
             let base_y = deposit_pos.y.floor() as i32;
             let base_z = deposit_pos.z.floor() as i32;
@@ -1412,12 +1423,15 @@ impl DiffField {
             let total_b = entity.color[2] * mag + entity.incoming.b * absorbed * entity.color[2] + entity.reemit_b;
             let total_d = mag + entity.incoming.density * absorbed;
 
-            // Boost compensates for spread: 10x for 3x3x3, 15x for 5x5x5
-            let boost = if is_body { 15.0 } else { 10.0 };
-            let total_r = total_r * boost;
-            let total_g = total_g * boost;
-            let total_b = total_b * boost;
-            let total_d = total_d * boost;
+            // Decoupled boost: body gets high density boost (opaque surface) with
+            // moderate color boost (natural brightness, no overexposure).
+            // Density and color saturate independently at the 50.0 cell cap — if both
+            // used the same high boost, norm_color = color/density would drift to 1.0.
+            let (density_boost, color_boost) = if is_body { (40.0, 10.0) } else { (10.0, 10.0) };
+            let total_r = total_r * color_boost;
+            let total_g = total_g * color_boost;
+            let total_b = total_b * color_boost;
+            let total_d = total_d * density_boost;
             for dz in -tent_half..(tent_half + 1) {
                 let cz_f = base_z as f32 + dz as f32 + 0.5;
                 let wz = (tent_radius - (cz_f - deposit_pos.z).abs()).max(0.0);
