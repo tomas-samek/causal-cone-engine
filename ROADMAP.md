@@ -44,10 +44,12 @@
 - Opacity tuning: density × 0.3 (was 0.1) — body surfaces appear solid, atmosphere stays translucent
 - Color normalization fix: removed gray fallback, always divide by max(density, 0.05)
 
-## v0.6: Shadow tuning & atmosphere
-- Atmosphere scatters too much light, overwhelming ground shadows (tail shadow should be visible on ground)
-- Reduce vacuum scatter / reemit to let shadows survive propagation
-- Potentially separate direct-light and ambient channels
+## v0.6: Shadow tuning & atmosphere ✅
+- Atmospheric column: concentrated vacuum relay network around dino AABB (replaces broad grid, ~60% fewer vacuum entities)
+- Radial density profile: scatter/magnitude peaked at dino center, Gaussian-like falloff
+- Per-tick atmospheric modulation: scatter/magnitude follow live AABB center
+- Shader ambient floor: 0.25 → 0.10 for deeper ground shadows
+- Observer start position: z=380 → z=310 for closer view
 
 ## v0.7: Multiple objects interacting
 - Multiple independent entity groups
