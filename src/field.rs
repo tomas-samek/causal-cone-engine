@@ -794,7 +794,7 @@ impl DiffField {
         let belly = [0.5, 0.65, 0.3];       // lighter belly
         let eye_color = [1.0, 0.8, 0.0];    // yellow eyes
         let mouth = [0.7, 0.2, 0.15];       // reddish mouth
-        let sp = 0.4; // tight spacing — surface stays solid after interior becomes heat
+        let sp = 0.3; // tight spacing — surface stays solid after interior becomes heat
 
         // --- Dino body via metaball field ---
         // Each body part is a metaball source. The combined field produces
