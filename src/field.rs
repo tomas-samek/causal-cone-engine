@@ -86,6 +86,10 @@ pub struct Entity {
     /// Air molecules redirect a tiny % of photons in all directions.
     /// 0.0 = pure vacuum (space), >0 = atmosphere.
     pub scatter: f32,
+    /// Base scatter value set at generation (for per-tick modulation)
+    pub base_scatter: f32,
+    /// Base deposit magnitude set at generation (for per-tick modulation)
+    pub base_magnitude: f32,
     /// Specular reflection — fraction of incoming bounced back unfiltered.
     /// Like the waxy cuticle on grass blades or wet surfaces.
     /// This light keeps its original color (mirror-like).
@@ -135,6 +139,8 @@ impl Entity {
             is_heat: false,
             is_vacuum: false,
             scatter: 0.0,
+            base_scatter: 0.0,
+            base_magnitude: 0.0,
             specular: 0.0,
             reemit: 0.2, // surfaces re-emit 30% — absorb most, not mirror-like
             reemit_r: 0.0,
@@ -959,51 +965,80 @@ impl DiffField {
 
         let before_vacuum = self.entities.len();
 
-        // VACUUM — sparse relay network for light to travel through empty space.
-        // Each vacuum entity is nearly invisible, nearly transparent.
-        // Light propagates through this network. Dino body BLOCKS paths by absorbing.
-        // Shadow = where dino interrupts vacuum relay chains between light and floor.
-        let vac_spacing = 3.0;
-        let vac_start = glam::Vec3::new(center - 30.0, center - 8.0, center - 25.0);
-        let vac_end = glam::Vec3::new(center + 30.0, center + 32.0, center + 25.0); // up to sun
+        // ATMOSPHERIC COLUMN — concentrated relay network around the dino.
+        // Cylindrical column centered on solid entity AABB. Vacuum entities relay
+        // light from sun to dino and scatter a fraction into the grid (atmosphere).
+        // Density peaked at column center, fading radially outward.
 
-        let mut vx = vac_start.x;
-        while vx <= vac_end.x {
-            let mut vy = vac_start.y;
-            while vy <= vac_end.y {
-                let mut vz = vac_start.z;
-                while vz <= vac_end.z {
+        // Compute solid entity AABB for column centering
+        let mut solid_min = glam::Vec3::splat(FIELD_SIZE as f32);
+        let mut solid_max = glam::Vec3::ZERO;
+        for e in &self.entities {
+            if !e.is_vacuum && !e.is_heat {
+                solid_min = solid_min.min(e.position);
+                solid_max = solid_max.max(e.position);
+            }
+        }
+        let solid_center = (solid_min + solid_max) * 0.5;
+        let solid_half = (solid_max - solid_min) * 0.5;
+        let column_radius = solid_half.x.max(solid_half.z) * 1.5;
+
+        let vac_spacing = 3.0;
+        let col_y_min = solid_min.y - 5.0;
+        let col_y_max = sun_y;
+
+        let mut vx = solid_center.x - column_radius;
+        while vx <= solid_center.x + column_radius {
+            let mut vy = col_y_min;
+            while vy <= col_y_max {
+                let mut vz = solid_center.z - column_radius;
+                while vz <= solid_center.z + column_radius {
                     let pos = glam::Vec3::new(vx, vy, vz);
 
-                    // Skip if inside the dino body (rough bounding check)
-                    let rel = pos - base;
-                    let in_body = (rel.x / 6.0).powi(2) + ((rel.y - 5.0) / 8.0).powi(2) + (rel.z / 10.0).powi(2) < 1.0;
-                    if !in_body {
-                        let mut e = Entity::new(
-                            pos,
-                            glam::Vec3::ZERO,
-                            0.0, // invisible — vacuum doesn't glow
-                            [0.0, 0.0, 0.0],
-                        );
-                        e.pass_through = 0.95; // air is nearly transparent
-                        e.is_vacuum = true;
-                        e.group = GROUP_VACUUM;
-                        // Below sun = atmosphere. Inverted gradient:
-                        // Bottom (near floor) = dense, high scatter/magnitude — delivers light to surfaces.
-                        // Top (near sun) = thin, sparse — just relays sunlight down.
-                        if vy < sun_y {
-                            let height_frac = (vy - (center - 13.0)) / (sun_y - (center - 13.0)); // 0=floor, 1=sun
-                            let bottom_weight = 1.0 - height_frac; // 1.0 at floor, 0.0 at sun
-                            e.scatter = 0.00002;
-                            e.deposit_magnitude = 0.1 + 4.0 * bottom_weight;
-                            e.color = [
-                                0.4 + 0.4 * bottom_weight,  // warmer near ground
-                                0.5 + 0.35 * bottom_weight,
-                                0.9 + 0.1 * height_frac,    // bluer up high
-                            ];
-                        }
-                        self.entities.push(e);
+                    // Radial distance from column center (XZ plane only)
+                    let dx = pos.x - solid_center.x;
+                    let dz = pos.z - solid_center.z;
+                    let horiz_dist = (dx * dx + dz * dz).sqrt();
+                    let radial_frac = (horiz_dist / column_radius).clamp(0.0, 1.0);
+
+                    // Skip entities outside the column radius
+                    if radial_frac >= 1.0 {
+                        vz += vac_spacing;
+                        continue;
                     }
+
+                    let falloff = 1.0 - radial_frac * radial_frac;
+
+                    let mut e = Entity::new(
+                        pos,
+                        glam::Vec3::ZERO,
+                        0.0,
+                        [0.0, 0.0, 0.0],
+                    );
+                    e.pass_through = 0.95;
+                    e.is_vacuum = true;
+                    e.group = GROUP_VACUUM;
+
+                    // Density profile: peaked at center, fading radially
+                    let base_scatter_val = 0.0001 * falloff;
+                    let base_mag_val = 2.0 * falloff;
+                    e.scatter = base_scatter_val;
+                    e.deposit_magnitude = base_mag_val;
+                    e.base_scatter = base_scatter_val;
+                    e.base_magnitude = base_mag_val;
+
+                    // Vertical color gradient (warmer near ground, bluer up high)
+                    if vy < sun_y {
+                        let height_frac = (vy - col_y_min) / (sun_y - col_y_min);
+                        let bottom_weight = 1.0 - height_frac;
+                        e.color = [
+                            0.4 + 0.4 * bottom_weight,
+                            0.5 + 0.35 * bottom_weight,
+                            0.9 + 0.1 * height_frac,
+                        ];
+                    }
+
+                    self.entities.push(e);
 
                     vz += vac_spacing;
                 }
