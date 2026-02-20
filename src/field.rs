@@ -1062,6 +1062,26 @@ impl DiffField {
         // Compute active set: which entity chains feed into what the observer sees
         self.compute_active_set(view_proj);
 
+        // Atmospheric column modulation: update vacuum scatter/magnitude based on
+        // distance from current AABB center. Gives "follow AABB" behavior.
+        {
+            let aabb_center = (self.aabb_min + self.aabb_max) * 0.5;
+            let aabb_half = (self.aabb_max - self.aabb_min) * 0.5;
+            let column_radius = aabb_half.x.max(aabb_half.z) * 1.5;
+            let inv_radius = if column_radius > 0.1 { 1.0 / column_radius } else { 0.0 };
+
+            for entity in &mut self.entities {
+                if !entity.is_vacuum || entity.base_scatter <= 0.0 { continue; }
+                let dx = entity.position.x - aabb_center.x;
+                let dz = entity.position.z - aabb_center.z;
+                let horiz_dist = (dx * dx + dz * dz).sqrt();
+                let radial_frac = (horiz_dist * inv_radius).clamp(0.0, 1.0);
+                let falloff = 1.0 - radial_frac * radial_frac;
+                entity.scatter = entity.base_scatter * falloff;
+                entity.deposit_magnitude = entity.base_magnitude * falloff;
+            }
+        }
+
         // Phase 0: AABB-restricted decay — only touch cells near geometry
         // The AABB from previous tick tells us where deposits exist.
         // Margin of 40 covers vacuum scatter region generously.
