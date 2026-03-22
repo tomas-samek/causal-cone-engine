@@ -9,6 +9,7 @@
 mod field;
 mod observer;
 mod renderer;
+mod consumption;
 
 use observer::Observer;
 use renderer::Renderer;
