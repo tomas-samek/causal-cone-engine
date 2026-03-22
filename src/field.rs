@@ -1477,6 +1477,7 @@ impl DiffField {
         let edge_gammas = &self.edge_gammas;
         let edge_dir_arr = &self.edge_dirs;
         let active = &self.active_set;
+        let consumption_states = &self.consumption_states;
         let edge_deposits = &mut self.edge_deposits;
 
         let edge_deposit_slice = edge_deposits.as_mut_slice();
@@ -1538,6 +1539,19 @@ impl DiffField {
             } else {
                 (0.0, 0.0, 0.0, 0.0)
             };
+
+            // Consumption blending: consumed portion → entity's own color (Same), rest passes through
+            let (pass_r, pass_g, pass_b) = if idx < consumption_states.len() {
+                if let Some(ref state) = consumption_states[idx] {
+                    if !state.learning && state.consumed > 0 {
+                        let total_seen = (state.consumed + state.rejected) as f32;
+                        let cr = state.consumed as f32 / total_seen.max(1.0);
+                        (entity.color[0] * cr + pass_r * (1.0 - cr),
+                         entity.color[1] * cr + pass_g * (1.0 - cr),
+                         entity.color[2] * cr + pass_b * (1.0 - cr))
+                    } else { (pass_r, pass_g, pass_b) }
+                } else { (pass_r, pass_g, pass_b) }
+            } else { (pass_r, pass_g, pass_b) };
 
             let total_r = own_r + pass_r;
             let total_g = own_g + pass_g;
@@ -1686,6 +1700,14 @@ impl DiffField {
             entity.prev_deposit_idx = new_base_idx;
 
             let mag = entity.deposit_magnitude;
+            // Consumption mass boost: entities that consume more deposit denser
+            let mag = if ent_idx < self.consumption_states.len() {
+                if let Some(ref state) = self.consumption_states[ent_idx] {
+                    if !state.learning && state.consumed > 0 {
+                        mag * (1.0 + (state.consumed as f32).ln().max(0.0) * 0.05)
+                    } else { mag }
+                } else { mag }
+            } else { mag };
             let absorbed = 1.0 - entity.pass_through;
 
             let total_r = entity.color[0] * mag + entity.incoming.r * absorbed * entity.color[0] + entity.reemit_r;
