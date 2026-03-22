@@ -199,6 +199,15 @@ pub struct DiffField {
     // Per-tick active/visible sets (reused allocation)
     active_set: Vec<bool>,
     visible_set: Vec<bool>,
+    /// Parallel vec: consumption_states[i] corresponds to entities[i] for i < entities.len().
+    /// Additional entries (i >= entities.len()) are trie-only metadata nodes.
+    pub consumption_states: Vec<Option<crate::consumption::ConsumptionState>>,
+    /// Whether to enable consumption/learning logs (memory-intensive).
+    pub enable_consumption_logs: bool,
+    /// Maximum trie depth to render (u16::MAX = full detail).
+    pub render_depth_cutoff: u16,
+    /// Debug mode: show trie depth as color instead of entity color.
+    pub show_trie_depth: bool,
 }
 
 // ── Metaball source definitions for skeleton + receptor placement ──────────
@@ -283,6 +292,10 @@ impl DiffField {
             reverse_count: Vec::new(),
             active_set: Vec::new(),
             visible_set: Vec::new(),
+            consumption_states: Vec::new(),
+            enable_consumption_logs: false,
+            render_depth_cutoff: u16::MAX,
+            show_trie_depth: false,
         };
 
         let sp = field.spawn_demo_scene();
@@ -328,6 +341,55 @@ impl DiffField {
         let n = field.entities.len();
         field.active_set = vec![false; n];
         field.visible_set = vec![false; n];
+
+        // --- Initialize consumption states (AFTER sort + connection build) ---
+        field.consumption_states = field.entities.iter().map(|entity| {
+            match entity.group {
+                GROUP_BODY | GROUP_BELLY | GROUP_TAIL | GROUP_TAIL_TIP |
+                GROUP_NECK | GROUP_HEAD | GROUP_JAW | GROUP_MOUTH |
+                GROUP_EYE | GROUP_LEG_L | GROUP_FOOT_L | GROUP_LEG_R |
+                GROUP_FOOT_R | GROUP_ARM_L | GROUP_ARM_R => {
+                    Some(crate::consumption::ConsumptionState::new(0, 0, field.enable_consumption_logs))
+                }
+                _ => None,
+            }
+        }).collect();
+
+        // Wire trie topology via BFS from first GROUP_BODY entity along spatial graph edges.
+        // Single-child cascade model: each parent gets at most one trie_child.
+        if let Some(root_idx) = field.entities.iter().position(|e| e.group == GROUP_BODY) {
+            let mut visited = vec![false; field.entities.len()];
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(root_idx);
+            visited[root_idx] = true;
+
+            while let Some(parent) = queue.pop_front() {
+                let edge_start = field.entities[parent].edge_start as usize;
+                let edge_count = field.entities[parent].edge_count as usize;
+                for k in edge_start..(edge_start + edge_count) {
+                    let target = field.edge_targets[k];
+                    if visited[target] { continue; }
+                    if field.consumption_states[target].is_none() { continue; }
+                    visited[target] = true;
+
+                    // Wire trie: parent -> child (first unvisited body neighbor only)
+                    if let Some(ref mut ps) = field.consumption_states[parent] {
+                        if ps.trie_child.is_none() {
+                            ps.trie_child = Some(target);
+                        }
+                    }
+                    let parent_depth = field.consumption_states[parent]
+                        .as_ref().map(|p| p.depth).unwrap_or(0);
+                    if let Some(ref mut cs) = field.consumption_states[target] {
+                        cs.trie_parent = Some(parent);
+                        cs.depth = parent_depth + 1;
+                    }
+                    queue.push_back(target);
+                }
+            }
+        }
+
+        debug_assert_eq!(field.entities.len(), field.consumption_states.len());
 
         // Seed AABB from solid entity positions so Phase 0 is tight from tick 1
         let mut aabb_min = glam::Vec3::splat(FIELD_SIZE as f32);
