@@ -1582,6 +1582,15 @@ impl DiffField {
             }
 
             // Heat: interior, light can't escape. Always skip.
+            // Progressive rendering: skip entities deeper than cutoff
+            if ent_idx < self.consumption_states.len() {
+                if let Some(ref state) = self.consumption_states[ent_idx] {
+                    if state.depth > self.render_depth_cutoff {
+                        continue;
+                    }
+                }
+            }
+
             if entity.is_heat { continue; }
 
             // Vacuum with atmosphere: scatter into grid only if active

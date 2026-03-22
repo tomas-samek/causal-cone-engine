@@ -449,4 +449,14 @@ impl Renderer {
             log::info!("+ {} trie-only states (no spatial entity)", extra);
         }
     }
+
+    pub fn decrease_render_depth(&mut self) {
+        self.diff_field.render_depth_cutoff = self.diff_field.render_depth_cutoff.saturating_sub(1);
+        log::info!("Render depth cutoff: {}", self.diff_field.render_depth_cutoff);
+    }
+
+    pub fn increase_render_depth(&mut self) {
+        self.diff_field.render_depth_cutoff = self.diff_field.render_depth_cutoff.saturating_add(1).min(u16::MAX);
+        log::info!("Render depth cutoff: {}", self.diff_field.render_depth_cutoff);
+    }
 }

@@ -137,6 +137,12 @@ impl ApplicationHandler for App {
                             KeyCode::KeyI => {
                                 state.renderer.dump_trie_info();
                             }
+                            KeyCode::BracketLeft => {
+                                state.renderer.decrease_render_depth();
+                            }
+                            KeyCode::BracketRight => {
+                                state.renderer.increase_render_depth();
+                            }
                             _ => {}
                         }
                     }
