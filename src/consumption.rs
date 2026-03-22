@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -20,7 +20,7 @@ impl DepositToken {
     /// Each input channel is in [0, 1]; density is scaled by `density_scale` first.
     pub fn from_deposit(density: f32, r: f32, g: f32, b: f32, density_scale: f32) -> Self {
         let quantize = |v: f32| -> u8 { (v * 15.0).round().clamp(0.0, 15.0) as u8 };
-        let d = quantize((density * density_scale).clamp(0.0, 1.0));
+        let d = quantize((density / density_scale).clamp(0.0, 1.0));
         let rq = quantize(r.clamp(0.0, 1.0));
         let gq = quantize(g.clamp(0.0, 1.0));
         let bq = quantize(b.clamp(0.0, 1.0));
@@ -34,9 +34,9 @@ impl DepositToken {
 
 // ── Spectrum ─────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Spectrum {
-    tokens: HashMap<DepositToken, ()>,
+    tokens: HashSet<DepositToken>,
 }
 
 impl Spectrum {
@@ -46,7 +46,7 @@ impl Spectrum {
         let total: u64 = obs_counts.values().sum();
         if total == 0 {
             return Self {
-                tokens: HashMap::new(),
+                tokens: HashSet::new(),
             };
         }
 
@@ -55,11 +55,11 @@ impl Spectrum {
             obs_counts.iter().map(|(&t, &c)| (t, c)).collect();
         sorted.sort_by(|a, b| b.1.cmp(&a.1));
 
-        let mut kept = HashMap::new();
+        let mut kept = HashSet::new();
         let mut accumulated: u64 = 0;
         let threshold = (total as f32 * TARGET_COVERAGE) as u64;
         for (token, count) in sorted {
-            kept.insert(token, ());
+            kept.insert(token);
             accumulated += count;
             if accumulated >= threshold {
                 break;
@@ -70,7 +70,7 @@ impl Spectrum {
     }
 
     pub fn contains(&self, token: &DepositToken) -> bool {
-        self.tokens.contains_key(token)
+        self.tokens.contains(token)
     }
 
     pub fn len(&self) -> usize {
@@ -87,23 +87,23 @@ impl Spectrum {
 #[derive(Clone, Debug)]
 pub struct Seed {
     pub birth_tick: u64,
-    pub entries: Vec<(u64, DepositToken)>,
+    pub tokens: Vec<(u64, DepositToken)>,
 }
 
 impl Seed {
     pub fn new(tick: u64) -> Self {
         Self {
             birth_tick: tick,
-            entries: Vec::new(),
+            tokens: Vec::new(),
         }
     }
 
     pub fn feed(&mut self, tick: u64, token: DepositToken) {
-        self.entries.push((tick, token));
+        self.tokens.push((tick, token));
     }
 
     pub fn should_promote(&self) -> bool {
-        self.entries.len() >= SEED_THRESHOLD
+        self.tokens.len() >= SEED_THRESHOLD
     }
 }
 
@@ -137,9 +137,7 @@ impl ConsumptionState {
             learning: true,
             obs_counts: HashMap::new(),
             learning_ticks: 0,
-            spectrum: Spectrum {
-                tokens: HashMap::new(),
-            },
+            spectrum: Spectrum::default(),
             consumed: 0,
             rejected: 0,
             trie_child: None,
@@ -167,6 +165,8 @@ impl ConsumptionState {
     pub(crate) fn crystallize(&mut self) {
         self.spectrum = Spectrum::crystallize_from(&self.obs_counts);
         self.learning = false;
+        self.obs_counts.clear();
+        self.obs_counts.shrink_to_fit();
     }
 
     /// Record a consumption event.
@@ -233,11 +233,12 @@ pub fn cascade_process(
             let new_depth = depth + 1;
             let new_idx = states.len();
 
-            let mut child_state = ConsumptionState::new(new_depth, tick, false);
+            let parent_logs = states[current_idx].consumption_log.is_some();
+            let mut child_state = ConsumptionState::new(new_depth, tick, parent_logs);
             child_state.trie_parent = Some(current_idx);
 
             // Pre-load seed tokens into the child's observations.
-            for &(t, tok) in &seed.entries {
+            for &(t, tok) in &seed.tokens {
                 child_state.observe(t, tok);
             }
 
@@ -334,15 +335,15 @@ mod tests {
         // Root recognizes A.
         let mut root = ConsumptionState::new(0, 0, false);
         root.learning = false;
-        let mut root_tokens = HashMap::new();
-        root_tokens.insert(tok_a, ());
+        let mut root_tokens = HashSet::new();
+        root_tokens.insert(tok_a);
         root.spectrum = Spectrum { tokens: root_tokens };
 
         // Child recognizes B.
         let mut child = ConsumptionState::new(1, 0, false);
         child.learning = false;
-        let mut child_tokens = HashMap::new();
-        child_tokens.insert(tok_b, ());
+        let mut child_tokens = HashSet::new();
+        child_tokens.insert(tok_b);
         child.spectrum = Spectrum { tokens: child_tokens };
         child.trie_parent = Some(0);
 
@@ -369,8 +370,8 @@ mod tests {
         // Root recognizes only A.
         let mut root = ConsumptionState::new(0, 0, false);
         root.learning = false;
-        let mut root_tokens = HashMap::new();
-        root_tokens.insert(tok_a, ());
+        let mut root_tokens = HashSet::new();
+        root_tokens.insert(tok_a);
         root.spectrum = Spectrum { tokens: root_tokens };
 
         let mut states = vec![root];
