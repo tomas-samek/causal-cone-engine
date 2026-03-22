@@ -1394,6 +1394,63 @@ impl DiffField {
             }
         }
 
+        // --- Consumption-Transformation Pass ---
+        // After incoming is accumulated (Phase 1), before entities push outward (Phase 2).
+        // Each body entity's incoming deposit is quantized to a token and routed through
+        // the consumption trie: consume matching tokens, cascade rejects to children.
+        {
+            use crate::consumption::{DepositToken, ConsumptionState, cascade_process};
+            let density_scale = 1.0_f32;
+            let entity_count = self.entities.len();
+
+            // cascade_process expects &mut Vec<ConsumptionState> (flat), but our field
+            // stores Vec<Option<ConsumptionState>>. Temporarily extract into a flat vec,
+            // tracking which indices were originally None so we can restore them.
+            let opt_len = self.consumption_states.len();
+            let mut none_slots: Vec<bool> = Vec::with_capacity(opt_len);
+            let mut flat: Vec<ConsumptionState> = Vec::with_capacity(opt_len);
+            for opt in self.consumption_states.drain(..) {
+                match opt {
+                    Some(cs) => { none_slots.push(false); flat.push(cs); }
+                    None => {
+                        none_slots.push(true);
+                        // Placeholder; will never be accessed since we skip None-origin indices.
+                        flat.push(ConsumptionState::new(0, 0, false));
+                    }
+                }
+            }
+
+            for i in 0..entity_count {
+                if i >= flat.len() { break; }
+                if none_slots[i] { continue; }
+                let incoming = &self.entities[i].incoming;
+                if incoming.density < 0.001 { continue; }
+
+                let token = DepositToken::from_deposit(
+                    incoming.density, incoming.r, incoming.g, incoming.b,
+                    density_scale,
+                );
+
+                cascade_process(
+                    &mut flat,
+                    i,
+                    self.tick,
+                    token,
+                );
+            }
+
+            // Restore: original slots get Some/None back; any new entries pushed by
+            // cascade_process (trie-only children beyond entity_count) are wrapped in Some.
+            self.consumption_states.reserve(flat.len());
+            for (idx, cs) in flat.into_iter().enumerate() {
+                if idx < none_slots.len() && none_slots[idx] {
+                    self.consumption_states.push(None);
+                } else {
+                    self.consumption_states.push(Some(cs));
+                }
+            }
+        }
+
         // Phase 2: PUSH — each entity pushes new content into its pipes (parallel).
         // New content = entity's own emission + pass-through of incoming (depleted).
         // This REPLACES what was in the pipe (old content was delivered in Phase 1).
@@ -1717,6 +1774,21 @@ impl DiffField {
         }
         self.aabb_min = aabb_min.max(glam::Vec3::ZERO);
         self.aabb_max = aabb_max.min(glam::Vec3::splat(FIELD_SIZE as f32));
+
+        // Trie diagnostics
+        if self.tick % 300 == 0 && self.tick > 0 {
+            let mut depth_counts: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
+            let mut total_consumed = 0u64;
+            let mut total_rejected = 0u64;
+            for state in self.consumption_states.iter().flatten() {
+                *depth_counts.entry(state.depth).or_insert(0) += 1;
+                total_consumed += state.consumed;
+                total_rejected += state.rejected;
+            }
+            let n_states = self.consumption_states.iter().filter(|s| s.is_some()).count();
+            log::info!("Trie @ t={}: states={}, depths={:?}, consumed={}, rejected={}",
+                self.tick, n_states, depth_counts, total_consumed, total_rejected);
+        }
 
         self.tick += 1;
     }
