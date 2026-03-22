@@ -1710,9 +1710,20 @@ impl DiffField {
             } else { mag };
             let absorbed = 1.0 - entity.pass_through;
 
-            let total_r = entity.color[0] * mag + entity.incoming.r * absorbed * entity.color[0] + entity.reemit_r;
-            let total_g = entity.color[1] * mag + entity.incoming.g * absorbed * entity.color[1] + entity.reemit_g;
-            let total_b = entity.color[2] * mag + entity.incoming.b * absorbed * entity.color[2] + entity.reemit_b;
+            // Trie depth visualization: override entity color with depth rainbow
+            let entity_color = if self.show_trie_depth {
+                if ent_idx < self.consumption_states.len() {
+                    if let Some(ref state) = self.consumption_states[ent_idx] {
+                        crate::consumption::depth_color(state.depth)
+                    } else { [0.3, 0.3, 0.3] }
+                } else { [0.3, 0.3, 0.3] }
+            } else {
+                entity.color
+            };
+
+            let total_r = entity_color[0] * mag + entity.incoming.r * absorbed * entity_color[0] + entity.reemit_r;
+            let total_g = entity_color[1] * mag + entity.incoming.g * absorbed * entity_color[1] + entity.reemit_g;
+            let total_b = entity_color[2] * mag + entity.incoming.b * absorbed * entity_color[2] + entity.reemit_b;
             let total_d = mag + entity.incoming.density * absorbed;
 
             // Decoupled boost: body gets high density boost (opaque surface) with

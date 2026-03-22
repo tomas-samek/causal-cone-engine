@@ -131,6 +131,12 @@ impl ApplicationHandler for App {
                                     event_loop.exit();
                                 }
                             }
+                            KeyCode::KeyT => {
+                                state.renderer.toggle_trie_depth_viz();
+                            }
+                            KeyCode::KeyI => {
+                                state.renderer.dump_trie_info();
+                            }
                             _ => {}
                         }
                     }

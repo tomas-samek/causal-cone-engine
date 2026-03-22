@@ -424,4 +424,29 @@ impl Renderer {
 
         Ok(())
     }
+
+    pub fn toggle_trie_depth_viz(&mut self) {
+        self.diff_field.show_trie_depth = !self.diff_field.show_trie_depth;
+        log::info!("Trie depth visualization: {}", self.diff_field.show_trie_depth);
+    }
+
+    pub fn dump_trie_info(&self) {
+        let entity_count = self.diff_field.entities.len();
+        let cs = &self.diff_field.consumption_states;
+        for i in 0..entity_count.min(cs.len()) {
+            if let Some(ref s) = cs[i] {
+                if s.consumed > 0 || !s.learning {
+                    log::info!(
+                        "Entity {} (group {}): depth={}, spectrum={}, consumed={}, rejected={}",
+                        i, self.diff_field.entities[i].group, s.depth, s.spectrum.len(),
+                        s.consumed, s.rejected
+                    );
+                }
+            }
+        }
+        let extra = cs.len().saturating_sub(entity_count);
+        if extra > 0 {
+            log::info!("+ {} trie-only states (no spatial entity)", extra);
+        }
+    }
 }
