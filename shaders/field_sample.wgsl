@@ -139,28 +139,39 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // If ray misses AABB entirely, skip to background
     var hit_anything = false;
     if t_enter <= t_exit && t_exit >= 0.0 {
-        // March parameters (tuned: 96 steps with faster growth covers >375 cells)
-        let max_steps = 96u;
-        var step_size = 0.6; // start with sub-cell steps for precision
-        let step_growth = 1.03; // each step slightly larger (logarithmic march)
-        let density_threshold = 0.01; // minimum density to register as a hit
+        // March parameters — find the ISO-SURFACE (first crossing), not a fog integral.
+        // Finer, slower-growing steps bracket the surface; bisection then pins the
+        // crossing to sub-voxel precision for a crisp silhouette (no fog ramp, no halo).
+        let max_steps = 192u;
+        var step_size = 0.5;
+        let step_growth = 1.02;
+        let iso = 0.3; // surface density level — THE knob: raise to tighten toward the core
         let max_distance = min(t_exit, 200.0); // clip to AABB exit
 
         var distance = max(t_enter, 1.0); // start at AABB entry (or 1 cell ahead if inside)
+        var prev_distance = distance;      // last sample distance known to be BELOW iso
 
         for (var i = 0u; i < max_steps; i = i + 1u) {
-            let sample_pos = u.observer_pos + ray_dir * f32(distance);
+            let probe_pos = u.observer_pos + ray_dir * f32(distance);
+            let probe_density = sample_density(probe_pos);
 
-            let field_value = sample_field(sample_pos);
-            let density = field_value.r; // density is in red channel (first float)
+            if probe_density >= iso {
+                // Bracketed the surface between prev_distance (below iso) and distance (above).
+                // Bisect to pin the iso crossing → sub-voxel-sharp edge.
+                var lo = prev_distance;
+                var hi = distance;
+                for (var b = 0u; b < 12u; b = b + 1u) {
+                    let mid = 0.5 * (lo + hi);
+                    if sample_density(u.observer_pos + ray_dir * mid) >= iso { hi = mid; } else { lo = mid; }
+                }
 
-            if density > density_threshold {
                 hit_anything = true;
-                // We hit a deposit. Extract color.
-                // In our FieldCell: [density, color_r, color_g, color_b]
-                let color = field_value.gba; // RGB in green, blue, alpha channels
-
-                // Normalize color by density to get actual color
+                // Shade once at the refined surface point. `sample_pos` IS the surface;
+                // the existing lighting block below uses it unchanged.
+                let sample_pos = u.observer_pos + ray_dir * hi;
+                let field_value = sample_field(sample_pos);
+                let density = field_value.r;
+                let color = field_value.gba;
                 let norm_color = color / max(density, 0.05);
 
                 // Gradient normal — compute surface orientation from density field
@@ -168,7 +179,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
                 // Diffuse shading: Lambert (N dot L), clamped with ambient floor
                 let n_dot_l = max(dot(normal, sun_dir), 0.0);
-                let ambient = 0.10; // ambient fill so shadows aren't pitch black
+                let ambient = 0.10;
                 let diffuse = ambient + (1.0 - ambient) * n_dot_l;
 
                 // Rim light: subtle brightening at grazing angles (Fresnel-like)
@@ -177,24 +188,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
                 let lit_color = norm_color * (diffuse + rim);
 
-                // Distance-based falloff — closer deposits are brighter
-                let falloff = 1.0 / (1.0 + distance * 0.02);
-
-                // Opacity from density — denser deposits are more opaque
-                let opacity = min(saturate(density * 0.3) * falloff, 1.0);
-
-                // Front-to-back compositing (like swimming through fog)
-                let contribution = lit_color * opacity * (1.0 - accumulated_alpha);
-                accumulated_color += contribution;
-                accumulated_alpha += opacity * (1.0 - accumulated_alpha);
-
-                // Early exit if nearly opaque
-                if accumulated_alpha > 0.92 {
-                    break;
-                }
+                // Opaque surface hit — take it and stop. No fog accumulation: the
+                // silhouette is the bisected iso crossing, so it stays crisp and
+                // halo-free (faint Gaussian tails below `iso` are never registered).
+                accumulated_color = lit_color;
+                accumulated_alpha = 1.0;
+                break;
             }
 
-            // Advance ray (logarithmic stepping)
+            // Advance the ray; remember this (below-iso) distance for bracketing.
+            prev_distance = distance;
             distance += step_size;
             step_size *= step_growth;
 
