@@ -1,175 +1,141 @@
 # Causal Cone Engine — Architecture
 
+> A personal pet project. This document describes how the engine actually works
+> today. For where it might go next, see [ROADMAP.md](ROADMAP.md).
+
 ## Core Principle
 
-There are no rays. There is no scene graph. There is only a field of accumulated 
-diffs and an observer moving through it.
+There are no rays cast into a scene, no triangle meshes, and no scene graph.
+There is a **dense 3D field** of accumulated deposits and an **observer** moving
+through it. Each frame samples the field; what you see is what has already been
+deposited along your line of sight.
 
-Entities deposit curvature at their position each tick. These deposits sit in the 
-field until something reads them. The observer reads deposits by arriving at their 
-location. What the observer sees is determined by what has been deposited within 
-their causal cone — the region of space from which diffs have had time to reach them.
+Two things hold the world:
 
-## Rendering Model
-
-### What the screen shows
-
-Each pixel represents: "What deposit would I encounter if I extended a line from 
-the observer through this screen coordinate into the diff field?"
-
-This sounds like raytracing but it's inverted:
-- **Raytracing**: Cast ray → find surface → compute lighting
-- **Causal cone**: For each deposit in cone → project onto screen → blend by depth
-
-The difference: we iterate over deposits (forward), not over pixels (backward).
-This is inherently O(deposits) not O(pixels × scene_complexity).
-
-### Depth ordering
-
-Deposits are bucketed by temporal lag from observer. Lag = how many ticks ago the 
-deposit was made relative to the observer's current tick. Higher lag = further in 
-the past = further in depth. Render back-to-front by bucket index. O(n), no sorting.
-
-### Splat rendering
-
-Each deposit is rendered as a Gaussian splat — a small oriented disk that blends 
-smoothly with neighbors. When deposits are dense enough, splats overlap and form 
-continuous surfaces. No mesh. No triangles. Just overlapping deposits.
-
-Splat properties derived from deposit:
-- **Position**: Where the entity deposited (3D world coordinate)
-- **Size**: Proportional to deposit magnitude (heavier entity = bigger splat)
-- **Color**: Derived from deposit properties (velocity, type, age)
-- **Opacity**: Falls off with lag (older deposits fade)
-- **Orientation**: Aligned to local field gradient (optional, v2)
-
-### Occlusion
-
-Last-write-wins. A deposit closer to the observer (lower lag) overwrites a deposit 
-further away (higher lag) at the same screen pixel. This is painter's algorithm 
-with bucket ordering. Alpha blending for partial transparency where deposits 
-partially overlap.
-
-### Lighting
-
-No light sources. No shadow maps. No ambient occlusion calculation.
-
-Deposit brightness = deposit magnitude × distance falloff. Regions with dense 
-deposits are "bright" because many overlapping splats accumulate opacity. Regions 
-with sparse deposits are "dark" because splats don't fill the gaps. Shadows are 
-simply regions where occluding deposits block deposits behind them. This is 
-automatic from the painter's algorithm — no shadow computation needed.
-
-For v2: deposits from entities with high velocity leave "stretched" splats (motion 
-blur) and deposits in high-curvature regions appear redshifted (gravitational 
-effects on color).
-
----
-
-## Architecture
+- **The grid** — a dense `512³` array of `FieldCell { density, r, g, b }`
+  (~134M cells, ~2 GB at f32). This is the observer's *retina*: the only thing
+  the GPU ever reads. It is regenerated, not persisted, each tick.
+- **The entity graph** — entities (nodes) connected by directed edges (pipes).
+  Light does **not** diffuse cell-to-cell through the grid; it flows along the
+  graph between entities. The grid only ever receives the *result* of that flow.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    TICK LOOP (CPU)                   │
-│                                                     │
-│  Entities ──deposit──→ DiffField (sparse HashMap)   │
-│                                                     │
-│  DiffField ──changed cells──→ GPU Upload Buffer     │
-└─────────────────────┬───────────────────────────────┘
-                      │ upload changed deposits
-                      ▼
-┌─────────────────────────────────────────────────────┐
-│                 GPU PIPELINE (wgpu)                  │
-│                                                     │
-│  Storage Buffer: all active deposits                │
-│          │                                          │
-│          ▼                                          │
-│  Compute Pass: causal cone culling                  │
-│  - discard deposits outside observer cone           │
-│  - output: visible deposit indices                  │
-│          │                                          │
-│          ▼                                          │
-│  Render Pass: Gaussian splat                        │
-│  - vertex shader: project deposit → screen quad     │
-│  - fragment shader: Gaussian falloff + alpha blend  │
-│  - draw order: by lag bucket (back to front)        │
-│          │                                          │
-│          ▼                                          │
-│  Framebuffer → Swapchain → Display                  │
-└─────────────────────────────────────────────────────┘
+Entity --emits/relays--> EdgeDeposit on pipe --delivered--> neighbour Entity
+Entity --deposits color--> grid cell   (only what the observer can see)
+Observer --marches--> grid cell        (one iso-surface hit per pixel)
 ```
 
-## Data Structures
+## Data Model
 
-### Deposit
+### FieldCell (`field.rs`)
 ```rust
-struct Deposit {
-    position: Vec3,      // world space
-    magnitude: f32,      // deposit amount (1.0 = standard)
-    lag: u32,            // ticks since deposit (temporal depth)
-    color: [f32; 3],     // RGB derived from entity properties
-    velocity: Vec3,      // entity velocity at deposit time (for motion blur)
-}
+struct FieldCell { density: f32, color_r: f32, color_g: f32, color_b: f32 }
+```
+A flat `Vec<FieldCell>` of length `512³`. Uploaded to the GPU as an
+`Rgba16Float` 3D texture (density in R, color in GBA).
+
+### Entity (`field.rs`)
+A point that participates in light transport. Key fields:
+- `position`, `velocity`, `color`, `deposit_magnitude`
+- `pass_through` — fraction of incoming light that continues through it
+- `reemit` — fraction of absorbed light re-emitted as its own color
+- `scatter` / `base_scatter` — atmosphere: fraction bled into the grid
+- `is_heat` — interior entity whose light can't escape the absorbing skin;
+  conducts through the graph but never deposits to the grid
+- `is_vacuum` — invisible relay (sun, atmosphere) that moves light but isn't drawn
+- `specular`, oscillation params (for slow skin-texture shimmer), `deposit_radii`
+- `edge_start` / `edge_count` — slice into the SoA edge arrays
+- `incoming` / `incoming_dir` — what arrived this tick
+
+### Edges — structure-of-arrays (`field.rs`)
+Edges are stored as parallel flat arrays for cache-friendly iteration, not as
+per-entity `Vec`s:
+`edge_targets`, `edge_deposits` (the `EdgeDeposit` in each pipe), `edge_gammas`
+(per-edge conductance weight), `edge_dirs` (normalized source→target). A reverse
+index (`reverse_*`) lets a target find its incoming edges.
+
+### Consumption trie (`consumption.rs`)
+A separate, optional learning layer running parallel to the body entities:
+- `DepositToken` — an incoming deposit quantized to 4-bit density + RGB levels.
+- `Spectrum` — the set of tokens an entity "recognizes," crystallized from the
+  most frequent tokens covering `TARGET_COVERAGE` (50%) of observations.
+- `ConsumptionState` / `Seed` / `cascade_process` — each body entity routes its
+  incoming token through a trie: tokens in its spectrum are *consumed* (blended
+  toward the entity's own color); rejects cascade to a child; persistent rejects
+  seed a new child state one level deeper (up to `MAX_TRIE_DEPTH = 20`).
+This drives the trie-depth diagnostics (`T`/`I`) and progressive rendering
+(`[` / `]` adjust `render_depth_cutoff`).
+
+## Per-Tick Pipeline (CPU, 30 ticks/sec)
+
+`DiffField::tick(view_proj)` runs a fixed-timestep pipeline. The recurring theme
+is **do work only where the observer can see** — this is the practical form of
+the "causal cone": chains that don't feed a visible pixel are skipped.
+
+| Phase | What happens |
+|-------|--------------|
+| **Active set** | `compute_active_set` extracts frustum planes (Gribb–Hartmann) and marks each entity `active` (participates in transport) and `visible` (deposits to grid). Emitters like the sun are always active; heat entities never are. |
+| **Atmosphere modulation** | Vacuum relay entities' `scatter`/`magnitude` are modulated by distance from the current geometry AABB center, so the atmosphere column follows the subject. |
+| **Phase 0 — decay** | Cells inside the AABB are multiplied by 0.85 (tiny values cleared); slabs outside the AABB are cleared. Only *dirty* slabs are touched. |
+| **Phase 1 — deliver** | Each edge's `EdgeDeposit` is pushed into its target's accumulator (active targets only). Targets apply incoming, compute incoming direction, update a debounce counter, and build re-emission energy. |
+| **Consumption** | Each body entity's incoming is tokenized and run through `cascade_process` (consume / reject / seed / promote). |
+| **Phase 2 — push** | Each active, non-debounced entity rewrites its outgoing edge deposits = own emission + pass-through of incoming, weighted by `edge_gamma × distance_factor`, with optional directional bias for vacuum relays. Parallelized with `rayon` (each entity owns a disjoint edge range). |
+| **Phase 3 — deposit** | Entities move (and bounce off bounds). Heat and too-deep entities are skipped; vacuum entities scatter into the grid; visible solids deposit color/density into cells. Dirty slabs and the new AABB are recorded. |
+
+## GPU Upload (`renderer.rs`)
+
+Only what changed crosses the bus. When the tick advances, for each **dirty
+slab** the renderer converts the AABB sub-rectangle of `FieldCell`s from f32 to
+`f16` and `write_texture`s just that sub-region into the 3D texture. Empty space
+and unchanged slabs cost nothing.
+
+## GPU Render (`shaders/field_sample.wgsl`)
+
+A single fullscreen triangle; all the work is in the fragment shader. Present
+mode is uncapped (`AutoNoVsync`).
+
+```
+For each pixel:
+  reconstruct world ray from inv_view_proj
+  ray ∩ AABB (slab test) ───────────── miss → sky background
+  march with growing step (0.5 × 1.02^i, ≤192 steps, clipped to AABB/200)
+    first sample with density ≥ iso (0.3)?
+      └─ 12-iteration bisection → sub-voxel iso crossing (crisp silhouette)
+         shade surface:
+           normal = density gradient (central differences)
+           if creature (green): procedural reptile skin
+             - Voronoi scales at two frequencies + normal perturbation
+             - fbm mottling, dorsal stripe, warm belly tint
+           Lambert diffuse + ambient floor + rim + specular (fixed sun_dir)
+  composite over sky gradient (zenith/horizon/ground + sun glow)
+  velocity vignette → ACES tone map → gamma
 ```
 
-### DiffField
-Sparse HashMap<IVec3, Vec<Deposit>> — grid cell → deposits at that cell.
-Only cells with deposits exist. Empty space costs nothing.
+The iso-surface is found by **bisection**, not fog/alpha accumulation, so the
+silhouette stays sharp and halo-free — sub-`iso` Gaussian tails are never drawn.
 
-### Observer
-```rust
-struct Observer {
-    position: Vec3,
-    orientation: Quat,
-    causal_radius: f32,  // how far diffs have reached (grows at c per tick)
-    tick: u64,           // current observer tick
-}
-```
+## Observer (`observer.rs`)
 
-## Phases
+Free-fly camera with acceleration + drag. `c = 1 cell/tick = 30 cells/sec` at
+30 ticks/sec; the observer is capped at `MAX_SPEED = 0.5c`. Effective FOV narrows
+with speed (a linear approximation of relativistic aberration), and the shader
+darkens screen edges at speed — fewer diffs reach you per tick the faster you go.
 
-### v0.1 — Proof of concept
-- [x] Window + wgpu setup
-- [ ] 10,000 entities depositing randomly in 3D
-- [ ] Point rendering (1 pixel per deposit, no splats yet)
-- [ ] Camera with WASD + mouse
-- [ ] Temporal lag as alpha (older = more transparent)
-- [ ] Back-to-front bucket ordering
-- [ ] FPS counter
-- **Goal**: See moving points with depth from temporal lag. Validate O(n) rendering.
+## Demo Scene (`spawn_demo_scene`)
 
-### v0.2 — Gaussian splats
-- [ ] Replace points with screen-space Gaussian quads
-- [ ] Splat size from deposit magnitude
-- [ ] Alpha blending back-to-front
-- [ ] Surfaces emerge from dense deposit regions
-- **Goal**: Dense point clouds look like surfaces.
+A dinosaur built from metaball sources via BFS flood-fill — body, belly, tail,
+neck, head, jaw, mouth, eyes, legs, feet — blended into seamless geometry. Only
+a surface/subsurface **receptor shell** of lightweight entities is created (they
+absorb ~97% of incoming light and re-emit ~30% as color); fully-enclosed
+interior cells become **heat**. The scene is lit by a **sun** (a vacuum emitter
+pushing light through the graph), wrapped in an **atmosphere** column of vacuum
+relays that scatter a little blue light into the grid, and stands on a **40×40
+floor**. The sky and sun glow are procedural background in the fragment shader.
 
-### v0.3 — Causal cone culling
-- [ ] Compute shader for cone intersection test
-- [ ] Only render deposits within observer's cone
-- [ ] Cone grows at 1 cell/tick (c)
-- [ ] Entities beyond horizon cost zero
-- **Goal**: Automatic LOD from causal structure.
+## Theoretical Basis
 
-### v0.4 — Temporal effects
-- [ ] Sliding window from Experiment 49
-- [ ] Trails: render last N ticks of each entity
-- [ ] Motion blur: velocity-weighted splat stretching
-- [ ] Holographic horizon: compressed far-field overlay
-- **Goal**: Port Experiment 49's temporal effects to GPU.
-
-### v0.5 — Real scenes
-- [ ] Load point cloud data (PLY/LAS files)
-- [ ] Convert point cloud → deposits
-- [ ] Camera flythrough of real scenes
-- [ ] Benchmark against conventional renderers
-- **Goal**: Render real-world data competitively.
-
-### v1.0 — Product
-- [ ] Scene graph for entity management
-- [ ] Physics integration (optional — entities can move)
-- [ ] Asset pipeline (mesh → point cloud → deposits)
-- [ ] Multi-window support
-- [ ] API for external applications
-- **Goal**: Usable engine that others can build on.
+Based on tick-frame physics: time is discrete, space is the diff field, photons
+are stationary (they *are* the field updates), and mass is what gives you energy
+to fight the substrate stream. The observer can't reach `c` — at `c` you're a
+photon and no rendering is possible. The reactive active-set is the engine's
+literal causal cone: only what can reach the observer is computed.
