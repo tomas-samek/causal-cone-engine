@@ -1,5 +1,8 @@
 # Causal Cone Engine — Roadmap
 
+> A personal pet project — this roadmap is a changelog of what's been built and a
+> loose sketch of where it might go, not a committed plan. ✅ marks done.
+
 ## v0.2: Dino looks good ✅
 - Diff-field rendering with 128³ grid
 - Entity graph with connection + radiation edges
@@ -55,21 +58,30 @@
 - Midpoint entities: interpolated skeleton points at joints (body↔neck, neck↔head, body↔tail, etc.) for smoother blending between body parts.
 - Cleanup: removed BFS builder, grid_pos/is_subsurface fields, metaball field evaluator simplified to surface detection only.
 
-## v0.7: Multiple objects interacting
+## v0.7: Consumption entities, trie rendering & crisp surfaces ✅
+- Consumption-transformation entities (`consumption.rs`): each body entity's incoming deposit is quantized to a `DepositToken` (4-bit density + RGB). A per-entity `Spectrum` crystallizes from the most frequent tokens covering 50% of observations (`TARGET_COVERAGE`).
+- Consumption trie via `cascade_process`: recognized tokens are consumed, rejects cascade to a child, persistent rejects seed new child states one level deeper (`MAX_TRIE_DEPTH = 20`). Trie topology wired by BFS over the body graph.
+- Consumption-modulated deposits: the consumed fraction blends each deposit toward the entity's own color (rest passes through).
+- Trie-depth diagnostics: `T` toggles depth-as-color visualization; `I` dumps per-entity trie/spectrum info to the log.
+- Progressive rendering by trie depth: `[` / `]` adjust `render_depth_cutoff`; entities deeper than the cutoff skip their grid deposit.
+- Iso-surface bisection march: replaced fog/alpha compositing with first-crossing detection at `iso = 0.3` plus 12-step bisection — crisp, halo-free silhouettes (sub-`iso` Gaussian tails are never drawn).
+- Procedural reptile skin: two-frequency Voronoi scales with normal perturbation, fbm mottling, dorsal stripe, warm belly tint, and a waxy specular sheen.
+
+## v0.8: Multiple objects interacting
 - Multiple independent entity groups
 - Inter-object interaction rules
 - Leverages hierarchical entities from v0.3
 
-## v0.8: Sound propagation
+## v0.9: Sound propagation
 - Field carries additional signal types beyond light
 - Acoustic wave simulation through entity graph
 
-## v0.9: Water/reflection
+## v0.10: Water/reflection
 - Reflective surface simulation
 - Extends specular material properties
 - Dynamic reflection via field re-emission
 
-## v0.10: Scene scale (landscape, multiple creatures)
+## v0.11: Scene scale (landscape, multiple creatures)
 - Larger worlds beyond 512³
 - Hierarchical or streaming field
 - Multiple animated creatures

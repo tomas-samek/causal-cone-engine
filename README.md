@@ -63,12 +63,14 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the fuller design.
 
 ## Demo Scene
 
-A dinosaur built from metaball sources via BFS flood-fill — body, belly, tail,
-neck, head, jaw, mouth, yellow eyes, legs and feet — blended into seamless
-geometry and wrapped in a procedural reptile-skin texture. It stands on a 40×40
-floor, lit by a sun and a sky dome, with an atmosphere scatter column relaying
-light from the sun to the scene. A receptor shell on the surface absorbs and
-re-emits incoming light as colored deposits.
+A dinosaur whose body is a *skeleton* of overlapping metaball entities — body,
+belly, tail, neck, head, jaw, mouth, yellow eyes, legs and feet, plus midpoints
+at the joints — each depositing a wide anisotropic gaussian blob that merges into
+seamless geometry, wrapped in a procedural reptile-skin texture. A separate
+lightweight receptor shell on the surface catches light and re-emits it as color.
+It stands on a 40×40 dirt/grass floor beside a rock, lit by a sun disc, with an
+atmosphere scatter column relaying light from the sun into the scene. The sky and
+sun glow are drawn procedurally by the fragment shader.
 
 ## Theoretical Basis
 

@@ -123,14 +123,20 @@ darkens screen edges at speed — fewer diffs reach you per tick the faster you 
 
 ## Demo Scene (`spawn_demo_scene`)
 
-A dinosaur built from metaball sources via BFS flood-fill — body, belly, tail,
-neck, head, jaw, mouth, eyes, legs, feet — blended into seamless geometry. Only
-a surface/subsurface **receptor shell** of lightweight entities is created (they
-absorb ~97% of incoming light and re-emit ~30% as color); fully-enclosed
-interior cells become **heat**. The scene is lit by a **sun** (a vacuum emitter
-pushing light through the graph), wrapped in an **atmosphere** column of vacuum
-relays that scatter a little blue light into the grid, and stands on a **40×40
-floor**. The sky and sun glow are procedural background in the fragment shader.
+The dinosaur's **density** comes from a *skeleton*: ~16 metaball-source entities
+(body, belly, tail, neck, head, jaw, mouth, eyes, legs, feet) plus ~11 midpoint
+entities at the joints. Each deposits a wide **anisotropic gaussian** blob
+(`deposit_radii`) and the overlapping blobs merge into a continuous, seamless
+density field — far cheaper than flood-filling the volume. Its **lighting** comes
+from a separate **receptor shell**: lightweight surface entities (placed by BFS
+surface-detection of the metaball field) that absorb most incoming light and
+re-emit ~30% as color via radiation links. Entities fully enclosed by opaque
+neighbors are turned to **heat** (conduct through the graph, never drawn).
+
+The scene is lit by a **sun disc** of vacuum emitters pushing light through the
+graph, wrapped in an **atmosphere** column of vacuum relays that scatter a little
+blue light into the grid, and stands on a **40×40 dirt/grass floor** beside a
+rock. The sky and sun glow are procedural background in the fragment shader.
 
 ## Theoretical Basis
 
