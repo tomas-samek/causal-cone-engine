@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "causal-cone-engine"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "bytemuck",
  "env_logger",
