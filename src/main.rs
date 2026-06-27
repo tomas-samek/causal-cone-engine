@@ -63,7 +63,7 @@ impl ApplicationHandler for App {
         }
 
         let window_attrs = Window::default_attributes()
-            .with_title("Causal Cone Engine v0.1 — diff field renderer")
+            .with_title("Causal Cone Engine v0.7 — diff field renderer")
             .with_inner_size(PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
 
         let window = Arc::new(event_loop.create_window(window_attrs).unwrap());
@@ -185,7 +185,7 @@ impl ApplicationHandler for App {
                     state.fps_timer = now;
 
                     state.window.set_title(&format!(
-                        "Causal Cone Engine v0.1 — {:.0} FPS — tick {} — observer v={:.3}c",
+                        "Causal Cone Engine v0.7 — {:.0} FPS — tick {} — observer v={:.3}c",
                         state.current_fps,
                         state.tick_count,
                         state.observer.speed()
