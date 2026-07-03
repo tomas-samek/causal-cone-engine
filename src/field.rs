@@ -298,6 +298,16 @@ fn evaluate_metaball_field(pos: glam::Vec3, balls: &[MetaballSource]) -> Metabal
     }
 }
 
+/// Feather window for the gaussian deposit cutoff: 1.0 below exponent 3.0,
+/// smoothstep down to exactly 0.0 at 4.0 (where the kernel stops sampling).
+/// Without it, boundary cells carry ~exp(-4)×boosted-magnitude — far above
+/// the iso threshold — and pop between "deposited" and "decaying" as a
+/// gaussian drifts sub-cell, which reads as edge shimmer.
+fn cutoff_window(exponent: f32) -> f32 {
+    let t = (4.0 - exponent).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 impl DiffField {
     pub fn new() -> Self {
         let mut field = Self {
@@ -2061,8 +2071,10 @@ impl DiffField {
                             if cx < 0 || cx >= FIELD_SIZE as i32 { continue; }
                             let fx = cx as f32 + 0.5 - deposit_pos.x;
                             let exponent = fx * fx * inv_rx2 + eyz;
-                            if exponent > 4.0 { continue; }
-                            let w = (-exponent).exp();
+                            if exponent >= 4.0 { continue; }
+                            // Feathered cutoff: fade to zero over exponent 3→4
+                            // so cells stop popping as the gaussian drifts
+                            let w = (-exponent).exp() * cutoff_window(exponent);
                             let idx = Self::index(cx as u32, cy as u32, cz as u32);
                             let cell = &mut self.cells[idx];
                             cell.density = (cell.density + total_d * w).min(50.0);
@@ -2140,6 +2152,29 @@ mod tests {
             glam::Vec3::Y,
         );
         proj * view
+    }
+
+    #[test]
+    fn cutoff_window_is_one_inside_and_zero_at_cutoff() {
+        assert_eq!(cutoff_window(0.0), 1.0);
+        assert_eq!(cutoff_window(3.0), 1.0);
+        assert_eq!(cutoff_window(4.0), 0.0);
+        assert!((cutoff_window(3.5) - 0.5).abs() < 1e-6); // smoothstep midpoint
+    }
+
+    #[test]
+    fn cutoff_window_fades_monotonically_and_continuously() {
+        // Monotone decreasing across the feather band
+        let mut prev = cutoff_window(3.0);
+        for i in 1..=20 {
+            let e = 3.0 + i as f32 * 0.05;
+            let cur = cutoff_window(e);
+            assert!(cur <= prev, "window not monotone at exponent {}", e);
+            prev = cur;
+        }
+        // Continuous at the cutoff: value just inside 4.0 is already tiny,
+        // so a cell crossing the boundary cannot pop
+        assert!(cutoff_window(3.999) < 1e-4);
     }
 
     #[test]
