@@ -231,6 +231,10 @@ pub struct DiffField {
     /// Link distances captured at build time, reused by refresh_cross_links.
     link_connect_dist: f32,
     link_radiation_dist: f32,
+    /// Phase 3 scratch: (entity index, final deposit position) queued by
+    /// pass 3a (move/animate/clear) and replayed by pass 3b (deposit).
+    /// Reused allocation — cleared each tick.
+    deposit_queue: Vec<(usize, glam::Vec3)>,
 }
 
 // ── Metaball source definitions for skeleton + receptor placement ──────────
@@ -324,6 +328,7 @@ impl DiffField {
             last_refresh_tick: 0,
             link_connect_dist: 0.0,
             link_radiation_dist: 0.0,
+            deposit_queue: Vec::new(),
         };
 
         let sp = field.spawn_demo_scene();
@@ -1810,9 +1815,15 @@ impl DiffField {
         self.travel_since_refresh += walk_delta.length();
         let walk_offset_z = self.walker.offset.z;
 
-        // Phase 3: entities deposit to grid (only visible entities)
+        // Phase 3a: move, animate, and clear old footprints.
+        // Every clear must land before ANY deposit: a clear that runs
+        // mid-loop wipes same-tick contributions already written by
+        // earlier-sorted overlapping entities (mouth under jaw), strobing
+        // their colors whenever a base cell shifts. Deposit positions are
+        // queued here and replayed in pass 3b.
         let mut aabb_min = glam::Vec3::splat(FIELD_SIZE as f32);
         let mut aabb_max = glam::Vec3::splat(0.0);
+        self.deposit_queue.clear();
         for (ent_idx, entity) in self.entities.iter_mut().enumerate() {
             // Move entity (all entities, not just visible — keeps positions consistent).
             // Walkers get the shared rigid displacement; their own velocity stays zero
@@ -1842,7 +1853,9 @@ impl DiffField {
 
             if entity.is_heat { continue; }
 
-            // Vacuum with atmosphere: scatter into grid only if active
+            // Vacuum with atmosphere: scatter into grid only if active.
+            // (Stays in 3a: scatter never clears, and atmosphere cells don't
+            // meaningfully overlap the skeleton's clear boxes.)
             if entity.is_vacuum {
                 if !self.active_set[ent_idx] { continue; }
                 if entity.scatter > 0.0 && entity.incoming.density > 0.1 {
@@ -1916,19 +1929,19 @@ impl DiffField {
                 deposit_pos.y -= z_frac * 2.5 * open_amount;
             }
 
-            // Determine deposit extent: skeleton entities use wide gaussian,
-            // floor/rock use compact tent kernel.
+            // Advance oscillation phase (once per tick, after deposit_pos
+            // was computed with the current phase — same timing as before)
+            entity.oscillation_phase += entity.oscillation_freq;
+
+            // Clear-box extents match the deposit kernel's extents.
             let use_gaussian = entity.deposit_radii != glam::Vec3::ZERO;
             let (half_x, half_y, half_z) = if use_gaussian {
-                // 2× radii so gaussians overlap heavily between adjacent skeleton
-                // points and fade smoothly (exp(-4) ≈ 0.02 at boundary).
                 ((entity.deposit_radii.x * 2.0).ceil() as i32,
                  (entity.deposit_radii.y * 2.0).ceil() as i32,
                  (entity.deposit_radii.z * 2.0).ceil() as i32)
             } else {
-                (1i32, 1i32, 1i32) // 3x3x3 tent for floor/rock
+                (1i32, 1i32, 1i32)
             };
-            let tent_radius = 1.5f32; // only used for non-gaussian
 
             let base_x = deposit_pos.x.floor() as i32;
             let base_y = deposit_pos.y.floor() as i32;
@@ -1959,6 +1972,33 @@ impl DiffField {
                 }
             }
             entity.prev_deposit_idx = new_base_idx;
+
+            self.deposit_queue.push((ent_idx, deposit_pos));
+        }
+        self.aabb_min = aabb_min.max(glam::Vec3::ZERO);
+        self.aabb_max = aabb_max.min(glam::Vec3::splat(FIELD_SIZE as f32));
+
+        // Phase 3b: deposit. Every queued entity writes into a field whose
+        // stale footprints are all cleared — deposit order no longer matters.
+        for qi in 0..self.deposit_queue.len() {
+            let (ent_idx, deposit_pos) = self.deposit_queue[qi];
+            let entity = &self.entities[ent_idx];
+
+            let use_gaussian = entity.deposit_radii != glam::Vec3::ZERO;
+            let (half_x, half_y, half_z) = if use_gaussian {
+                // 2× radii so gaussians overlap heavily between adjacent skeleton
+                // points and fade smoothly (exp(-4) ≈ 0.02 at boundary).
+                ((entity.deposit_radii.x * 2.0).ceil() as i32,
+                 (entity.deposit_radii.y * 2.0).ceil() as i32,
+                 (entity.deposit_radii.z * 2.0).ceil() as i32)
+            } else {
+                (1i32, 1i32, 1i32) // 3x3x3 tent for floor/rock
+            };
+            let tent_radius = 1.5f32; // only used for non-gaussian
+
+            let base_x = deposit_pos.x.floor() as i32;
+            let base_y = deposit_pos.y.floor() as i32;
+            let base_z = deposit_pos.z.floor() as i32;
 
             let mag = entity.deposit_magnitude;
             // Consumption mass boost: entities that consume more deposit denser
@@ -2062,12 +2102,7 @@ impl DiffField {
                     }
                 }
             }
-
-            // Advance oscillation phase
-            entity.oscillation_phase += entity.oscillation_freq;
         }
-        self.aabb_min = aabb_min.max(glam::Vec3::ZERO);
-        self.aabb_max = aabb_max.min(glam::Vec3::splat(FIELD_SIZE as f32));
 
         // Trie diagnostics
         if self.tick % 300 == 0 && self.tick > 0 {
