@@ -459,4 +459,18 @@ impl Renderer {
         self.diff_field.render_depth_cutoff = self.diff_field.render_depth_cutoff.saturating_add(1).min(u16::MAX);
         log::info!("Render depth cutoff: {}", self.diff_field.render_depth_cutoff);
     }
+
+    pub fn time_lapse(&self) -> u64 {
+        self.diff_field.walker.time_lapse
+    }
+
+    pub fn halve_time_lapse(&mut self) {
+        self.diff_field.walker.halve_time_lapse();
+        log::info!("Time lapse: ×{}", self.diff_field.walker.time_lapse);
+    }
+
+    pub fn double_time_lapse(&mut self) {
+        self.diff_field.walker.double_time_lapse();
+        log::info!("Time lapse: ×{}", self.diff_field.walker.time_lapse);
+    }
 }

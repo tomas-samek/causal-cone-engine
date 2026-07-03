@@ -144,6 +144,12 @@ impl ApplicationHandler for App {
                             KeyCode::BracketRight => {
                                 state.renderer.increase_render_depth();
                             }
+                            KeyCode::Minus => {
+                                state.renderer.halve_time_lapse();
+                            }
+                            KeyCode::Equal => {
+                                state.renderer.double_time_lapse();
+                            }
                             _ => {}
                         }
                     }
@@ -186,10 +192,12 @@ impl ApplicationHandler for App {
                     state.fps_timer = now;
 
                     state.window.set_title(&format!(
-                        "Causal Cone Engine v0.7 — {:.0} FPS — tick {} — observer v={:.3}c",
+                        "Causal Cone Engine v0.7 — {:.0} FPS — tick {} — observer v={:.3}c — dino v={:e}c — lapse ×{}",
                         state.current_fps,
                         state.tick_count,
-                        state.observer.speed()
+                        state.observer.speed(),
+                        walker::DINO_SPEED_C,
+                        state.renderer.time_lapse()
                     ));
                 }
 
