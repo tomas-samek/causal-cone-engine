@@ -74,13 +74,14 @@ the "causal cone": chains that don't feed a visible pixel are skipped.
 
 | Phase | What happens |
 |-------|--------------|
+| **Cross-link refresh** | When the walker (dino) has drifted ≥1 cell since links were last built, walker↔world connection and radiation edges are re-searched and the SoA edge arrays repacked; internal edges and their in-flight deposits are preserved. |
 | **Active set** | `compute_active_set` extracts frustum planes (Gribb–Hartmann) and marks each entity `active` (participates in transport) and `visible` (deposits to grid). Emitters like the sun are always active; heat entities never are. |
 | **Atmosphere modulation** | Vacuum relay entities' `scatter`/`magnitude` are modulated by distance from the current geometry AABB center, so the atmosphere column follows the subject. |
 | **Phase 0 — decay** | Cells inside the AABB are multiplied by 0.85 (tiny values cleared); slabs outside the AABB are cleared. Only *dirty* slabs are touched. |
 | **Phase 1 — deliver** | Each edge's `EdgeDeposit` is pushed into its target's accumulator (active targets only). Targets apply incoming, compute incoming direction, update a debounce counter, and build re-emission energy. |
 | **Consumption** | Each body entity's incoming is tokenized and run through `cascade_process` (consume / reject / seed / promote). |
 | **Phase 2 — push** | Each active, non-debounced entity rewrites its outgoing edge deposits = own emission + pass-through of incoming, weighted by `edge_gamma × distance_factor`, with optional directional bias for vacuum relays. Parallelized with `rayon` (each entity owns a disjoint edge range). |
-| **Phase 3 — deposit** | Entities move (and bounce off bounds). Heat and too-deep entities are skipped; vacuum entities scatter into the grid; visible solids deposit color/density into cells. Dirty slabs and the new AABB are recorded. |
+| **Phase 3 — deposit** | The walker group (dino) translates rigidly by `speed × time_lapse` and paces ±6 cells along Z; other entities move by velocity (and bounce off bounds). Heat and too-deep entities are skipped; vacuum entities scatter into the grid; visible solids deposit color/density into cells. Dirty slabs and the new AABB are recorded. |
 
 ## GPU Upload (`renderer.rs`)
 
@@ -120,6 +121,22 @@ Free-fly camera with acceleration + drag. `c = 1 cell/tick = 30 cells/sec` at
 30 ticks/sec; the observer is capped at `MAX_SPEED = 0.5c`. Effective FOV narrows
 with speed (a linear approximation of relativistic aberration), and the shader
 darkens screen edges at speed — fewer diffs reach you per tick the faster you go.
+
+## Time-Lapse World Clock (`walker.rs`)
+
+Two clocks are separated. A **sim step** is the 30 Hz wall-clock unit: one
+graph hop of light, one decay + deposit pass. A **world tick** is the physics
+unit where c = 1 cell/tick. Each sim step advances `time_lapse` world-ticks
+(default ×100,000, keys `-`/`=`, clamped to [1, 2²⁰]).
+
+The dino's speed is stored honestly as `DINO_SPEED_C = 1e-6` cells per
+world-tick — strongly subluminal. Per sim step it moves
+`1e-6 × 100,000 = 0.1 cells` (30×/sec, never jumping), i.e. ~3 cells/sec on
+screen. Light transport still runs once per sim step: at this speed ratio
+the light field is **quasi-static** (adiabatic regime) — light crosses the
+whole field in a negligible fraction of a step of world time, so the
+residual graph-convergence lag is invisible. The observer stays in the
+wall-clock frame; its 0.5c cap and aberration vignette are unchanged.
 
 ## Demo Scene (`spawn_demo_scene`)
 

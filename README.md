@@ -31,6 +31,7 @@ First build will take a while (downloading + compiling wgpu). Subsequent builds 
 | T | Toggle trie-depth visualization |
 | I | Dump trie / entity info to the log |
 | `[` / `]` | Decrease / increase render-depth cutoff (progressive rendering by trie depth) |
+| `-` / `=` | Halve / double the time-lapse factor (×1 = literal real-time 1e-6 c) |
 
 ## What You're Seeing
 
@@ -68,7 +69,9 @@ belly, tail, neck, head, jaw, mouth, yellow eyes, legs and feet, plus midpoints
 at the joints — each depositing a wide anisotropic gaussian blob that merges into
 seamless geometry, wrapped in a procedural reptile-skin texture. A separate
 lightweight receptor shell on the surface catches light and re-emits it as color.
-It stands on a 40×40 dirt/grass floor beside a rock, lit by a sun disc, with an
+It paces slowly back and forth on a 40×40 dirt/grass floor beside a rock —
+moving at a true 1e-6 c, rendered visible through a ×100,000 time-lapse
+world clock — lit by a sun disc, with an
 atmosphere scatter column relaying light from the sun into the scene. The sky and
 sun glow are drawn procedurally by the fragment shader.
 
