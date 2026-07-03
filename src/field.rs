@@ -1309,7 +1309,10 @@ impl DiffField {
             let mid_pt = (ba.pass_through + bb.pass_through) * 0.5;
             let mut e = Entity::new(mid_pos, glam::Vec3::ZERO, mid_mag, mid_color);
             e.pass_through = mid_pt;
-            e.group = ba.group; // use source group
+            // Midpoints inherit the source group — except head↔jaw, which must
+            // ride the jaw animation: as GROUP_HEAD it would sit still and fill
+            // the mouth with a static blob while the jaw dips below it.
+            e.group = if (a, b_idx) == (5, 6) { bb.group } else { ba.group };
             e.deposit_radii = mid_radii;
             self.entities.push(e);
         }
@@ -1908,7 +1911,9 @@ impl DiffField {
 
                 // Jaw only opens DOWN (abs), never pushes up into head
                 let open_amount = (time * frequency).sin().abs();
-                deposit_pos.y -= z_frac * 1.5 * open_amount;
+                // 2.5 cells at the snout tip — enough to clear the head
+                // gaussian's tail so the opening reads at the iso-surface
+                deposit_pos.y -= z_frac * 2.5 * open_amount;
             }
 
             // Determine deposit extent: skeleton entities use wide gaussian,
