@@ -308,6 +308,13 @@ fn cutoff_window(exponent: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Rank percentile of a sorted slice (p in 0..=1). Empty slice → 0.0.
+fn percentile(sorted: &[f32], p: f32) -> f32 {
+    if sorted.is_empty() { return 0.0; }
+    let idx = ((sorted.len() as f32 * p).ceil() as usize).max(1) - 1;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
 impl DiffField {
     pub fn new() -> Self {
         let mut field = Self {
@@ -1511,6 +1518,88 @@ impl DiffField {
         sp
     }
 
+    /// On-demand diagnostics (key H): saturation histograms over the active
+    /// AABB and a floor-contrast probe. Answers "where does the 50-cap
+    /// bite?" and "which transport path carries the ground pattern?".
+    pub fn dump_field_stats(&self) {
+        let fs = FIELD_SIZE as usize;
+        let x0 = self.aabb_min.x.max(0.0) as usize;
+        let x1 = (self.aabb_max.x as usize + 1).min(fs);
+        let y0 = self.aabb_min.y.max(0.0) as usize;
+        let y1 = (self.aabb_max.y as usize + 1).min(fs);
+        let z0 = self.aabb_min.z.max(0.0) as usize;
+        let z1 = (self.aabb_max.z as usize + 1).min(fs);
+
+        let mut density = Vec::new();
+        let mut colors = Vec::new();
+        let mut capped = 0u64;
+        let mut nonzero = 0u64;
+        for z in z0..z1 {
+            for y in y0..y1 {
+                let row = z * fs * fs + y * fs;
+                for x in x0..x1 {
+                    let c = &self.cells[row + x];
+                    if c.density <= 0.0 { continue; }
+                    nonzero += 1;
+                    density.push(c.density);
+                    colors.push(c.color_r.max(c.color_g).max(c.color_b));
+                    if c.density >= 49.5 { capped += 1; }
+                }
+            }
+        }
+        density.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        colors.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        log::info!(
+            "Field stats (AABB {}x{}x{}, {} nonzero cells): density p50={:.3} p90={:.3} p99={:.3} max={:.3}, {:.1}% at cap; color(max-ch) p50={:.3} p90={:.3} p99={:.3} max={:.3}",
+            x1 - x0, y1 - y0, z1 - z0, nonzero,
+            percentile(&density, 0.5), percentile(&density, 0.9),
+            percentile(&density, 0.99), percentile(&density, 1.0),
+            100.0 * capped as f64 / nonzero.max(1) as f64,
+            percentile(&colors, 0.5), percentile(&colors, 0.9),
+            percentile(&colors, 0.99), percentile(&colors, 1.0),
+        );
+
+        // Floor contrast probe: tiles under the walker footprint vs far tiles
+        let mut wmin = glam::Vec3::splat(FIELD_SIZE as f32);
+        let mut wmax = glam::Vec3::ZERO;
+        for e in self.entities.iter().filter(|e| e.is_walker) {
+            wmin = wmin.min(e.position);
+            wmax = wmax.max(e.position);
+        }
+        let center = (wmin + wmax) * 0.5;
+        let (mut under_inc, mut under_col, mut under_n) = (0.0f64, 0.0f64, 0u32);
+        let (mut far_inc, mut far_col, mut far_n) = (0.0f64, 0.0f64, 0u32);
+        for e in self.entities.iter().filter(|e| e.group == GROUP_FLOOR) {
+            let cell_col = {
+                let ix = e.position.x as i32;
+                let iy = e.position.y as i32;
+                let iz = e.position.z as i32;
+                if Self::in_bounds(ix, iy, iz) {
+                    let c = &self.cells[Self::index(ix as u32, iy as u32, iz as u32)];
+                    c.color_r.max(c.color_g).max(c.color_b) as f64
+                } else { 0.0 }
+            };
+            let under = e.position.x >= wmin.x && e.position.x <= wmax.x
+                && e.position.z >= wmin.z && e.position.z <= wmax.z;
+            let dx = e.position.x - center.x;
+            let dz = e.position.z - center.z;
+            if under {
+                under_inc += e.incoming.density as f64;
+                under_col += cell_col;
+                under_n += 1;
+            } else if dx * dx + dz * dz > 400.0 {
+                far_inc += e.incoming.density as f64;
+                far_col += cell_col;
+                far_n += 1;
+            }
+        }
+        log::info!(
+            "Floor probe: under dino n={} avg incoming={:.3} avg cell color={:.3} | far (>20 cells) n={} avg incoming={:.3} avg cell color={:.3}",
+            under_n, under_inc / under_n.max(1) as f64, under_col / under_n.max(1) as f64,
+            far_n, far_inc / far_n.max(1) as f64, far_col / far_n.max(1) as f64,
+        );
+    }
+
     /// Run one simulation tick — push-driven pipe propagation
     pub fn tick(&mut self, view_proj: glam::Mat4) {
         // Refresh walker↔world light links once the dino has drifted a cell
@@ -2152,6 +2241,17 @@ mod tests {
             glam::Vec3::Y,
         );
         proj * view
+    }
+
+    #[test]
+    fn percentile_picks_correct_ranks() {
+        let sorted: Vec<f32> = (1..=100).map(|i| i as f32).collect();
+        assert_eq!(percentile(&sorted, 0.5), 50.0);
+        assert_eq!(percentile(&sorted, 0.9), 90.0);
+        assert_eq!(percentile(&sorted, 0.99), 99.0);
+        assert_eq!(percentile(&sorted, 1.0), 100.0);
+        assert_eq!(percentile(&[], 0.5), 0.0);
+        assert_eq!(percentile(&[7.0], 0.5), 7.0);
     }
 
     #[test]

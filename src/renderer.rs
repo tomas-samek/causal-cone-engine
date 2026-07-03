@@ -473,4 +473,8 @@ impl Renderer {
         self.diff_field.walker.double_time_lapse();
         log::info!("Time lapse: ×{}", self.diff_field.walker.time_lapse);
     }
+
+    pub fn dump_field_stats(&self) {
+        self.diff_field.dump_field_stats();
+    }
 }

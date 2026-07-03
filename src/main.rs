@@ -150,6 +150,9 @@ impl ApplicationHandler for App {
                             KeyCode::Equal => {
                                 state.renderer.double_time_lapse();
                             }
+                            KeyCode::KeyH => {
+                                state.renderer.dump_field_stats();
+                            }
                             _ => {}
                         }
                     }
