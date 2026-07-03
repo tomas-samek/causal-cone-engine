@@ -205,8 +205,13 @@ impl ApplicationHandler for App {
                 state.observer.update(&self.keys_held, dt);
 
                 // Tick simulation (fixed timestep, 30 ticks/sec)
-                state.tick_accumulator += dt;
                 let tick_interval = 1.0 / 30.0;
+                state.tick_accumulator += dt;
+                // Cap simulation debt: a slow frame runs at most 3 catch-up ticks instead
+                // of spiraling (each extra tick makes the next frame slower still).
+                if state.tick_accumulator > 3.0 * tick_interval {
+                    state.tick_accumulator = 3.0 * tick_interval;
+                }
                 while state.tick_accumulator >= tick_interval {
                     state.renderer.tick(&state.observer);
                     state.tick_count += 1;

@@ -39,6 +39,12 @@ pub const GROUP_ROCK: u16 = 19;
 /// Cells of walker travel between cross-link refreshes.
 pub const LINK_REFRESH_DIST: f32 = 1.0;
 
+/// Minimum ticks between cross-link refreshes — caps refresh cost at high
+/// time-lapse, where the 1-cell distance trigger would otherwise fire every
+/// tick. At the default lapse the distance trigger fires every ~10 ticks,
+/// so this changes nothing there.
+pub const MIN_REFRESH_SPACING: u64 = 5;
+
 /// A single deposit in the field
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
@@ -219,6 +225,9 @@ pub struct DiffField {
     pub walker: crate::walker::WalkController,
     /// Cells of walker travel since the last cross-link refresh (Task 3).
     travel_since_refresh: f32,
+    /// Tick of the last cross-link refresh — throttles refresh cadence so the
+    /// 1-cell distance trigger can't fire every tick at high time-lapse.
+    last_refresh_tick: u64,
     /// Link distances captured at build time, reused by refresh_cross_links.
     link_connect_dist: f32,
     link_radiation_dist: f32,
@@ -312,6 +321,7 @@ impl DiffField {
             show_trie_depth: false,
             walker: crate::walker::WalkController::new(),
             travel_since_refresh: 0.0,
+            last_refresh_tick: 0,
             link_connect_dist: 0.0,
             link_radiation_dist: 0.0,
         };
@@ -1458,8 +1468,11 @@ impl DiffField {
     pub fn tick(&mut self, view_proj: glam::Mat4) {
         // Refresh walker↔world light links once the dino has drifted a cell
         // from where they were last built — shadow and lighting follow.
-        if self.travel_since_refresh >= LINK_REFRESH_DIST {
+        if self.travel_since_refresh >= LINK_REFRESH_DIST
+            && self.tick.saturating_sub(self.last_refresh_tick) >= MIN_REFRESH_SPACING
+        {
             self.travel_since_refresh = 0.0;
+            self.last_refresh_tick = self.tick;
             self.refresh_cross_links();
         }
 
