@@ -153,6 +153,18 @@ impl ApplicationHandler for App {
                             KeyCode::KeyH => {
                                 state.renderer.dump_field_stats();
                             }
+                            KeyCode::Digit1 => {
+                                state.renderer.tune_density_scale(0.5);
+                            }
+                            KeyCode::Digit2 => {
+                                state.renderer.tune_density_scale(2.0);
+                            }
+                            KeyCode::Digit3 => {
+                                state.renderer.tune_color_scale(0.5);
+                            }
+                            KeyCode::Digit4 => {
+                                state.renderer.tune_color_scale(2.0);
+                            }
                             _ => {}
                         }
                     }

@@ -477,4 +477,21 @@ impl Renderer {
     pub fn dump_field_stats(&self) {
         self.diff_field.dump_field_stats();
     }
+
+    pub fn tune_density_scale(&mut self, factor: f32) {
+        self.diff_field.tune_density = crate::field::scale_tune(self.diff_field.tune_density, factor);
+        self.log_tuning();
+    }
+
+    pub fn tune_color_scale(&mut self, factor: f32) {
+        self.diff_field.tune_color = crate::field::scale_tune(self.diff_field.tune_color, factor);
+        self.log_tuning();
+    }
+
+    fn log_tuning(&self) {
+        log::info!(
+            "Tuning: density ×{:.4}, color ×{:.4}",
+            self.diff_field.tune_density, self.diff_field.tune_color
+        );
+    }
 }

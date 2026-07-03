@@ -235,6 +235,10 @@ pub struct DiffField {
     /// pass 3a (move/animate/clear) and replayed by pass 3b (deposit).
     /// Reused allocation — cleared each tick.
     deposit_queue: Vec<(usize, glam::Vec3)>,
+    /// Live calibration multipliers (keys 1-4): applied on top of the
+    /// hardcoded deposit boosts. Baked into constants after calibration.
+    pub tune_density: f32,
+    pub tune_color: f32,
 }
 
 // ── Metaball source definitions for skeleton + receptor placement ──────────
@@ -315,6 +319,11 @@ fn percentile(sorted: &[f32], p: f32) -> f32 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+/// Multiply a live-tuning value (keys 1-6), clamped to [1/1024, 1024].
+pub fn scale_tune(v: f32, factor: f32) -> f32 {
+    (v * factor).clamp(1.0 / 1024.0, 1024.0)
+}
+
 impl DiffField {
     pub fn new() -> Self {
         let mut field = Self {
@@ -346,6 +355,8 @@ impl DiffField {
             link_connect_dist: 0.0,
             link_radiation_dist: 0.0,
             deposit_queue: Vec::new(),
+            tune_density: 1.0,
+            tune_color: 1.0,
         };
 
         let sp = field.spawn_demo_scene();
@@ -1914,6 +1925,9 @@ impl DiffField {
         self.travel_since_refresh += walk_delta.length();
         let walk_offset_z = self.walker.offset.z;
 
+        let tune_density = self.tune_density;
+        let tune_color = self.tune_color;
+
         // Phase 3a: move, animate, and clear old footprints.
         // Every clear must land before ANY deposit: a clear that runs
         // mid-loop wipes same-tick contributions already written by
@@ -2129,7 +2143,11 @@ impl DiffField {
             // Decoupled boost: body gets high density boost (opaque surface) with
             // moderate color boost (natural brightness, no overexposure).
             let is_body = use_gaussian;
-            let (density_boost, color_boost) = if is_body { (40.0, 10.0) } else { (10.0, 10.0) };
+            let (density_boost, color_boost) = if is_body {
+                (40.0 * tune_density, 10.0 * tune_color)
+            } else {
+                (10.0 * tune_density, 10.0 * tune_color)
+            };
             let total_r = total_r * color_boost;
             let total_g = total_g * color_boost;
             let total_b = total_b * color_boost;
@@ -2275,6 +2293,15 @@ mod tests {
         // Continuous at the cutoff: value just inside 4.0 is already tiny,
         // so a cell crossing the boundary cannot pop
         assert!(cutoff_window(3.999) < 1e-4);
+    }
+
+    #[test]
+    fn scale_tune_stays_in_range() {
+        assert_eq!(scale_tune(1.0, 2.0), 2.0);
+        assert_eq!(scale_tune(1.0, 0.5), 0.5);
+        assert_eq!(scale_tune(1024.0, 2.0), 1024.0);
+        let lo = scale_tune(1.0 / 1024.0, 0.5);
+        assert!((lo - 1.0 / 1024.0).abs() < 1e-9);
     }
 
     #[test]
