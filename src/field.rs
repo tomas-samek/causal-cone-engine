@@ -789,29 +789,36 @@ impl DiffField {
         let positions: Vec<glam::Vec3> = self.entities.iter().map(|e| e.position).collect();
         let walker: Vec<bool> = self.entities.iter().map(|e| e.is_walker).collect();
 
-        // Save in-flight pipe contents keyed by (source, target)
-        let mut old_deposits: HashMap<(usize, usize), EdgeDeposit> =
-            HashMap::with_capacity(self.edge_targets.len());
-        for (i, e) in self.entities.iter().enumerate() {
-            let start = e.edge_start as usize;
-            for k in start..start + e.edge_count as usize {
-                old_deposits.insert((i, self.edge_targets[k]), self.edge_deposits[k]);
-            }
-        }
-
-        // Retain same-side edges only (drop all cross edges)
+        // Retain same-side edges (with their deposits carried over positionally —
+        // no hashing) and snapshot ONLY the old cross-edge deposits into a small
+        // map (a few thousand entries, not all ~111k edges). Re-created cross pairs
+        // recover their in-flight light from this map; truly-new pairs start empty.
         let mut temp_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut temp_deposits: Vec<Vec<EdgeDeposit>> = vec![Vec::new(); n];
+        let mut old_cross_deposits: HashMap<(usize, usize), EdgeDeposit> = HashMap::new();
+        // Entities whose cross edge-set changes this refresh (old or new cross
+        // endpoints). Their debounce is reset below so new/removed pipes re-propagate
+        // immediately instead of the shadow lagging a few steps behind.
+        let mut wake = vec![false; n];
         for (i, e) in self.entities.iter().enumerate() {
             let start = e.edge_start as usize;
             for k in start..start + e.edge_count as usize {
                 let t = self.edge_targets[k];
                 if walker[i] == walker[t] {
                     temp_edges[i].push(t);
+                    temp_deposits[i].push(self.edge_deposits[k]);
+                } else {
+                    old_cross_deposits.insert((i, t), self.edge_deposits[k]);
+                    wake[i] = true;
+                    wake[t] = true;
                 }
             }
         }
 
-        // New cross connection edges: walker↔world within connect_dist.
+        // New cross connection edges: walker↔world within connect_dist. Unlike
+        // build_connections (which caps at 26 per entity), these are added uncapped;
+        // this stays bounded in practice because cross edges are fully dropped and
+        // re-searched each refresh (runtime edge count stays ~111k stable).
         // Iterate walkers only (few hundred) against the world spatial hash.
         let grid = Self::spatial_hash(&positions, connect_dist);
         for i in 0..n {
@@ -829,6 +836,8 @@ impl DiffField {
                                 if pos.distance_squared(positions[j]) < connect_dist_sq {
                                     temp_edges[i].push(j);
                                     temp_edges[j].push(i);
+                                    wake[i] = true;
+                                    wake[j] = true;
                                 }
                             }
                         }
@@ -892,17 +901,27 @@ impl DiffField {
             cands.truncate(max_radiation);
             for &(target, _) in cands.iter() {
                 temp_edges[i].push(target);
+                wake[i] = true;
+                wake[target] = true;
             }
         }
 
         // Repack SoA (recomputes edge_dirs from the moved positions),
         // restore retained pipe contents, recompute gammas, rebuild reverse.
         self.flatten_edges(temp_edges);
+        // Restore in-flight pipe contents. The first temp_deposits[i].len() edges in
+        // each entity's flattened range are the retained same-side edges, in the same
+        // order — restore those positionally (no hashing). The remaining edges are the
+        // newly searched cross edges: re-created pairs recover their light from the
+        // small old-cross map; truly-new pairs stay empty.
         for i in 0..n {
             let start = self.entities[i].edge_start as usize;
             let count = self.entities[i].edge_count as usize;
-            for k in start..start + count {
-                if let Some(dep) = old_deposits.get(&(i, self.edge_targets[k])) {
+            let retained = temp_deposits[i].len();
+            for (off, k) in (start..start + count).enumerate() {
+                if off < retained {
+                    self.edge_deposits[k] = temp_deposits[i][off];
+                } else if let Some(dep) = old_cross_deposits.get(&(i, self.edge_targets[k])) {
                     self.edge_deposits[k] = *dep;
                 }
             }
@@ -917,6 +936,16 @@ impl DiffField {
             }
         }
         self.build_reverse_edges();
+
+        // Deterministic debounce wake: an entity that gained (or lost) cross edges
+        // this refresh would otherwise stay debounced for a few steps because its
+        // fresh incoming edges deliver zero — delaying the shadow. Reset it so it
+        // re-propagates on the next tick.
+        for i in 0..n {
+            if wake[i] {
+                self.entities[i].stable_ticks = 0;
+            }
+        }
 
         log::debug!(
             "Cross-link refresh at offset {:?}: {} total edges, {:.2} ms",
