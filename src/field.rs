@@ -36,6 +36,9 @@ pub const GROUP_FLOOR: u16 = 17;
 pub const GROUP_VACUUM: u16 = 18;
 pub const GROUP_ROCK: u16 = 19;
 
+/// Cells of walker travel between cross-link refreshes.
+pub const LINK_REFRESH_DIST: f32 = 1.0;
+
 /// A single deposit in the field
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
@@ -216,6 +219,9 @@ pub struct DiffField {
     pub walker: crate::walker::WalkController,
     /// Cells of walker travel since the last cross-link refresh (Task 3).
     travel_since_refresh: f32,
+    /// Link distances captured at build time, reused by refresh_cross_links.
+    link_connect_dist: f32,
+    link_radiation_dist: f32,
 }
 
 // ── Metaball source definitions for skeleton + receptor placement ──────────
@@ -306,6 +312,8 @@ impl DiffField {
             show_trie_depth: false,
             walker: crate::walker::WalkController::new(),
             travel_since_refresh: 0.0,
+            link_connect_dist: 0.0,
+            link_radiation_dist: 0.0,
         };
 
         let sp = field.spawn_demo_scene();
@@ -323,6 +331,8 @@ impl DiffField {
         let radiation_dist = (sp * 15.0).min(10.0);
         field.build_connections(connect_dist);
         field.build_radiation_links(radiation_dist, connect_dist);
+        field.link_connect_dist = connect_dist;
+        field.link_radiation_dist = radiation_dist;
 
         // Skin texture: assign oscillation presets per body region.
         // Frequencies ~1000x slower than tail wag — texture shifts glacially, not per-frame.
@@ -748,6 +758,162 @@ impl DiffField {
             }
             offset += edges.len() as u32;
         }
+    }
+
+    /// Rebuild only the edges that cross the walker/world boundary.
+    ///
+    /// Rigid translation keeps dino-internal edges valid forever, and world
+    /// entities don't move — so those edge sets (and their in-flight
+    /// deposits) are preserved verbatim. Only walker↔world pairs are
+    /// re-searched: short-range connection edges (this is how atmosphere
+    /// light reaches the receptor shell) and LOS-checked radiation links
+    /// (this is how the feet shade the floor). Heat flags, colors, and
+    /// consumption state are deliberately NOT touched.
+    fn refresh_cross_links(&mut self) {
+        let t0 = std::time::Instant::now();
+        let connect_dist = self.link_connect_dist;
+        let radiation_dist = self.link_radiation_dist;
+        let connect_dist_sq = connect_dist * connect_dist;
+        let radiation_dist_sq = radiation_dist * radiation_dist;
+        let n = self.entities.len();
+        let positions: Vec<glam::Vec3> = self.entities.iter().map(|e| e.position).collect();
+        let walker: Vec<bool> = self.entities.iter().map(|e| e.is_walker).collect();
+
+        // Save in-flight pipe contents keyed by (source, target)
+        let mut old_deposits: HashMap<(usize, usize), EdgeDeposit> =
+            HashMap::with_capacity(self.edge_targets.len());
+        for (i, e) in self.entities.iter().enumerate() {
+            let start = e.edge_start as usize;
+            for k in start..start + e.edge_count as usize {
+                old_deposits.insert((i, self.edge_targets[k]), self.edge_deposits[k]);
+            }
+        }
+
+        // Retain same-side edges only (drop all cross edges)
+        let mut temp_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, e) in self.entities.iter().enumerate() {
+            let start = e.edge_start as usize;
+            for k in start..start + e.edge_count as usize {
+                let t = self.edge_targets[k];
+                if walker[i] == walker[t] {
+                    temp_edges[i].push(t);
+                }
+            }
+        }
+
+        // New cross connection edges: walker↔world within connect_dist.
+        // Iterate walkers only (few hundred) against the world spatial hash.
+        let grid = Self::spatial_hash(&positions, connect_dist);
+        for i in 0..n {
+            if !walker[i] { continue; }
+            let pos = positions[i];
+            let cx = (pos.x / connect_dist).floor() as i32;
+            let cy = (pos.y / connect_dist).floor() as i32;
+            let cz = (pos.z / connect_dist).floor() as i32;
+            for dz in -1..=1_i32 {
+                for dy in -1..=1_i32 {
+                    for dx in -1..=1_i32 {
+                        if let Some(bucket) = grid.get(&(cx + dx, cy + dy, cz + dz)) {
+                            for &j in bucket {
+                                if walker[j] { continue; }
+                                if pos.distance_squared(positions[j]) < connect_dist_sq {
+                                    temp_edges[i].push(j);
+                                    temp_edges[j].push(i);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // New cross radiation links: solid↔solid, LOS-checked, capped like
+        // build_radiation_links (closest 10 per entity among the new links).
+        let block_cell = connect_dist.max(1.0);
+        let block_radius_sq = (connect_dist * 0.3).powi(2);
+        let mut block_grid: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+        for i in 0..n {
+            if self.entities[i].is_vacuum || self.entities[i].is_heat { continue; }
+            let pos = positions[i];
+            let key = (
+                (pos.x / block_cell).floor() as i32,
+                (pos.y / block_cell).floor() as i32,
+                (pos.z / block_cell).floor() as i32,
+            );
+            block_grid.entry(key).or_default().push(i);
+        }
+        let rad_grid = Self::spatial_hash(&positions, radiation_dist);
+        let max_radiation: usize = 10;
+        let mut cross_rad: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+        for i in 0..n {
+            if !walker[i] { continue; }
+            if self.entities[i].is_vacuum || self.entities[i].is_heat { continue; }
+            let pos = positions[i];
+            let cx = (pos.x / radiation_dist).floor() as i32;
+            let cy = (pos.y / radiation_dist).floor() as i32;
+            let cz = (pos.z / radiation_dist).floor() as i32;
+            for dz in -1..=1_i32 {
+                for dy in -1..=1_i32 {
+                    for dx in -1..=1_i32 {
+                        if let Some(bucket) = rad_grid.get(&(cx + dx, cy + dy, cz + dz)) {
+                            for &j in bucket {
+                                if walker[j] { continue; }
+                                if self.entities[j].is_vacuum || self.entities[j].is_heat { continue; }
+                                let dist_sq = pos.distance_squared(positions[j]);
+                                if dist_sq >= connect_dist_sq && dist_sq < radiation_dist_sq {
+                                    if Self::ray_blocked(
+                                        pos, positions[j], i, j,
+                                        &block_grid, block_cell, &positions, block_radius_sq,
+                                    ) {
+                                        continue;
+                                    }
+                                    cross_rad[i].push((j, dist_sq));
+                                    cross_rad[j].push((i, dist_sq));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for i in 0..n {
+            let cands = &mut cross_rad[i];
+            cands.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            cands.truncate(max_radiation);
+            for &(target, _) in cands.iter() {
+                temp_edges[i].push(target);
+            }
+        }
+
+        // Repack SoA (recomputes edge_dirs from the moved positions),
+        // restore retained pipe contents, recompute gammas, rebuild reverse.
+        self.flatten_edges(temp_edges);
+        for i in 0..n {
+            let start = self.entities[i].edge_start as usize;
+            let count = self.entities[i].edge_count as usize;
+            for k in start..start + count {
+                if let Some(dep) = old_deposits.get(&(i, self.edge_targets[k])) {
+                    self.edge_deposits[k] = *dep;
+                }
+            }
+        }
+        for i in 0..n {
+            let start = self.entities[i].edge_start as usize;
+            let end = start + self.entities[i].edge_count as usize;
+            for k in start..end {
+                let target = self.edge_targets[k];
+                let dist_sq = positions[i].distance_squared(positions[target]);
+                self.edge_gammas[k] = 1.0 / dist_sq.max(0.1);
+            }
+        }
+        self.build_reverse_edges();
+
+        log::debug!(
+            "Cross-link refresh at offset {:?}: {} total edges, {:.2} ms",
+            self.walker.offset,
+            self.edge_targets.len(),
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
     /// Build reverse edge index: for each entity, which edges (from other entities) point TO it.
@@ -1290,6 +1456,13 @@ impl DiffField {
 
     /// Run one simulation tick — push-driven pipe propagation
     pub fn tick(&mut self, view_proj: glam::Mat4) {
+        // Refresh walker↔world light links once the dino has drifted a cell
+        // from where they were last built — shadow and lighting follow.
+        if self.travel_since_refresh >= LINK_REFRESH_DIST {
+            self.travel_since_refresh = 0.0;
+            self.refresh_cross_links();
+        }
+
         // Compute active set: which entity chains feed into what the observer sees
         self.compute_active_set(view_proj);
 
@@ -1925,5 +2098,40 @@ mod tests {
                 assert!((d0 - d1).abs() < 1e-3, "pair ({},{}) drifted: {} vs {}", a, b, d0, d1);
             }
         }
+    }
+
+    #[test]
+    #[ignore] // builds the full 512³ field (~2 GB, slow) — run: cargo test --release -- --ignored
+    fn cross_links_follow_walker() {
+        let mut field = DiffField::new();
+        let vp = test_view_proj();
+        // 90 steps ≈ 9 cells of travel (with one turnaround at +6) → several refreshes
+        for _ in 0..90 {
+            field.tick(vp);
+        }
+
+        // Every walker↔world edge must respect the link distances plus at most
+        // LINK_REFRESH_DIST of staleness — links may never lag the walk.
+        let max_len = field.link_radiation_dist + LINK_REFRESH_DIST + 0.2;
+        let mut cross_edges = 0u32;
+        let mut foot_to_floor = 0u32;
+        for (i, e) in field.entities.iter().enumerate() {
+            let start = e.edge_start as usize;
+            for k in start..start + e.edge_count as usize {
+                let t = field.edge_targets[k];
+                if e.is_walker == field.entities[t].is_walker { continue; }
+                cross_edges += 1;
+                let d = e.position.distance(field.entities[t].position);
+                assert!(d <= max_len, "stale cross edge {}→{}: {} cells", i, t, d);
+                if e.is_walker
+                    && matches!(e.group, GROUP_FOOT_L | GROUP_FOOT_R)
+                    && field.entities[t].group == GROUP_FLOOR
+                {
+                    foot_to_floor += 1;
+                }
+            }
+        }
+        assert!(cross_edges > 0, "walker is isolated from the world graph");
+        assert!(foot_to_floor > 0, "no foot→floor links at the new position — shadow can't follow");
     }
 }
