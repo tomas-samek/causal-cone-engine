@@ -10,6 +10,7 @@ mod field;
 mod observer;
 mod renderer;
 mod consumption;
+mod walker;
 
 use observer::Observer;
 use renderer::Renderer;
