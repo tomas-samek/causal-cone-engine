@@ -129,6 +129,9 @@ pub struct Entity {
     /// Anisotropic deposit extent (rx, ry, rz). When non-zero, Phase 3 uses gaussian
     /// deposit with these radii instead of the tent kernel.
     pub deposit_radii: glam::Vec3,
+    /// Member of the rigid walker group (the dino) — moved by WalkController,
+    /// never by per-entity velocity/bounce.
+    pub is_walker: bool,
 }
 
 impl Entity {
@@ -162,6 +165,7 @@ impl Entity {
             prev_incoming_density: 0.0,
             stable_ticks: 0,
             deposit_radii: glam::Vec3::ZERO,
+            is_walker: false,
         }
     }
 }
@@ -208,6 +212,10 @@ pub struct DiffField {
     pub render_depth_cutoff: u16,
     /// Debug mode: show trie depth as color instead of entity color.
     pub show_trie_depth: bool,
+    /// Rigid-body walk controller for the dino group.
+    pub walker: crate::walker::WalkController,
+    /// Cells of walker travel since the last cross-link refresh (Task 3).
+    travel_since_refresh: f32,
 }
 
 // ── Metaball source definitions for skeleton + receptor placement ──────────
@@ -296,6 +304,8 @@ impl DiffField {
             enable_consumption_logs: false,
             render_depth_cutoff: u16::MAX,
             show_trie_depth: false,
+            walker: crate::walker::WalkController::new(),
+            travel_since_refresh: 0.0,
         };
 
         let sp = field.spawn_demo_scene();
@@ -1107,6 +1117,16 @@ impl DiffField {
         let receptor_spacing = 1.0;
         self.build_receptor_shell(&balls, receptor_spacing, balls[0].center);
 
+        // Mark the whole dino — skeleton, midpoints, receptor shell — as the
+        // rigid walker group. All dino parts use groups BODY..=ARM_R; receptors
+        // inherit their group from the metaball they sit on. Heat conversion
+        // happens later in build_connections and doesn't change groups.
+        for e in self.entities.iter_mut() {
+            if (GROUP_BODY..=GROUP_ARM_R).contains(&e.group) {
+                e.is_walker = true;
+            }
+        }
+
         // ROCK — small boulder on the ground
         let rock_color = [0.4, 0.35, 0.25];
         self.fill_ellipsoid(
@@ -1566,11 +1586,22 @@ impl DiffField {
             }
         });
 
+        // Rigid walker motion: one shared displacement for the whole dino
+        // group this step (speed_c × time_lapse world-ticks).
+        let walk_delta = self.walker.step();
+        self.travel_since_refresh += walk_delta.length();
+        let walk_offset_z = self.walker.offset.z;
+
         // Phase 3: entities deposit to grid (only visible entities)
         let mut aabb_min = glam::Vec3::splat(FIELD_SIZE as f32);
         let mut aabb_max = glam::Vec3::splat(0.0);
         for (ent_idx, entity) in self.entities.iter_mut().enumerate() {
-            // Move entity (all entities, not just visible — keeps positions consistent)
+            // Move entity (all entities, not just visible — keeps positions consistent).
+            // Walkers get the shared rigid displacement; their own velocity stays zero
+            // so the per-axis bounce below can never tear the group apart.
+            if entity.is_walker {
+                entity.position += walk_delta;
+            }
             entity.position += entity.velocity;
 
             // Bounce
@@ -1640,7 +1671,8 @@ impl DiffField {
             if entity.group == GROUP_TAIL || entity.group == GROUP_TAIL_TIP {
                 let time = self.tick as f32 / 30.0;
                 let frequency = std::f32::consts::PI; // ~2 sec period
-                let center_z = FIELD_SIZE as f32 / 2.0;
+                // Anchor follows the walker so the wag taper stays body-relative
+                let center_z = FIELD_SIZE as f32 / 2.0 + walk_offset_z;
                 // z_frac: 0.0 at body junction (z=center), 1.0 at tail tip (z=center-24)
                 let z_frac = ((center_z - entity.position.z) / 24.0).clamp(0.0, 1.0);
                 let amplitude = 3.0 * z_frac; // tip swings 3 cells, body junction ~0
@@ -1654,7 +1686,7 @@ impl DiffField {
                 let time = self.tick as f32 / 30.0;
                 let frequency = std::f32::consts::PI * 0.5; // ~4 sec full cycle
                 let center = FIELD_SIZE as f32 / 2.0;
-                let pivot_z = center + 8.0;  // back of jaw (base z-offset from center)
+                let pivot_z = center + 8.0 + walk_offset_z; // back of jaw, follows walker
 
                 // z_frac: 0 at pivot (back), 1 at front of jaw
                 let z_frac = ((entity.position.z - pivot_z) / 8.0).clamp(0.0, 1.0);
@@ -1837,5 +1869,61 @@ impl DiffField {
 
     pub fn as_bytes(&self) -> &[u8] {
         bytemuck::cast_slice(&self.cells)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_view_proj() -> glam::Mat4 {
+        // Same pose as Observer::new(): in front of the dino, looking at it.
+        let proj = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 16.0 / 9.0, 0.1, 500.0);
+        let view = glam::Mat4::look_at_rh(
+            glam::Vec3::new(256.0, 256.0, 310.0),
+            glam::Vec3::new(256.0, 256.0, 256.0),
+            glam::Vec3::Y,
+        );
+        proj * view
+    }
+
+    #[test]
+    #[ignore] // builds the full 512³ field (~2 GB, slow) — run: cargo test --release -- --ignored
+    fn walker_group_moves_rigidly() {
+        let mut field = DiffField::new();
+        let walkers: Vec<usize> = field.entities.iter().enumerate()
+            .filter(|(_, e)| e.is_walker)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(walkers.len() > 100, "expected skeleton + receptors, got {}", walkers.len());
+        // Sun, floor, rock, vacuum must NOT walk
+        assert!(field.entities.iter().all(|e| {
+            !(e.is_walker && matches!(e.group, GROUP_SUN | GROUP_FLOOR | GROUP_VACUUM | GROUP_ROCK))
+        }));
+
+        let start: Vec<glam::Vec3> = walkers.iter().map(|&i| field.entities[i].position).collect();
+        let vp = test_view_proj();
+        for _ in 0..30 {
+            field.tick(vp);
+        }
+        let expected = field.walker.offset;
+        assert!(expected.length() > 0.5, "walker barely moved: {:?}", expected);
+
+        // Every walker entity moved by exactly the shared offset
+        for (k, &i) in walkers.iter().enumerate() {
+            let moved = field.entities[i].position - start[k];
+            assert!((moved - expected).length() < 1e-3,
+                "entity {} moved {:?}, expected {:?}", i, moved, expected);
+        }
+        // Rigidity: pairwise distances preserved (spot-check first 10)
+        let m = walkers.len().min(10);
+        for a in 0..m {
+            for b in (a + 1)..m {
+                let d0 = start[a].distance(start[b]);
+                let d1 = field.entities[walkers[a]].position
+                    .distance(field.entities[walkers[b]].position);
+                assert!((d0 - d1).abs() < 1e-3, "pair ({},{}) drifted: {} vs {}", a, b, d0, d1);
+            }
+        }
     }
 }
