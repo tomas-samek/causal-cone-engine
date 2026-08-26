@@ -1,10 +1,10 @@
-// Renderer — the observer's retina.
+// Renderer — the observer's retina, uploaded.
 //
-// A fullscreen quad. A fragment shader. For each pixel, cast a direction
-// from the observer into the field. Sample. First hit above threshold = color.
+// A fullscreen quad. A fragment shader. The receptor array already holds the
+// image: the CPU retina sums what arrived along entity pipes. The renderer
+// copies it into two W×H textures and the shader thresholds, shades, composites.
 //
-// No meshes. No draw calls. No lights. No shadows.
-// Just a 3D texture and a camera swimming through it.
+// No meshes. No draw calls. No lights. No shadows. No marching.
 
 use crate::field::{DiffField, FIELD_SIZE};
 use crate::observer::Observer;
@@ -45,14 +45,51 @@ pub struct Renderer {
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
 
-    // The field — 3D texture on GPU
-    field_texture: wgpu::Texture,
-    field_bind_group: wgpu::BindGroup,
+    // The retina — two W×H textures on GPU
+    retina_dc: wgpu::Texture,
+    retina_nd: wgpu::Texture,
+    retina_bind_group: wgpu::BindGroup,
+    retina_layout: wgpu::BindGroupLayout,
+    retina_sampler: wgpu::Sampler,
+    retina_size: (u32, u32),
 
     // The field data on CPU
     diff_field: DiffField,
-    last_uploaded_tick: u64,
-    upload_buf: Vec<u16>, // f16 staging buffer for slab-by-slab upload
+    upload_buf: Vec<u16>, // f16 staging buffer for both textures (padded rows)
+}
+
+/// Allocate the two receptor textures at `w`×`h` and bind them with `sampler`.
+fn create_retina_textures(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    w: u32,
+    h: u32,
+) -> (wgpu::Texture, wgpu::Texture, wgpu::BindGroup) {
+    let make = |label: &str| device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let dc = make("RetinaDC");
+    let nd = make("RetinaND");
+    let dc_view = dc.create_view(&Default::default());
+    let nd_view = nd.create_view(&Default::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("RetinaBindGroup"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&dc_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&nd_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    });
+    (dc, nd, bind_group)
 }
 
 impl Renderer {
@@ -111,28 +148,10 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        // --- Create 3D field texture ---
-        let field_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("DiffField3D"),
-            size: wgpu::Extent3d {
-                width: FIELD_SIZE,
-                height: FIELD_SIZE,
-                depth_or_array_layers: FIELD_SIZE,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        let field_texture_view = field_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let field_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("FieldSampler"),
+        let retina_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("RetinaSampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
@@ -171,22 +190,32 @@ impl Renderer {
                 }],
             });
 
-        let field_bind_group_layout =
+        let retina_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("FieldLayout"),
+                label: Some("RetinaLayout"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D3,
+                            view_dimension: wgpu::TextureViewDimension::D2,
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         },
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
@@ -203,36 +232,28 @@ impl Renderer {
             }],
         });
 
-        let field_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("FieldBindGroup"),
-            layout: &field_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&field_texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&field_sampler),
-                },
-            ],
-        });
+        // --- The retina textures — sized by the CPU receptor array ---
+        let diff_field = DiffField::new();
+        let retina_size = (diff_field.retina.width, diff_field.retina.height);
+        let (retina_dc, retina_nd, retina_bind_group) = create_retina_textures(
+            &device, &retina_layout, &retina_sampler, retina_size.0, retina_size.1,
+        );
 
         // --- Shader ---
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("FieldSampler"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/field_sample.wgsl").into()),
+            label: Some("RetinaDisplay"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/retina.wgsl").into()),
         });
 
         // --- Pipeline ---
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("RenderPipelineLayout"),
-            bind_group_layouts: &[&uniform_bind_group_layout, &field_bind_group_layout],
+            bind_group_layouts: &[&uniform_bind_group_layout, &retina_layout],
             push_constant_ranges: &[],
         });
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("FieldSamplePipeline"),
+            label: Some("RetinaDisplayPipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -265,8 +286,6 @@ impl Renderer {
             cache: None,
         });
 
-        let diff_field = DiffField::new();
-
         Self {
             surface,
             device,
@@ -276,11 +295,14 @@ impl Renderer {
             render_pipeline,
             uniform_buffer,
             uniform_bind_group,
-            field_texture,
-            field_bind_group,
+            retina_dc,
+            retina_nd,
+            retina_bind_group,
+            retina_layout,
+            retina_sampler,
+            retina_size,
             diff_field,
-            last_uploaded_tick: 0,
-            upload_buf: vec![0u16; (FIELD_SIZE * FIELD_SIZE * 4) as usize],
+            upload_buf: Vec::new(),
         }
     }
 
@@ -304,57 +326,50 @@ impl Renderer {
 
     /// Render one frame — sample the field from the observer's perspective
     pub fn render(&mut self, observer: &Observer) -> Result<(), wgpu::SurfaceError> {
-        // Upload dirty slabs when simulation has advanced — AABB-restricted f32→f16 per slab
-        if self.diff_field.tick != self.last_uploaded_tick {
-            let margin = 40.0f32;
-            let fs = FIELD_SIZE as usize;
-            let dx_min = (self.diff_field.aabb_min.x - margin).max(0.0) as usize;
-            let dx_max = ((self.diff_field.aabb_max.x + margin) as usize + 1).min(fs);
-            let dy_min = (self.diff_field.aabb_min.y - margin).max(0.0) as usize;
-            let dy_max = ((self.diff_field.aabb_max.y + margin) as usize + 1).min(fs);
-            let sub_w = dx_max - dx_min;
-            let sub_h = dy_max - dy_min;
-            let sub_bytes_per_row = sub_w as u32 * 4 * 2; // 4 channels × 2 bytes (f16)
-
-            for z in 0..FIELD_SIZE as usize {
-                if !self.diff_field.dirty_slabs[z] { continue; }
-
-                // Convert f32 cells to f16 — only the AABB sub-rectangle
-                let slab_base = z * fs * fs;
-                let mut buf_idx = 0;
-                for y in dy_min..dy_max {
-                    let row_base = slab_base + y * fs;
-                    for x in dx_min..dx_max {
-                        let cell = &self.diff_field.cells[row_base + x];
-                        self.upload_buf[buf_idx]     = half::f16::from_f32(cell.density).to_bits();
-                        self.upload_buf[buf_idx + 1] = half::f16::from_f32(cell.color_r).to_bits();
-                        self.upload_buf[buf_idx + 2] = half::f16::from_f32(cell.color_g).to_bits();
-                        self.upload_buf[buf_idx + 3] = half::f16::from_f32(cell.color_b).to_bits();
-                        buf_idx += 4;
-                    }
-                }
-
+        // Resolution changed (keys 7/8)? Recreate the textures.
+        let (rw, rh) = (self.diff_field.retina.width, self.diff_field.retina.height);
+        if (rw, rh) != self.retina_size {
+            let (dc, nd, bg) = create_retina_textures(&self.device, &self.retina_layout, &self.retina_sampler, rw, rh);
+            self.retina_dc = dc;
+            self.retina_nd = nd;
+            self.retina_bind_group = bg;
+            self.retina_size = (rw, rh);
+            self.diff_field.retina.dirty = true;
+        }
+        if self.diff_field.retina.dirty {
+            // write_texture needs bytes_per_row % 256 == 0 (true at 320 wide,
+            // not at every resolution keys 7/8 can produce) → padded rows.
+            let row_bytes = ((rw * 8 + 255) / 256) * 256;
+            let stride = (row_bytes / 2) as usize; // u16 per padded row
+            let total = stride * rh as usize;
+            self.upload_buf.resize(total * 2, 0);
+            let (dc_buf, nd_buf) = self.upload_buf.split_at_mut(total);
+            let f = |x: f32| half::f16::from_f32(x).to_bits();
+            for (i, r) in self.diff_field.retina.receptors.iter().enumerate() {
+                let (x, y) = ((i % rw as usize), (i / rw as usize));
+                let o = y * stride + x * 4;
+                let d = r.density.clamp(0.0, 60000.0);
+                let inv = if r.density > 1e-6 { 1.0 / r.density } else { 0.0 };
+                let nl = r.normal.length();
+                let nrm = if nl > 1e-6 { r.normal / nl } else { glam::Vec3::Y };
+                dc_buf[o] = f(d);
+                dc_buf[o + 1] = f((r.color[0] * inv).min(60000.0));
+                dc_buf[o + 2] = f((r.color[1] * inv).min(60000.0));
+                dc_buf[o + 3] = f((r.color[2] * inv).min(60000.0));
+                nd_buf[o] = f(nrm.x);
+                nd_buf[o + 1] = f(nrm.y);
+                nd_buf[o + 2] = f(nrm.z);
+                nd_buf[o + 3] = f((r.depth * inv).min(60000.0));
+            }
+            for (tex, buf) in [(&self.retina_dc, &*dc_buf), (&self.retina_nd, &*nd_buf)] {
                 self.queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: &self.field_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d { x: dx_min as u32, y: dy_min as u32, z: z as u32 },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    bytemuck::cast_slice(&self.upload_buf[..buf_idx]),
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(sub_bytes_per_row),
-                        rows_per_image: Some(sub_h as u32),
-                    },
-                    wgpu::Extent3d {
-                        width: sub_w as u32,
-                        height: sub_h as u32,
-                        depth_or_array_layers: 1,
-                    },
+                    wgpu::ImageCopyTexture { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    bytemuck::cast_slice(buf),
+                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(row_bytes), rows_per_image: Some(rh) },
+                    wgpu::Extent3d { width: rw, height: rh, depth_or_array_layers: 1 },
                 );
             }
-            self.last_uploaded_tick = self.diff_field.tick;
+            self.diff_field.retina.dirty = false;
         }
 
         let output = self.surface.get_current_texture()?;
@@ -413,7 +428,7 @@ impl Renderer {
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.field_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.retina_bind_group, &[]);
 
             // Draw fullscreen triangle (3 vertices, no buffer)
             render_pass.draw(0..3, 0..1);
@@ -493,6 +508,14 @@ impl Renderer {
         self.diff_field.retina_force_relink = true;
         self.diff_field.compute_edge_atten_public();
         self.log_tuning();
+    }
+
+    pub fn scale_retina(&mut self, factor: f32) {
+        let r = &mut self.diff_field.retina;
+        let w = (r.width as f32 * factor).round() as u32;
+        let h = (r.height as f32 * factor).round() as u32;
+        r.resize(w, h);
+        log::info!("Retina resolution: {}x{}", r.width, r.height);
     }
 
     fn log_tuning(&self) {

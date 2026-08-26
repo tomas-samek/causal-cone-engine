@@ -168,6 +168,8 @@ impl ApplicationHandler for App {
                             }
                             KeyCode::Digit5 => { state.renderer.tune_atten_scale(0.5); }
                             KeyCode::Digit6 => { state.renderer.tune_atten_scale(2.0); }
+                            KeyCode::Digit7 => { state.renderer.scale_retina(0.5); }
+                            KeyCode::Digit8 => { state.renderer.scale_retina(2.0); }
                             _ => {}
                         }
                     }
