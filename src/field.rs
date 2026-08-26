@@ -203,6 +203,11 @@ pub struct DiffField {
     edge_targets: Vec<usize>,
     edge_deposits: Vec<EdgeDeposit>,
     edge_gammas: Vec<f32>,
+    /// Per-edge transmittance τ ∈ [0,1], parallel to `edge_gammas`. Radiation
+    /// edges are attenuated by the density they pass through; connection edges
+    /// (shorter than `link_connect_dist`) stay 1.0. A segment buried in a
+    /// metaball core underflows to exactly 0 — a fully opaque pipe.
+    edge_atten: Vec<f32>,
     edge_dirs: Vec<glam::Vec3>, // precomputed normalized direction per edge (source → target)
     // Reverse edge index — for each target entity, which edges point to it
     reverse_edge_sources: Vec<usize>, // source entity index
@@ -351,6 +356,7 @@ impl DiffField {
             edge_targets: Vec::new(),
             edge_deposits: Vec::new(),
             edge_gammas: Vec::new(),
+            edge_atten: Vec::new(),
             edge_dirs: Vec::new(),
             reverse_edge_sources: Vec::new(),
             reverse_edge_k: Vec::new(),
@@ -391,9 +397,11 @@ impl DiffField {
         let connect_dist = (sp * 5.0).min(3.5);
         let radiation_dist = (sp * 15.0).min(10.0);
         field.build_connections(connect_dist);
-        field.build_radiation_links(radiation_dist, connect_dist);
+        // Set before build_radiation_links: compute_edge_atten reads
+        // link_connect_dist to tell connection edges from radiation edges.
         field.link_connect_dist = connect_dist;
         field.link_radiation_dist = radiation_dist;
+        field.build_radiation_links(radiation_dist, connect_dist);
 
         // Skin texture: assign oscillation presets per body region.
         // Frequencies ~1000x slower than tail wag — texture shifts glacially, not per-frame.
@@ -643,53 +651,60 @@ impl DiffField {
         );
     }
 
-    /// Check if any solid entity blocks the line of sight between two positions.
-    /// Steps along the ray checking spatial hash cells for nearby blockers.
-    fn ray_blocked(
-        pos_a: glam::Vec3,
-        pos_b: glam::Vec3,
-        idx_a: usize,
-        idx_b: usize,
-        block_grid: &HashMap<(i32, i32, i32), Vec<usize>>,
-        cell_size: f32,
-        positions: &[glam::Vec3],
-        block_radius_sq: f32,
-    ) -> bool {
-        let ab = pos_b - pos_a;
-        let ab_len = ab.length();
-        if ab_len < 0.001 { return false; }
-        let ab_dir = ab / ab_len;
+    /// Static occluder set for edge attenuation: every solid entity at its
+    /// current position. Nothing is drawable here — this is only for τ.
+    fn occluder_sources(&self) -> Vec<crate::retina::Source> {
+        self.entities.iter().map(|e| crate::retina::Source {
+            position: e.position,
+            radii: e.deposit_radii,
+            normal: glam::Vec3::Y,
+            opacity: e.deposit_magnitude * if e.deposit_radii != glam::Vec3::ZERO { 40.0 } else { 10.0 },
+            density: 0.0,
+            color: [0.0; 3],
+            drawable: false,
+            occluder: !e.is_heat && !e.is_vacuum,
+        }).collect()
+    }
 
-        let step = cell_size;
-        let mut t = step;
-        while t < ab_len - step * 0.5 {
-            let sample = pos_a + ab_dir * t;
-            let cx = (sample.x / cell_size).floor() as i32;
-            let cy = (sample.y / cell_size).floor() as i32;
-            let cz = (sample.z / cell_size).floor() as i32;
-
-            for dz in -1..=1_i32 {
-                for dy in -1..=1_i32 {
-                    for dx in -1..=1_i32 {
-                        if let Some(bucket) = block_grid.get(&(cx + dx, cy + dy, cz + dz)) {
-                            for &eidx in bucket {
-                                if eidx == idx_a || eidx == idx_b { continue; }
-                                let ap = positions[eidx] - pos_a;
-                                let proj = ap.dot(ab_dir);
-                                if proj <= 0.0 || proj >= ab_len { continue; }
-                                let closest = pos_a + ab_dir * proj;
-                                let dist_sq = (positions[eidx] - closest).length_squared();
-                                if dist_sq < block_radius_sq {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
+    /// τ for every edge longer than link_connect_dist (radiation links);
+    /// connection edges stay 1.0. `only_cross` restricts to walker↔world
+    /// edges (what a cross-link refresh rebuilt) — internal edges keep the
+    /// values carried over by the caller.
+    fn compute_edge_atten(&mut self, only_cross: bool) {
+        use crate::retina::{segment_transmittance, SpatialHash};
+        let t0 = std::time::Instant::now();
+        let sources = self.occluder_sources();
+        let hash = SpatialHash::build(&sources);
+        let cd_sq = self.link_connect_dist * self.link_connect_dist;
+        let k = self.atten_k;
+        // (source, edge index, target) for every edge
+        let mut edges: Vec<(usize, usize, usize)> = Vec::with_capacity(self.edge_targets.len());
+        for (i, e) in self.entities.iter().enumerate() {
+            let start = e.edge_start as usize;
+            for kk in start..start + e.edge_count as usize {
+                edges.push((i, kk, self.edge_targets[kk]));
             }
-            t += step;
         }
-        false
+        let walker: Vec<bool> = self.entities.iter().map(|e| e.is_walker).collect();
+        let atten: Vec<(usize, f32)> = edges.par_iter().filter_map(|&(i, kk, t)| {
+            if only_cross && walker[i] == walker[t] { return None; }
+            let a = sources[i].position;
+            let b = sources[t].position;
+            if a.distance_squared(b) < cd_sq { return Some((kk, 1.0)); }
+            Some((kk, segment_transmittance(&sources, &hash, a, b, &[i, t], k)))
+        }).collect();
+        let mut attenuated = 0usize;
+        for (kk, a) in atten {
+            self.edge_atten[kk] = a;
+            if a < 0.999 { attenuated += 1; }
+        }
+        log::info!("Edge attenuation ({}): {} edges < 1, {:.2} ms",
+            if only_cross { "cross" } else { "all" }, attenuated, t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    /// Recompute τ for every edge (public wrapper for live tuning).
+    pub fn compute_edge_atten_public(&mut self) {
+        self.compute_edge_atten(false);
     }
 
     /// Build radiation links — direct surface-to-surface edges for non-vacuum, non-heat
@@ -711,26 +726,10 @@ impl DiffField {
             }
         }
 
-        // Build blocking grid from solid entities for line-of-sight raycasting
-        let block_cell = connect_dist.max(1.0);
-        let block_radius_sq = (connect_dist * 0.3).powi(2);
-        let mut block_grid: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
-        for i in 0..n {
-            if self.entities[i].is_vacuum || self.entities[i].is_heat { continue; }
-            let pos = positions[i];
-            let key = (
-                (pos.x / block_cell).floor() as i32,
-                (pos.y / block_cell).floor() as i32,
-                (pos.z / block_cell).floor() as i32,
-            );
-            block_grid.entry(key).or_default().push(i);
-        }
-
         // Add radiation links via spatial hash — collect candidates per entity, sorted by distance
         let max_radiation: usize = 10; // cap per entity
         let rad_grid = Self::spatial_hash(&positions, max_dist);
         let mut radiation_candidates: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
-        let mut blocked_count = 0u64;
         for i in 0..n {
             if self.entities[i].is_vacuum || self.entities[i].is_heat { continue; }
             let pos = positions[i];
@@ -746,14 +745,6 @@ impl DiffField {
                                 if self.entities[j].is_vacuum || self.entities[j].is_heat { continue; }
                                 let dist_sq = positions[i].distance_squared(positions[j]);
                                 if dist_sq >= short_dist_sq && dist_sq < max_dist_sq {
-                                    // Line-of-sight check: skip if solid entity blocks the path
-                                    if Self::ray_blocked(
-                                        pos, positions[j], i, j,
-                                        &block_grid, block_cell, &positions, block_radius_sq,
-                                    ) {
-                                        blocked_count += 1;
-                                        continue;
-                                    }
                                     radiation_candidates[i].push((j, dist_sq));
                                     radiation_candidates[j].push((i, dist_sq));
                                 }
@@ -775,8 +766,8 @@ impl DiffField {
             count += cands.len() as u64;
         }
         log::info!(
-            "Radiation links: {} directed edges (capped at {} per entity, {} blocked by LOS)",
-            count, max_radiation, blocked_count
+            "Radiation links: {} directed edges (capped at {} per entity)",
+            count, max_radiation
         );
 
         // Re-flatten into SoA
@@ -794,6 +785,8 @@ impl DiffField {
             }
         }
 
+        self.compute_edge_atten(false);
+
         log::info!(
             "Edge SoA: {} total directed edges, {:.1} MB contiguous",
             self.edge_targets.len(),
@@ -808,6 +801,7 @@ impl DiffField {
         self.edge_dirs = Vec::with_capacity(total);
         self.edge_deposits = vec![EdgeDeposit::default(); total];
         self.edge_gammas = vec![1.0; total];
+        self.edge_atten = vec![1.0; total];
         let mut offset = 0u32;
         for (i, edges) in temp_edges.iter().enumerate() {
             self.entities[i].edge_start = offset;
@@ -846,6 +840,10 @@ impl DiffField {
         // recover their in-flight light from this map; truly-new pairs start empty.
         let mut temp_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut temp_deposits: Vec<Vec<EdgeDeposit>> = vec![Vec::new(); n];
+        // Retained edges keep their τ positionally too — recomputing every
+        // edge's transmittance each refresh would cost far more than the
+        // cross-edge subset that actually moved.
+        let mut temp_atten: Vec<Vec<f32>> = vec![Vec::new(); n];
         let mut old_cross_deposits: HashMap<(usize, usize), EdgeDeposit> = HashMap::new();
         // Entities whose cross edge-set changes this refresh (old or new cross
         // endpoints). Their debounce is reset below so new/removed pipes re-propagate
@@ -858,6 +856,7 @@ impl DiffField {
                 if walker[i] == walker[t] {
                     temp_edges[i].push(t);
                     temp_deposits[i].push(self.edge_deposits[k]);
+                    temp_atten[i].push(self.edge_atten[k]);
                 } else {
                     old_cross_deposits.insert((i, t), self.edge_deposits[k]);
                     wake[i] = true;
@@ -897,21 +896,9 @@ impl DiffField {
             }
         }
 
-        // New cross radiation links: solid↔solid, LOS-checked, capped like
+        // New cross radiation links: solid↔solid, capped like
         // build_radiation_links (closest 10 per entity among the new links).
-        let block_cell = connect_dist.max(1.0);
-        let block_radius_sq = (connect_dist * 0.3).powi(2);
-        let mut block_grid: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
-        for i in 0..n {
-            if self.entities[i].is_vacuum || self.entities[i].is_heat { continue; }
-            let pos = positions[i];
-            let key = (
-                (pos.x / block_cell).floor() as i32,
-                (pos.y / block_cell).floor() as i32,
-                (pos.z / block_cell).floor() as i32,
-            );
-            block_grid.entry(key).or_default().push(i);
-        }
+        // No LOS pruning — occlusion is carried by per-edge τ instead.
         let rad_grid = Self::spatial_hash(&positions, radiation_dist);
         let max_radiation: usize = 10;
         let mut cross_rad: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
@@ -931,12 +918,6 @@ impl DiffField {
                                 if self.entities[j].is_vacuum || self.entities[j].is_heat { continue; }
                                 let dist_sq = pos.distance_squared(positions[j]);
                                 if dist_sq >= connect_dist_sq && dist_sq < radiation_dist_sq {
-                                    if Self::ray_blocked(
-                                        pos, positions[j], i, j,
-                                        &block_grid, block_cell, &positions, block_radius_sq,
-                                    ) {
-                                        continue;
-                                    }
                                     cross_rad[i].push((j, dist_sq));
                                     cross_rad[j].push((i, dist_sq));
                                 }
@@ -972,6 +953,7 @@ impl DiffField {
             for (off, k) in (start..start + count).enumerate() {
                 if off < retained {
                     self.edge_deposits[k] = temp_deposits[i][off];
+                    self.edge_atten[k] = temp_atten[i][off];
                 } else if let Some(dep) = old_cross_deposits.get(&(i, self.edge_targets[k])) {
                     self.edge_deposits[k] = *dep;
                 }
@@ -987,6 +969,7 @@ impl DiffField {
             }
         }
         self.build_reverse_edges();
+        self.compute_edge_atten(true);
 
         // Deterministic debounce wake: an entity that gained (or lost) cross edges
         // this refresh would otherwise stay debounced for a few steps because its
@@ -1756,6 +1739,7 @@ impl DiffField {
 
         let entities = &self.entities;
         let edge_gammas = &self.edge_gammas;
+        let edge_atten = &self.edge_atten;
         let edge_dir_arr = &self.edge_dirs;
         let active = &self.active_set;
         let consumption_states = &self.consumption_states;
@@ -1780,7 +1764,7 @@ impl DiffField {
             let mut total_weight: f32 = 0.0;
             for (local_k, dep) in deposits.iter_mut().enumerate() {
                 let k = start + local_k;
-                let mut w = edge_gammas[k] * distance_factors[idx];
+                let mut w = edge_gammas[k] * distance_factors[idx] * edge_atten[k];
                 if has_dir {
                     let edge_dir = edge_dir_arr[k];
                     let alignment = edge_dir.dot(entity.incoming_dir);
@@ -2533,5 +2517,93 @@ mod tests {
         let s = field.retina.stats;
         assert!(s.pipes_sent * 100 < s.pipes_total,
             "frozen scene still sends {} of {} pipes", s.pipes_sent, s.pipes_total);
+    }
+
+    #[test]
+    #[ignore] // builds the full 512³ field (~2 GB, slow) — run: cargo test --release -- --ignored
+    fn long_edges_are_attenuated_short_edges_are_not() {
+        let field = DiffField::new();
+        let cd_sq = field.link_connect_dist * field.link_connect_dist;
+        let mut long_below_one = 0u32;
+        let mut long_total = 0u32;
+        for (i, e) in field.entities.iter().enumerate() {
+            let start = e.edge_start as usize;
+            for k in start..start + e.edge_count as usize {
+                let t = field.edge_targets[k];
+                let d_sq = e.position.distance_squared(field.entities[t].position);
+                let a = field.edge_atten[k];
+                // τ ∈ [0,1]: an edge buried in the metaball core integrates a
+                // density large enough that exp(−k·∫ρ) underflows f32 to
+                // exactly 0 — a fully opaque path, not a bug.
+                assert!(a >= 0.0 && a <= 1.0, "edge {}→{} atten {}", i, t, a);
+                if d_sq < cd_sq {
+                    assert_eq!(a, 1.0, "connection edge {}→{} attenuated", i, t);
+                } else {
+                    long_total += 1;
+                    if a < 0.999 { long_below_one += 1; }
+                }
+            }
+        }
+        assert!(long_total > 1000, "expected many radiation edges, got {}", long_total);
+        assert!(long_below_one > 0, "no radiation edge is attenuated — occluders ignored");
+        assert!(long_below_one < long_total, "every radiation edge is attenuated — self-shadowing");
+    }
+
+    #[test]
+    #[ignore] // builds the full 512³ field (~2 GB, slow) — run: cargo test --release -- --ignored
+    fn attenuation_shadows_follow_walker() {
+        let mut field = DiffField::new();
+        let vp = test_view_proj();
+        // Walk far enough to trigger several cross-link refreshes, so the
+        // τ under test is the one compute_edge_atten(true) rebuilt at the
+        // walked position — not the one build_radiation_links computed.
+        for _ in 0..100 { field.tick(vp); }
+        let mut wmin = glam::Vec3::splat(FIELD_SIZE as f32);
+        let mut wmax = glam::Vec3::ZERO;
+        for e in field.entities.iter().filter(|e| e.is_walker) {
+            wmin = wmin.min(e.position);
+            wmax = wmax.max(e.position);
+        }
+        let center = (wmin + wmax) * 0.5;
+        let long_dist_sq = field.link_connect_dist * field.link_connect_dist;
+
+        let (mut crossing_sum, mut crossing_n) = (0.0f64, 0u32);
+        let (mut far_sum, mut far_n) = (0.0f64, 0u32);
+        let mut min_crossing = 1.0f32;
+        for e in field.entities.iter() {
+            let start = e.edge_start as usize;
+            for kk in start..start + e.edge_count as usize {
+                let t = field.edge_targets[kk];
+                let a = e.position;
+                let b = field.entities[t].position;
+                if a.distance_squared(b) <= long_dist_sq { continue; }
+                let mid = (a + b) * 0.5;
+                let inside = mid.cmpge(wmin).all() && mid.cmple(wmax).all();
+                if inside {
+                    crossing_sum += field.edge_atten[kk] as f64;
+                    crossing_n += 1;
+                    min_crossing = min_crossing.min(field.edge_atten[kk]);
+                }
+                let dx = mid.x - center.x;
+                let dz = mid.z - center.z;
+                if e.group == GROUP_FLOOR
+                    && field.entities[t].group == GROUP_FLOOR
+                    && dx * dx + dz * dz > 625.0
+                {
+                    far_sum += field.edge_atten[kk] as f64;
+                    far_n += 1;
+                }
+            }
+        }
+        assert!(crossing_n > 0, "no long edges cross the body");
+        assert!(far_n > 0, "no far floor edges found");
+        assert!(min_crossing < 0.5, "no edge through the body is attenuated: min={}", min_crossing);
+        let far_avg = far_sum / far_n as f64;
+        let crossing_avg = crossing_sum / crossing_n as f64;
+        assert!(
+            far_avg > crossing_avg,
+            "far edges ({:.3}) not clearer than body-crossing edges ({:.3})",
+            far_avg, crossing_avg
+        );
     }
 }

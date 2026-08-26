@@ -488,10 +488,17 @@ impl Renderer {
         self.log_tuning();
     }
 
+    pub fn tune_atten_scale(&mut self, factor: f32) {
+        self.diff_field.atten_k = crate::field::scale_tune(self.diff_field.atten_k, factor);
+        self.diff_field.retina_force_relink = true;
+        self.diff_field.compute_edge_atten_public();
+        self.log_tuning();
+    }
+
     fn log_tuning(&self) {
         log::info!(
-            "Tuning: density ×{:.4}, color ×{:.4}",
-            self.diff_field.tune_density, self.diff_field.tune_color
+            "Tuning: density ×{:.4}, color ×{:.4}, atten_k ×{:.4}",
+            self.diff_field.tune_density, self.diff_field.tune_color, self.diff_field.atten_k
         );
     }
 }

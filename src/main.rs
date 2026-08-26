@@ -166,6 +166,8 @@ impl ApplicationHandler for App {
                             KeyCode::Digit4 => {
                                 state.renderer.tune_color_scale(2.0);
                             }
+                            KeyCode::Digit5 => { state.renderer.tune_atten_scale(0.5); }
+                            KeyCode::Digit6 => { state.renderer.tune_atten_scale(2.0); }
                             _ => {}
                         }
                     }
