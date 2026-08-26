@@ -821,9 +821,11 @@ impl DiffField {
     /// entities don't move — so those edge sets (and their in-flight
     /// deposits) are preserved verbatim. Only walker↔world pairs are
     /// re-searched: short-range connection edges (this is how atmosphere
-    /// light reaches the receptor shell) and LOS-checked radiation links
-    /// (this is how the feet shade the floor). Heat flags, colors, and
-    /// consumption state are deliberately NOT touched.
+    /// light reaches the receptor shell) and radiation links, whose
+    /// transmittance is then recomputed by `compute_edge_atten(true)` at the
+    /// walked position (this is how the body's density dims the pipes that
+    /// cross it). Heat flags, colors, and consumption state are deliberately
+    /// NOT touched.
     fn refresh_cross_links(&mut self) {
         let t0 = std::time::Instant::now();
         let connect_dist = self.link_connect_dist;
@@ -2554,9 +2556,13 @@ mod tests {
     fn attenuation_shadows_follow_walker() {
         let mut field = DiffField::new();
         let vp = test_view_proj();
-        // Walk far enough to trigger several cross-link refreshes, so the
-        // τ under test is the one compute_edge_atten(true) rebuilt at the
-        // walked position — not the one build_radiation_links computed.
+        // Walk far enough to trigger several cross-link refreshes. Every
+        // walker↔world edge here was created by refresh_cross_links AFTER the
+        // dino moved, and flatten_edges reset its τ to 1.0 — nothing carries
+        // a build-time value into this set. So a cross edge with τ < 1 can
+        // only come from compute_edge_atten(true) running at the walked
+        // position: delete that call and every assertion below on `cross`
+        // sees a uniform 1.0.
         for _ in 0..100 { field.tick(vp); }
         let mut wmin = glam::Vec3::splat(FIELD_SIZE as f32);
         let mut wmax = glam::Vec3::ZERO;
@@ -2567,43 +2573,52 @@ mod tests {
         let center = (wmin + wmax) * 0.5;
         let long_dist_sq = field.link_connect_dist * field.link_connect_dist;
 
-        let (mut crossing_sum, mut crossing_n) = (0.0f64, 0u32);
+        // Radiation edges that cross the walker/world boundary — the set the
+        // refresh rebuilt — versus far floor↔floor edges nowhere near the body.
+        let (mut cross_sum, mut cross_n, mut cross_dimmed) = (0.0f64, 0u32, 0u32);
         let (mut far_sum, mut far_n) = (0.0f64, 0u32);
-        let mut min_crossing = 1.0f32;
-        for e in field.entities.iter() {
+        let mut min_cross = 1.0f32;
+        for (i, e) in field.entities.iter().enumerate() {
             let start = e.edge_start as usize;
             for kk in start..start + e.edge_count as usize {
                 let t = field.edge_targets[kk];
                 let a = e.position;
                 let b = field.entities[t].position;
                 if a.distance_squared(b) <= long_dist_sq { continue; }
-                let mid = (a + b) * 0.5;
-                let inside = mid.cmpge(wmin).all() && mid.cmple(wmax).all();
-                if inside {
-                    crossing_sum += field.edge_atten[kk] as f64;
-                    crossing_n += 1;
-                    min_crossing = min_crossing.min(field.edge_atten[kk]);
+                let tau = field.edge_atten[kk];
+                if field.entities[i].is_walker != field.entities[t].is_walker {
+                    cross_sum += tau as f64;
+                    cross_n += 1;
+                    if tau < 0.5 { cross_dimmed += 1; }
+                    min_cross = min_cross.min(tau);
                 }
+                let mid = (a + b) * 0.5;
                 let dx = mid.x - center.x;
                 let dz = mid.z - center.z;
                 if e.group == GROUP_FLOOR
                     && field.entities[t].group == GROUP_FLOOR
                     && dx * dx + dz * dz > 625.0
                 {
-                    far_sum += field.edge_atten[kk] as f64;
+                    far_sum += tau as f64;
                     far_n += 1;
                 }
             }
         }
-        assert!(crossing_n > 0, "no long edges cross the body");
+        assert!(cross_n > 0, "no walker↔world radiation edges after the walk");
         assert!(far_n > 0, "no far floor edges found");
-        assert!(min_crossing < 0.5, "no edge through the body is attenuated: min={}", min_crossing);
-        let far_avg = far_sum / far_n as f64;
-        let crossing_avg = crossing_sum / crossing_n as f64;
+        // The discriminating assertion: τ for the refreshed cross set was
+        // computed against the body's density at its NEW position.
         assert!(
-            far_avg > crossing_avg,
-            "far edges ({:.3}) not clearer than body-crossing edges ({:.3})",
-            far_avg, crossing_avg
+            cross_dimmed > 0 && min_cross < 0.5,
+            "no walker↔world pipe is dimmed at the walked position: {} of {} below 0.5, min={}",
+            cross_dimmed, cross_n, min_cross
+        );
+        let far_avg = far_sum / far_n as f64;
+        let cross_avg = cross_sum / cross_n as f64;
+        assert!(
+            far_avg > cross_avg,
+            "far floor edges ({:.4}) not clearer than walker↔world edges ({:.4})",
+            far_avg, cross_avg
         );
     }
 }
