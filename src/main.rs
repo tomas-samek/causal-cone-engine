@@ -11,6 +11,7 @@ mod observer;
 mod renderer;
 mod consumption;
 mod walker;
+mod retina;
 
 use observer::Observer;
 use renderer::Renderer;

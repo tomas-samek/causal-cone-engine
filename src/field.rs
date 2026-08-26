@@ -307,7 +307,7 @@ fn evaluate_metaball_field(pos: glam::Vec3, balls: &[MetaballSource]) -> Metabal
 /// Without it, boundary cells carry ~exp(-4)×boosted-magnitude — far above
 /// the iso threshold — and pop between "deposited" and "decaying" as a
 /// gaussian drifts sub-cell, which reads as edge shimmer.
-fn cutoff_window(exponent: f32) -> f32 {
+pub(crate) fn cutoff_window(exponent: f32) -> f32 {
     let t = (4.0 - exponent).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
