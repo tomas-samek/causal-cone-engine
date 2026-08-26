@@ -422,6 +422,111 @@ impl Retina {
         self.stats.relink_ms = t0.elapsed().as_secs_f32() * 1000.0;
         self.dirty = true;
     }
+
+    /// What entity `i` offers its pipes this tick (before the footprint
+    /// weight). A source that stopped drawing offers zero, so its pipes
+    /// withdraw what they last sent.
+    fn contribution(&self, i: usize, s: &Source) -> PipeState {
+        if !s.drawable { return PipeState::default(); }
+        let d = s.density * self.entity_trans[i];
+        PipeState {
+            density: d,
+            color: [s.color[0] * self.entity_trans[i], s.color[1] * self.entity_trans[i], s.color[2] * self.entity_trans[i]],
+            normal: s.normal * d,
+            depth: self.entity_depth[i] * d,
+        }
+    }
+
+    /// Phase 3′: every pipe sends `new − last` if it exceeds DELTA_EPS.
+    /// Parallel over entities; receptors are shared by many entities, so each
+    /// rayon split accumulates into a scratch image that is reduced at the end.
+    pub fn arrive(&mut self, sources: &[Source]) -> usize {
+        let n_rec = self.receptors.len();
+        let n = sources.len().min(self.pipe_count.len());
+
+        // Contributions first (needs &self), then the per-entity mutable views
+        // of pipe_last (contiguous, ascending) — direct field borrows, no unsafe.
+        let contribs: Vec<PipeState> = (0..n).map(|i| self.contribution(i, &sources[i])).collect();
+        let mut slices: Vec<&mut [PipeState]> = Vec::with_capacity(n);
+        let mut rest: &mut [PipeState] = &mut self.pipe_last;
+        for i in 0..n {
+            let (head, tail) = rest.split_at_mut(self.pipe_count[i] as usize);
+            slices.push(head);
+            rest = tail;
+        }
+
+        let pipe_start = &self.pipe_start;
+        let pipe_receptor = &self.pipe_receptor;
+        let pipe_weight = &self.pipe_weight;
+
+        let (scratch, sent) = slices.into_par_iter().enumerate()
+            .fold(
+                || (vec![Receptor::default(); n_rec], 0usize),
+                |(mut acc, mut sent), (i, last)| {
+                    let start = pipe_start[i] as usize;
+                    for (off, l) in last.iter_mut().enumerate() {
+                        let k = start + off;
+                        let new = contribs[i].scaled(pipe_weight[k]);
+                        let delta = new.minus(l);
+                        if delta.max_abs() > DELTA_EPS {
+                            acc[pipe_receptor[k] as usize].add(&delta);
+                            *l = new;
+                            sent += 1;
+                        }
+                    }
+                    (acc, sent)
+                },
+            )
+            .reduce(
+                || (vec![Receptor::default(); n_rec], 0usize),
+                |(mut a, sa), (b, sb)| {
+                    for (x, y) in a.iter_mut().zip(&b) { x.add_receptor(y); }
+                    (a, sa + sb)
+                },
+            );
+
+        if sent > 0 {
+            for (r, s) in self.receptors.iter_mut().zip(&scratch) { r.add_receptor(s); }
+            self.dirty = true;
+        }
+        self.stats.pipes_sent = sent;
+        sent
+    }
+
+    /// One retina step: relink if the view or the links moved, then arrive.
+    pub fn tick(&mut self, sources: &[Source], view_proj: Mat4, aabb_min: Vec3, aabb_max: Vec3, force_relink: bool, atten_k: f32) {
+        if force_relink || self.needs_relink(view_proj, aabb_min, aabb_max) {
+            let hash = SpatialHash::build(sources);
+            let eye = eye_from_view_proj(view_proj);
+            self.relink(sources, &hash, view_proj, eye, atten_k);
+        }
+        self.arrive(sources);
+    }
+
+    /// Reference image: Σ over pipes of contribution·weight, from scratch.
+    /// The incremental receptors must equal this (up to DELTA_EPS per pipe).
+    pub fn direct_sum(&self, sources: &[Source]) -> Vec<Receptor> {
+        let mut out = vec![Receptor::default(); self.receptors.len()];
+        for i in 0..sources.len().min(self.pipe_count.len()) {
+            let c = self.contribution(i, &sources[i]);
+            for (rc, w) in self.pipes_of(i) {
+                out[rc as usize].add(&c.scaled(w));
+            }
+        }
+        out
+    }
+
+    pub fn log_stats(&self) {
+        let above = self.receptors.iter().filter(|r| r.density >= RETINA_ISO).count();
+        let max_d = self.receptors.iter().map(|r| r.density).fold(0.0f32, f32::max);
+        log::info!(
+            "Retina {}x{}: {} receptors ≥ iso ({:.1}%), max density {:.2}; pipes {} total / {} sent last tick; mean τ {:.3}; {} relinks (last {:.2} ms)",
+            self.width, self.height, above,
+            100.0 * above as f64 / self.receptors.len().max(1) as f64, max_d,
+            self.stats.pipes_total, self.stats.pipes_sent, self.stats.mean_trans,
+            self.stats.relinks, self.stats.relink_ms,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -605,5 +710,109 @@ mod tests {
         // 1 cell sideways ≈ 1.75 receptors → relink
         let shove = Mat4::from_translation(Vec3::new(1.0, 0.0, 0.0));
         assert!(r.needs_relink(vp * shove, lo, hi));
+    }
+
+    fn lcg(seed: &mut u64) -> f32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 33) as f32) / (u32::MAX >> 1) as f32
+    }
+
+    fn scene() -> Vec<Source> {
+        vec![
+            src(Vec3::new(0.0, 0.0, -10.0), Vec3::splat(2.0), 5.0),
+            src(Vec3::new(3.0, 1.0, -12.0), Vec3::new(1.0, 2.0, 1.0), 3.0),
+            src(Vec3::new(-4.0, -2.0, -9.0), Vec3::ONE, 8.0),
+            src(Vec3::new(1.0, -1.0, -20.0), Vec3::splat(3.0), 2.0),
+            src(Vec3::new(0.0, 4.0, -15.0), Vec3::ZERO, 1.0),
+        ]
+    }
+
+    fn assert_receptors_match(r: &Retina, sources: &[Source], tol: f32) {
+        let want = r.direct_sum(sources);
+        for (i, (got, want)) in r.receptors.iter().zip(&want).enumerate() {
+            assert!((got.density - want.density).abs() < tol, "receptor {} density {} vs {}", i, got.density, want.density);
+            for c in 0..3 {
+                assert!((got.color[c] - want.color[c]).abs() < tol, "receptor {} color[{}]", i, c);
+            }
+            assert!((got.normal - want.normal).length() < tol, "receptor {} normal", i);
+            assert!((got.depth - want.depth).abs() < tol * 30.0, "receptor {} depth", i);
+        }
+    }
+
+    #[test]
+    fn receptors_equal_direct_sum_after_random_updates() {
+        let vp = test_view_proj(63, 35);
+        let (lo, hi) = (Vec3::new(-10.0, -10.0, -25.0), Vec3::new(10.0, 10.0, -5.0));
+        let mut sources = scene();
+        let mut r = Retina::new(63, 35);
+        let mut seed = 7u64;
+        for _ in 0..20 {
+            for s in &mut sources {
+                s.density = 1.0 + 40.0 * lcg(&mut seed);
+                s.color = [lcg(&mut seed), lcg(&mut seed), lcg(&mut seed)];
+            }
+            r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+            assert_receptors_match(&r, &sources, 1e-2);
+        }
+        assert_eq!(r.stats.relinks, 1, "static view must link exactly once");
+    }
+
+    #[test]
+    fn settled_scene_sends_nothing() {
+        let vp = test_view_proj(63, 35);
+        let (lo, hi) = (Vec3::new(-10.0, -10.0, -25.0), Vec3::new(10.0, 10.0, -5.0));
+        let sources = scene();
+        let mut r = Retina::new(63, 35);
+        r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        assert!(r.stats.pipes_sent > 0);
+        r.dirty = false;
+        r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        assert_eq!(r.stats.pipes_sent, 0, "settled scene still sends deltas");
+        assert!(!r.dirty);
+    }
+
+    #[test]
+    fn relink_keeps_receptors_exact() {
+        let vp_a = test_view_proj(63, 35);
+        let vp_b = vp_a * Mat4::from_translation(Vec3::new(2.0, 0.5, 0.0));
+        let (lo, hi) = (Vec3::new(-10.0, -10.0, -25.0), Vec3::new(10.0, 10.0, -5.0));
+        let sources = scene();
+        let mut r = Retina::new(63, 35);
+        r.tick(&sources, vp_a, lo, hi, false, ATTEN_K_DEFAULT);
+        let before: Vec<Receptor> = r.receptors.clone();
+        r.tick(&sources, vp_b, lo, hi, false, ATTEN_K_DEFAULT);
+        assert_eq!(r.stats.relinks, 2);
+        assert_ne!(before, r.receptors, "view moved but the image did not");
+        assert_receptors_match(&r, &sources, 1e-2);
+    }
+
+    #[test]
+    fn source_that_stops_drawing_is_withdrawn() {
+        let vp = test_view_proj(63, 35);
+        let (lo, hi) = (Vec3::new(-10.0, -10.0, -25.0), Vec3::new(10.0, 10.0, -5.0));
+        let mut sources = scene();
+        let mut r = Retina::new(63, 35);
+        r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        sources[0].drawable = false; // culled between relinks (e.g. trie depth)
+        r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        assert_receptors_match(&r, &sources, 1e-2);
+    }
+
+    #[test]
+    fn resolution_change_preserves_mean_density() {
+        let (lo, hi) = (Vec3::new(-10.0, -10.0, -25.0), Vec3::new(10.0, 10.0, -5.0));
+        let sources = vec![src(Vec3::new(0.0, 0.0, -10.0), Vec3::splat(3.0), 10.0)];
+        let mean = |w: u32, h: u32| {
+            let mut r = Retina::new(w, h);
+            r.tick(&sources, test_view_proj(w, h), lo, hi, false, ATTEN_K_DEFAULT);
+            r.receptors.iter().map(|x| x.density).sum::<f32>() / (w * h) as f32
+        };
+        let (coarse, fine) = (mean(63, 35), mean(126, 70));
+        assert!((coarse - fine).abs() < 0.2 * fine, "coarse {} vs fine {}", coarse, fine);
+        let mut r = Retina::new(63, 35);
+        r.resize(126, 70);
+        assert_eq!(r.receptors.len(), 126 * 70);
+        r.resize(1, 1);
+        assert_eq!((r.width, r.height), (MIN_RETINA_DIM, MIN_RETINA_DIM));
     }
 }
