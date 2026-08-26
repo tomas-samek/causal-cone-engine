@@ -239,6 +239,16 @@ pub struct DiffField {
     /// hardcoded deposit boosts. Baked into constants after calibration.
     pub tune_density: f32,
     pub tune_color: f32,
+    /// The observer's retina — receptor array fed by entity pipes.
+    pub retina: crate::retina::Retina,
+    /// Transmittance strength for occlusion (keys 5/6).
+    pub atten_k: f32,
+    /// Set by tuning keys so the next tick relinks even if the view is static.
+    pub retina_force_relink: bool,
+    /// Test plumbing: park tail/jaw/skin animation so a scene can be frozen.
+    pub freeze_animation: bool,
+    /// Per-entity retina sources, rebuilt each tick (reused allocation).
+    sources: Vec<crate::retina::Source>,
 }
 
 // ── Metaball source definitions for skeleton + receptor placement ──────────
@@ -313,6 +323,9 @@ pub(crate) fn cutoff_window(exponent: f32) -> f32 {
 }
 
 /// Rank percentile of a sorted slice (p in 0..=1). Empty slice → 0.0.
+/// Unused since `dump_field_stats` moved off the grid; kept (with its test)
+/// for the retina histograms that will replace the grid ones.
+#[allow(dead_code)]
 fn percentile(sorted: &[f32], p: f32) -> f32 {
     if sorted.is_empty() { return 0.0; }
     let idx = ((sorted.len() as f32 * p).ceil() as usize).max(1) - 1;
@@ -357,6 +370,11 @@ impl DiffField {
             deposit_queue: Vec::new(),
             tune_density: 1.0,
             tune_color: 1.0,
+            retina: crate::retina::Retina::new(crate::retina::RETINA_W, crate::retina::RETINA_H),
+            atten_k: crate::retina::ATTEN_K_DEFAULT,
+            retina_force_relink: false,
+            freeze_animation: false,
+            sources: Vec::new(),
         };
 
         let sp = field.spawn_demo_scene();
@@ -1529,46 +1547,11 @@ impl DiffField {
         sp
     }
 
-    /// On-demand diagnostics (key H): saturation histograms over the active
-    /// AABB and a floor-contrast probe. Answers "where does the 50-cap
-    /// bite?" and "which transport path carries the ground pattern?".
+    /// On-demand diagnostics (key H): retina occupancy/pipe traffic and a
+    /// floor-contrast probe. Answers "what reaches the receptors?" and
+    /// "does the ground under the dino get lit differently from far away?".
     pub fn dump_field_stats(&self) {
-        let fs = FIELD_SIZE as usize;
-        let x0 = self.aabb_min.x.max(0.0) as usize;
-        let x1 = (self.aabb_max.x as usize + 1).min(fs);
-        let y0 = self.aabb_min.y.max(0.0) as usize;
-        let y1 = (self.aabb_max.y as usize + 1).min(fs);
-        let z0 = self.aabb_min.z.max(0.0) as usize;
-        let z1 = (self.aabb_max.z as usize + 1).min(fs);
-
-        let mut density = Vec::new();
-        let mut colors = Vec::new();
-        let mut capped = 0u64;
-        let mut nonzero = 0u64;
-        for z in z0..z1 {
-            for y in y0..y1 {
-                let row = z * fs * fs + y * fs;
-                for x in x0..x1 {
-                    let c = &self.cells[row + x];
-                    if c.density <= 0.0 { continue; }
-                    nonzero += 1;
-                    density.push(c.density);
-                    colors.push(c.color_r.max(c.color_g).max(c.color_b));
-                    if c.density >= 49.5 { capped += 1; }
-                }
-            }
-        }
-        density.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        colors.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        log::info!(
-            "Field stats (AABB {}x{}x{}, {} nonzero cells): density p50={:.3} p90={:.3} p99={:.3} max={:.3}, {:.1}% at cap; color(max-ch) p50={:.3} p90={:.3} p99={:.3} max={:.3}",
-            x1 - x0, y1 - y0, z1 - z0, nonzero,
-            percentile(&density, 0.5), percentile(&density, 0.9),
-            percentile(&density, 0.99), percentile(&density, 1.0),
-            100.0 * capped as f64 / nonzero.max(1) as f64,
-            percentile(&colors, 0.5), percentile(&colors, 0.9),
-            percentile(&colors, 0.99), percentile(&colors, 1.0),
-        );
+        self.retina.log_stats();
 
         // Floor contrast probe: tiles under the walker footprint vs far tiles
         let mut wmin = glam::Vec3::splat(FIELD_SIZE as f32);
@@ -1578,41 +1561,33 @@ impl DiffField {
             wmax = wmax.max(e.position);
         }
         let center = (wmin + wmax) * 0.5;
-        let (mut under_inc, mut under_col, mut under_n) = (0.0f64, 0.0f64, 0u32);
-        let (mut far_inc, mut far_col, mut far_n) = (0.0f64, 0.0f64, 0u32);
+        let (mut under_inc, mut under_n) = (0.0f64, 0u32);
+        let (mut far_inc, mut far_n) = (0.0f64, 0u32);
         for e in self.entities.iter().filter(|e| e.group == GROUP_FLOOR) {
-            let cell_col = {
-                let ix = e.position.x as i32;
-                let iy = e.position.y as i32;
-                let iz = e.position.z as i32;
-                if Self::in_bounds(ix, iy, iz) {
-                    let c = &self.cells[Self::index(ix as u32, iy as u32, iz as u32)];
-                    c.color_r.max(c.color_g).max(c.color_b) as f64
-                } else { 0.0 }
-            };
             let under = e.position.x >= wmin.x && e.position.x <= wmax.x
                 && e.position.z >= wmin.z && e.position.z <= wmax.z;
             let dx = e.position.x - center.x;
             let dz = e.position.z - center.z;
             if under {
                 under_inc += e.incoming.density as f64;
-                under_col += cell_col;
                 under_n += 1;
             } else if dx * dx + dz * dz > 400.0 {
                 far_inc += e.incoming.density as f64;
-                far_col += cell_col;
                 far_n += 1;
             }
         }
         log::info!(
-            "Floor probe: under dino n={} avg incoming={:.3} avg cell color={:.3} | far (>20 cells) n={} avg incoming={:.3} avg cell color={:.3}",
-            under_n, under_inc / under_n.max(1) as f64, under_col / under_n.max(1) as f64,
-            far_n, far_inc / far_n.max(1) as f64, far_col / far_n.max(1) as f64,
+            "Floor probe: under dino n={} avg incoming={:.3} | far (>20 cells) n={} avg incoming={:.3}",
+            under_n, under_inc / under_n.max(1) as f64,
+            far_n, far_inc / far_n.max(1) as f64,
         );
     }
 
-    /// Run one simulation tick — push-driven pipe propagation
-    pub fn tick(&mut self, view_proj: glam::Mat4) {
+    /// Light transport for one sim step: cross-link refresh, active set,
+    /// atmosphere modulation, Phase 1 deliver, consumption, Phase 2 push.
+    /// Returns true if the cross-link refresh ran (the retina relinks then).
+    fn transport(&mut self, view_proj: glam::Mat4) -> bool {
+        let mut refreshed = false;
         // Refresh walker↔world light links once the dino has drifted a cell
         // from where they were last built — shadow and lighting follow.
         if self.travel_since_refresh >= LINK_REFRESH_DIST
@@ -1621,6 +1596,7 @@ impl DiffField {
             self.travel_since_refresh = 0.0;
             self.last_refresh_tick = self.tick;
             self.refresh_cross_links();
+            refreshed = true;
         }
 
         // Compute active set: which entity chains feed into what the observer sees
@@ -1644,55 +1620,6 @@ impl DiffField {
                 entity.scatter = entity.base_scatter * falloff;
                 entity.deposit_magnitude = entity.base_magnitude * falloff;
             }
-        }
-
-        // Phase 0: AABB-restricted decay — only touch cells near geometry
-        // The AABB from previous tick tells us where deposits exist.
-        // Margin of 40 covers vacuum scatter region generously.
-        let margin = 40.0f32;
-        let fs = FIELD_SIZE as usize;
-        let dx_min = (self.aabb_min.x - margin).max(0.0) as usize;
-        let dx_max = ((self.aabb_max.x + margin) as usize + 1).min(fs);
-        let dy_min = (self.aabb_min.y - margin).max(0.0) as usize;
-        let dy_max = ((self.aabb_max.y + margin) as usize + 1).min(fs);
-        let dz_min = (self.aabb_min.z - margin).max(0.0) as usize;
-        let dz_max = ((self.aabb_max.z + margin) as usize + 1).min(fs);
-
-        for z in 0..fs {
-            if !self.dirty_slabs[z] { continue; }
-
-            if z < dz_min || z >= dz_max {
-                // Outside AABB z range — stale deposits, clear and mark clean
-                let slab_base = z * fs * fs;
-                for cell in &mut self.cells[slab_base..slab_base + fs * fs] {
-                    *cell = FieldCell::default();
-                }
-                self.dirty_slabs[z] = false;
-                continue;
-            }
-
-            // Within AABB z range — decay only the AABB sub-rectangle
-            let slab_base = z * fs * fs;
-            let mut any_nonzero = false;
-            for y in dy_min..dy_max {
-                let row_base = slab_base + y * fs;
-                for x in dx_min..dx_max {
-                    let cell = &mut self.cells[row_base + x];
-                    cell.density *= 0.85;
-                    cell.color_r *= 0.85;
-                    cell.color_g *= 0.85;
-                    cell.color_b *= 0.85;
-                    if cell.density < 0.001 {
-                        cell.density = 0.0;
-                        cell.color_r = 0.0;
-                        cell.color_g = 0.0;
-                        cell.color_b = 0.0;
-                    } else {
-                        any_nonzero = true;
-                    }
-                }
-            }
-            if !any_nonzero { self.dirty_slabs[z] = false; }
         }
 
         // Phase 1: PUSH-BASED DELIVER with active filtering.
@@ -1813,8 +1740,9 @@ impl DiffField {
 
         // Dynamic connector density: scale gammas by observer distance.
         // Close entities propagate at full weight; distant ones at reduced weight.
-        let inv_vp = view_proj.inverse();
-        let observer_pos = glam::Vec3::new(inv_vp.col(3).x, inv_vp.col(3).y, inv_vp.col(3).z);
+        // The eye position, recovered from the view-projection matrix. (The
+        // old `inv_vp.col(3).xyz` is the unprojected clip origin, not the eye.)
+        let observer_pos = crate::retina::eye_from_view_proj(view_proj);
         let distance_factors: Vec<f32> = self.entities.iter().map(|e| {
             let dist = (e.position - observer_pos).length();
             // Full weight within 30 cells, linear falloff to 0.1 at 130+ cells
@@ -1918,6 +1846,215 @@ impl DiffField {
                 dep.density = total_d * w;
             }
         });
+
+        refreshed
+    }
+
+    /// Move and animate entities, track the AABB, and build this tick's
+    /// retina sources. Replaces the grid deposit: the emission formula is
+    /// the old Phase 3b one, but it goes to the retina as a Source.
+    fn advance_entities(&mut self) {
+        use crate::retina::Source;
+        let walk_delta = self.walker.step();
+        self.travel_since_refresh += walk_delta.length();
+        let walk_offset_z = self.walker.offset.z;
+        let tune_density = self.tune_density;
+        let tune_color = self.tune_color;
+        let freeze = self.freeze_animation;
+        let tick = self.tick;
+
+        let n = self.entities.len();
+        self.sources.clear();
+        self.sources.resize(n, Source {
+            position: glam::Vec3::ZERO, radii: glam::Vec3::ZERO, normal: glam::Vec3::Y,
+            opacity: 0.0, density: 0.0, color: [0.0; 3], drawable: false, occluder: false,
+        });
+
+        let mut aabb_min = glam::Vec3::splat(FIELD_SIZE as f32);
+        let mut aabb_max = glam::Vec3::splat(0.0);
+        for ent_idx in 0..n {
+            // Read everything that lives outside `entities` first, so the
+            // mutable entity borrow below does not conflict.
+            let visible = self.visible_set[ent_idx];
+            let show_depth = self.show_trie_depth;
+            let (depth_cull, mass_boost, depth_col) =
+                match self.consumption_states.get(ent_idx).and_then(|s| s.as_ref()) {
+                    Some(state) => (
+                        state.depth > self.render_depth_cutoff,
+                        if !state.learning && state.consumed > 0 {
+                            1.0 + (state.consumed as f32).ln().max(0.0) * 0.05
+                        } else { 1.0 },
+                        Some(crate::consumption::depth_color(state.depth)),
+                    ),
+                    None => (false, 1.0f32, None),
+                };
+
+            let entity = &mut self.entities[ent_idx];
+            if entity.is_walker { entity.position += walk_delta; }
+            entity.position += entity.velocity;
+            for i in 0..3 {
+                if entity.position[i] < 1.0 || entity.position[i] >= (FIELD_SIZE - 1) as f32 {
+                    entity.velocity[i] *= -1.0;
+                    entity.position[i] = entity.position[i].clamp(1.0, (FIELD_SIZE - 2) as f32);
+                }
+            }
+            if entity.is_heat || entity.is_vacuum { continue; }
+
+            let extent = if entity.deposit_radii != glam::Vec3::ZERO { entity.deposit_radii * 2.0 } else { glam::Vec3::splat(1.0) };
+            aabb_min = aabb_min.min(entity.position - extent);
+            aabb_max = aabb_max.max(entity.position + extent);
+
+            // Animated deposit position (skin oscillation, tail wag, jaw).
+            let mut deposit_pos = entity.position;
+            if !freeze && entity.oscillation_amplitude > 0.0 {
+                deposit_pos += entity.surface_normal * entity.oscillation_phase.sin() * entity.oscillation_amplitude;
+            }
+            if !freeze && (entity.group == GROUP_TAIL || entity.group == GROUP_TAIL_TIP) {
+                let time = tick as f32 / 30.0;
+                let frequency = std::f32::consts::PI;
+                let center_z = FIELD_SIZE as f32 / 2.0 + walk_offset_z;
+                let z_frac = ((center_z - entity.position.z) / 24.0).clamp(0.0, 1.0);
+                let amplitude = 3.0 * z_frac;
+                let phase = time * frequency + z_frac * 2.0;
+                deposit_pos.x += amplitude * phase.sin();
+            }
+            if !freeze && (entity.group == GROUP_JAW || entity.group == GROUP_MOUTH) {
+                let time = tick as f32 / 30.0;
+                let frequency = std::f32::consts::PI * 0.5;
+                let center = FIELD_SIZE as f32 / 2.0;
+                let pivot_z = center + 8.0 + walk_offset_z;
+                let z_frac = ((entity.position.z - pivot_z) / 8.0).clamp(0.0, 1.0);
+                let open_amount = (time * frequency).sin().abs();
+                deposit_pos.y -= z_frac * 2.5 * open_amount;
+            }
+            if !freeze { entity.oscillation_phase += entity.oscillation_freq; }
+
+            let use_gaussian = entity.deposit_radii != glam::Vec3::ZERO;
+            let (density_boost, color_boost) = if use_gaussian {
+                (40.0 * tune_density, 10.0 * tune_color)
+            } else {
+                (10.0 * tune_density, 10.0 * tune_color)
+            };
+            let static_boost = if use_gaussian { 40.0 } else { 10.0 };
+
+            // Visible? (frustum + trie-depth cutoff)
+            let drawable = visible && !depth_cull;
+
+            // Consumption mass boost: entities that consume more deposit denser
+            let mag = entity.deposit_magnitude * mass_boost;
+            let absorbed = 1.0 - entity.pass_through;
+            let entity_color = if show_depth {
+                depth_col.unwrap_or([0.3, 0.3, 0.3])
+            } else { entity.color };
+            let total_r = (entity_color[0] * mag + entity.incoming.r * absorbed * entity_color[0] + entity.reemit_r) * color_boost;
+            let total_g = (entity_color[1] * mag + entity.incoming.g * absorbed * entity_color[1] + entity.reemit_g) * color_boost;
+            let total_b = (entity_color[2] * mag + entity.incoming.b * absorbed * entity_color[2] + entity.reemit_b) * color_boost;
+            let total_d = (mag + entity.incoming.density * absorbed) * density_boost;
+
+            self.sources[ent_idx] = Source {
+                position: deposit_pos,
+                radii: entity.deposit_radii,
+                normal: if entity.surface_normal.length_squared() > 0.0 { entity.surface_normal } else { glam::Vec3::Y },
+                opacity: entity.deposit_magnitude * static_boost,
+                density: total_d,
+                color: [total_r, total_g, total_b],
+                drawable,
+                occluder: true,
+            };
+        }
+        self.aabb_min = aabb_min.max(glam::Vec3::ZERO);
+        self.aabb_max = aabb_max.min(glam::Vec3::splat(FIELD_SIZE as f32));
+    }
+
+    /// Run one simulation tick — push-driven pipe propagation, then arrival
+    /// at the observer's retina.
+    pub fn tick(&mut self, view_proj: glam::Mat4) {
+        let refreshed = self.transport(view_proj);
+        self.advance_entities();
+        let force = refreshed || self.retina_force_relink;
+        self.retina_force_relink = false;
+        // Borrow split: sources and retina are separate fields.
+        let sources = std::mem::take(&mut self.sources);
+        self.retina.tick(&sources, view_proj, self.aabb_min, self.aabb_max, force, self.atten_k);
+        self.sources = sources;
+
+        if self.tick % 300 == 0 && self.tick > 0 {
+            self.log_trie_diagnostics();
+        }
+        self.tick += 1;
+    }
+
+    /// Periodic trie census: how many states, at what depths, and the
+    /// consume/reject totals.
+    fn log_trie_diagnostics(&self) {
+        let mut depth_counts: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
+        let mut total_consumed = 0u64;
+        let mut total_rejected = 0u64;
+        for state in self.consumption_states.iter().flatten() {
+            *depth_counts.entry(state.depth).or_insert(0) += 1;
+            total_consumed += state.consumed;
+            total_rejected += state.rejected;
+        }
+        let n_states = self.consumption_states.iter().filter(|s| s.is_some()).count();
+        log::info!("Trie @ t={}: states={}, depths={:?}, consumed={}, rejected={}",
+            self.tick, n_states, depth_counts, total_consumed, total_rejected);
+    }
+
+    /// The pre-retina simulation tick: transport, then grid decay and the
+    /// voxel deposit passes. Kept as reference until the grid is removed
+    /// (Task 8) — nothing calls it.
+    #[allow(dead_code)]
+    pub fn tick_grid(&mut self, view_proj: glam::Mat4) {
+        let _ = self.transport(view_proj);
+
+        // Phase 0: AABB-restricted decay — only touch cells near geometry
+        // The AABB from previous tick tells us where deposits exist.
+        // Margin of 40 covers vacuum scatter region generously.
+        let margin = 40.0f32;
+        let fs = FIELD_SIZE as usize;
+        let dx_min = (self.aabb_min.x - margin).max(0.0) as usize;
+        let dx_max = ((self.aabb_max.x + margin) as usize + 1).min(fs);
+        let dy_min = (self.aabb_min.y - margin).max(0.0) as usize;
+        let dy_max = ((self.aabb_max.y + margin) as usize + 1).min(fs);
+        let dz_min = (self.aabb_min.z - margin).max(0.0) as usize;
+        let dz_max = ((self.aabb_max.z + margin) as usize + 1).min(fs);
+
+        for z in 0..fs {
+            if !self.dirty_slabs[z] { continue; }
+
+            if z < dz_min || z >= dz_max {
+                // Outside AABB z range — stale deposits, clear and mark clean
+                let slab_base = z * fs * fs;
+                for cell in &mut self.cells[slab_base..slab_base + fs * fs] {
+                    *cell = FieldCell::default();
+                }
+                self.dirty_slabs[z] = false;
+                continue;
+            }
+
+            // Within AABB z range — decay only the AABB sub-rectangle
+            let slab_base = z * fs * fs;
+            let mut any_nonzero = false;
+            for y in dy_min..dy_max {
+                let row_base = slab_base + y * fs;
+                for x in dx_min..dx_max {
+                    let cell = &mut self.cells[row_base + x];
+                    cell.density *= 0.85;
+                    cell.color_r *= 0.85;
+                    cell.color_g *= 0.85;
+                    cell.color_b *= 0.85;
+                    if cell.density < 0.001 {
+                        cell.density = 0.0;
+                        cell.color_r = 0.0;
+                        cell.color_g = 0.0;
+                        cell.color_b = 0.0;
+                    } else {
+                        any_nonzero = true;
+                    }
+                }
+            }
+            if !any_nonzero { self.dirty_slabs[z] = false; }
+        }
 
         // Rigid walker motion: one shared displacement for the whole dino
         // group this step (speed_c × time_lapse world-ticks).
@@ -2225,17 +2362,7 @@ impl DiffField {
 
         // Trie diagnostics
         if self.tick % 300 == 0 && self.tick > 0 {
-            let mut depth_counts: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
-            let mut total_consumed = 0u64;
-            let mut total_rejected = 0u64;
-            for state in self.consumption_states.iter().flatten() {
-                *depth_counts.entry(state.depth).or_insert(0) += 1;
-                total_consumed += state.consumed;
-                total_rejected += state.rejected;
-            }
-            let n_states = self.consumption_states.iter().filter(|s| s.is_some()).count();
-            log::info!("Trie @ t={}: states={}, depths={:?}, consumed={}, rejected={}",
-                self.tick, n_states, depth_counts, total_consumed, total_rejected);
+            self.log_trie_diagnostics();
         }
 
         self.tick += 1;
@@ -2377,5 +2504,34 @@ mod tests {
         }
         assert!(cross_edges > 0, "walker is isolated from the world graph");
         assert!(foot_to_floor > 0, "no foot→floor links at the new position — shadow can't follow");
+    }
+
+    #[test]
+    #[ignore] // builds the full 512³ field (~2 GB, slow) — run: cargo test --release -- --ignored
+    fn retina_sees_the_dino_and_settles() {
+        let mut field = DiffField::new();
+        let vp = test_view_proj();
+        for _ in 0..60 {
+            field.tick(vp);
+        }
+        let r = &field.retina;
+        let above = r.receptors.iter().filter(|x| x.density >= crate::retina::RETINA_ISO).count();
+        assert!(above > 500, "only {} receptors above iso — dino not on the retina", above);
+        assert!(r.receptors.iter().all(|x| x.density.is_finite() && x.color.iter().all(|c| c.is_finite())),
+            "non-finite receptor");
+        // Walker-group sources are drawable and linked
+        let linked_walkers = field.entities.iter().enumerate()
+            .filter(|(i, e)| e.is_walker && r.pipes_of(*i).count() > 0).count();
+        assert!(linked_walkers > 100, "only {} walker entities have pipes", linked_walkers);
+        // Freeze the world: no motion, no animation. Lighting keeps
+        // converging (consumption learning nudges mass boosts), so demand
+        // "almost silent", not zero — the unit tests prove exact zero.
+        field.walker.speed_c = 0.0;
+        for e in &mut field.entities { e.velocity = glam::Vec3::ZERO; }
+        field.freeze_animation = true;
+        for _ in 0..10 { field.tick(vp); }
+        let s = field.retina.stats;
+        assert!(s.pipes_sent * 100 < s.pipes_total,
+            "frozen scene still sends {} of {} pipes", s.pipes_sent, s.pipes_total);
     }
 }
