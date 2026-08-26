@@ -370,16 +370,11 @@ impl Retina {
             "receptors not zero after dropping all pipes");
         for r in &mut self.receptors { *r = Receptor::default(); }
 
-        // 2–3. Project footprints; 5. τ toward the eye (parallel — this is the cost).
+        // 2–3. Project footprints.
         let fps: Vec<Option<Footprint>> = sources.par_iter()
             .map(|s| if s.drawable { footprint(&view_proj, w, h, s) } else { None })
             .collect();
         let n = sources.len();
-        self.entity_trans = (0..n).into_par_iter().map(|i| {
-            if fps[i].is_some() {
-                segment_transmittance(sources, hash, sources[i].position, eye, &[i], atten_k)
-            } else { 1.0 }
-        }).collect();
         self.entity_depth = fps.iter().map(|f| f.as_ref().map(|f| f.depth).unwrap_or(0.0)).collect();
 
         // 4. Pipes with feathered gaussian weights.
@@ -408,6 +403,15 @@ impl Retina {
             self.pipe_count[i] = self.pipe_receptor.len() as u32 - self.pipe_start[i];
         }
         self.pipe_last = vec![PipeState::default(); self.pipe_receptor.len()];
+
+        // 5. τ toward the eye — only for entities that actually got pipes
+        // (parallel — this is the cost).
+        let pipe_count = &self.pipe_count;
+        self.entity_trans = (0..n).into_par_iter().map(|i| {
+            if pipe_count[i] > 0 {
+                segment_transmittance(sources, hash, sources[i].position, eye, &[i], atten_k)
+            } else { 1.0 }
+        }).collect();
 
         // 6. Bookkeeping.
         self.last_view_proj = Some(view_proj);
@@ -565,7 +569,10 @@ mod tests {
         let hash = SpatialHash::build(&sources);
         let mut r = Retina::new(63, 35);
         r.relink(&sources, &hash, vp, Vec3::ZERO, ATTEN_K_DEFAULT);
-        for i in 0..3 { assert_eq!(r.pipes_of(i).count(), 0, "source {} got pipes", i); }
+        for i in 0..3 {
+            assert_eq!(r.pipes_of(i).count(), 0, "source {} got pipes", i);
+            assert_eq!(r.transmittance(i), 1.0, "source {} τ not defaulted to 1.0", i);
+        }
         assert_eq!(r.stats.pipes_total, 0);
     }
 
