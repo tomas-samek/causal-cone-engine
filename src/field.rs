@@ -635,7 +635,7 @@ impl DiffField {
             if a.distance_squared(b) < cd_sq { return Some((kk, 1.0)); }
             // No AABB clip: an edge spans two entities, so it is already inside
             // the geometry box — clipping it would only cost the box test.
-            Some((kk, segment_transmittance(&sources, &hash, a, b, &[i, t], k, None)))
+            Some((kk, segment_transmittance(&sources, &hash, a, b, &[i, t], k, crate::retina::ATTEN_THRESHOLD, None)))
         }).collect();
         let mut attenuated = 0usize;
         for (kk, a) in atten {
@@ -2081,10 +2081,55 @@ mod tests {
         field.walker.speed_c = 0.0;
         for e in &mut field.entities { e.velocity = glam::Vec3::ZERO; }
         field.freeze_animation = true;
-        for _ in 0..10 { field.tick(vp); }
+        // 25 ticks, not 10: now that the dino is no longer occluded by itself
+        // its skin actually carries light, so the lighting has ~100 more
+        // contributing entities to converge. It reaches 0.6% by tick 20 and
+        // stays there; 10 ticks catches it mid-descent at ~1.6%.
+        for _ in 0..25 { field.tick(vp); }
         let s = field.retina.stats;
         assert!(s.pipes_sent * 100 < s.pipes_total,
             "frozen scene still sends {} of {} pipes", s.pipes_sent, s.pipes_total);
+    }
+
+    /// The dino is made of a receptor shell buried in its own skeleton
+    /// metaballs. If an entity's τ is measured against the absolute density
+    /// floor, every shell entity is occluded by the body it belongs to and the
+    /// dino renders as a hole. The walker group has to *arrive*.
+    #[test]
+    #[ignore] // builds the full demo scene (slow) — run: cargo test --release -- --ignored
+    fn walker_entities_are_not_occluded_by_their_own_body() {
+        let mut field = DiffField::new();
+        let vp = test_view_proj();
+        for _ in 0..30 {
+            field.tick(vp);
+        }
+        let r = &field.retina;
+        let taus: Vec<f32> = field.entities.iter().enumerate()
+            .filter(|(i, e)| e.is_walker && r.pipes_of(*i).count() > 0)
+            .map(|(i, _)| r.transmittance(i))
+            .collect();
+        assert!(taus.len() >= 100, "only {} walker entities linked", taus.len());
+        let mean = taus.iter().sum::<f32>() / taus.len() as f32;
+        let bright = taus.iter().filter(|&&t| t >= 0.5).count();
+        eprintln!("walker τ over {} linked entities: mean {:.3}, {} ≥ 0.5 ({:.0}%)",
+            taus.len(), mean, bright, 100.0 * bright as f64 / taus.len() as f64);
+        assert!(mean >= 0.3, "mean walker τ {:.3} — the dino occludes itself", mean);
+        // The shell is a closed surface, so at most about half of it can ever
+        // face the eye — the other half is behind the body and *must* stay
+        // dark. The measured split is 51/49, so demand a clear near half.
+        assert!(bright * 100 >= taus.len() * 45,
+            "only {} of {} walker entities have τ ≥ 0.5", bright, taus.len());
+        // And the half nearest the eye is the dino's visible skin: it has to
+        // arrive nearly unattenuated, not merely "on average not zero".
+        let mut by_depth: Vec<(f32, f32)> = field.entities.iter().enumerate()
+            .filter(|(i, e)| e.is_walker && r.pipes_of(*i).count() > 0)
+            .map(|(i, _)| (r.depth_of(i), r.transmittance(i)))
+            .collect();
+        by_depth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let half = by_depth.len() / 2;
+        let near = by_depth[..half].iter().map(|x| x.1).sum::<f32>() / half as f32;
+        eprintln!("near half mean τ = {:.3}", near);
+        assert!(near >= 0.8, "the dino's front skin is dimmed: near-half mean τ {:.3}", near);
     }
 
     /// A tick must fit in a frame. The bounds are several times what a tick
@@ -2307,3 +2352,4 @@ mod tests {
         );
     }
 }
+

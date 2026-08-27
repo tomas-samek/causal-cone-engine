@@ -156,8 +156,14 @@ fn clip_to_box(from: Vec3, dir: Vec3, len: f32, bmin: Vec3, bmax: Vec3) -> Optio
 }
 
 /// Fraction of light surviving the segment from → to:
-/// exp(−k · ∫ max(0, ρ − ATTEN_THRESHOLD) ds), skipping ATTEN_END_MARGIN at
+/// exp(−k · ∫ max(0, ρ − threshold) ds), skipping ATTEN_END_MARGIN at
 /// both ends so an entity's own kernel (and its partner's) never self-shadows.
+///
+/// `threshold` is the density that counts as "not occluding", floored at
+/// ATTEN_THRESHOLD. A caller that walks from an entity buried inside other
+/// occluders (the dino's receptor shell sits inside its own skeleton) raises it
+/// to the density already surrounding that entity — the end margin cannot help
+/// there, because the body it is buried in extends far past 1.5 cells.
 ///
 /// Two bounds keep the cost off the segment's length. `aabb` (the scene's
 /// geometry box) clips the walk to the stretch that can hold occluders at all —
@@ -172,8 +178,10 @@ pub fn segment_transmittance(
     to: Vec3,
     skip: &[usize],
     k: f32,
+    threshold: f32,
     aabb: Option<(Vec3, Vec3)>,
 ) -> f32 {
+    let threshold = threshold.max(ATTEN_THRESHOLD);
     let ab = to - from;
     let len = ab.length();
     if len - 2.0 * ATTEN_END_MARGIN <= 0.0 { return 1.0; }
@@ -194,7 +202,7 @@ pub fn segment_transmittance(
     let mut t = ATTEN_END_MARGIN + (m0 + 0.5) * step;
     while t < hi {
         let rho = hash.density_at(sources, from + dir * t, skip);
-        integral += (rho - ATTEN_THRESHOLD).max(0.0) * step;
+        integral += (rho - threshold).max(0.0) * step;
         if k * integral > ATTEN_TAU_CUTOFF { return 0.0; }
         t += step;
     }
@@ -525,7 +533,14 @@ impl Retina {
         let aabb = Some((aabb_min, aabb_max));
         self.entity_trans = (0..n).into_par_iter().map(|i| {
             if pipe_count[i] > 0 {
-                segment_transmittance(sources, hash, sources[i].position, eye, &[i], atten_k, aabb)
+                // Relative threshold: an entity is not occluded by what it is
+                // already buried in. ρ_self is the density of *other* occluders
+                // at the entity's own position — for a receptor on the dino's
+                // shell that is its own skeleton, 4–8 deep. Only density above
+                // it (the body behind, the floor under) can dim the entity.
+                let rho_self = hash.density_at(sources, sources[i].position, &[i]);
+                let threshold = rho_self.max(ATTEN_THRESHOLD);
+                segment_transmittance(sources, hash, sources[i].position, eye, &[i], atten_k, threshold, aabb)
             } else { 1.0 }
         }).collect();
 
@@ -729,7 +744,7 @@ mod tests {
     fn transmittance_is_one_with_no_occluder_on_the_segment() {
         let sources = vec![src(Vec3::new(10.0, 0.0, -5.0), Vec3::ONE, 10.0)];
         let hash = SpatialHash::build(&sources);
-        let t = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, -10.0), Vec3::ZERO, &[], 0.5, None);
+        let t = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, -10.0), Vec3::ZERO, &[], 0.5, ATTEN_THRESHOLD, None);
         assert!((t - 1.0).abs() < 1e-6, "off-segment occluder attenuated: {}", t);
     }
 
@@ -739,7 +754,7 @@ mod tests {
         let sources = vec![occ];
         let hash = SpatialHash::build(&sources);
         let k = 0.5;
-        let t = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, -10.0), Vec3::ZERO, &[], k, None);
+        let t = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, -10.0), Vec3::ZERO, &[], k, ATTEN_THRESHOLD, None);
         // Independent reference: fine quadrature of the same integrand
         let mut integral = 0.0f32;
         let dz = 0.01;
@@ -763,12 +778,12 @@ mod tests {
         let hash = SpatialHash::build(&sources);
         // Endpoint sources sit inside the 1.5-cell margins → never sampled
         let t_ends = segment_transmittance(&sources[..2], &SpatialHash::build(&sources[..2]),
-            a.position, b.position, &[], 0.5, None);
+            a.position, b.position, &[], 0.5, ATTEN_THRESHOLD, None);
         assert!((t_ends - 1.0).abs() < 1e-6, "endpoint sources leaked into the integral: {}", t_ends);
         // Skipping the middle occluder restores full transmittance
-        let t_skip = segment_transmittance(&sources, &hash, a.position, b.position, &[2], 0.5, None);
+        let t_skip = segment_transmittance(&sources, &hash, a.position, b.position, &[2], 0.5, ATTEN_THRESHOLD, None);
         assert!((t_skip - 1.0).abs() < 1e-6);
-        let t_block = segment_transmittance(&sources, &hash, a.position, b.position, &[], 0.5, None);
+        let t_block = segment_transmittance(&sources, &hash, a.position, b.position, &[], 0.5, ATTEN_THRESHOLD, None);
         assert!(t_block < 0.1);
     }
 
@@ -784,12 +799,12 @@ mod tests {
         let hash = SpatialHash::build(&sources);
         // Scene AABB holds every solid — entity and occluder both.
         let aabb = Some((Vec3::new(-8.0, -8.0, -8.0), Vec3::new(8.0, 8.0, 12.0)));
-        let near = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, 20.0), entity, &[], 0.5, aabb);
-        let far = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, 500.0), entity, &[], 0.5, aabb);
+        let near = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, 20.0), entity, &[], 0.5, ATTEN_THRESHOLD, aabb);
+        let far = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, 500.0), entity, &[], 0.5, ATTEN_THRESHOLD, aabb);
         assert!(near < 0.9, "the occluder did not attenuate at all: {}", near);
         assert!((near - far).abs() < 1e-6, "clipped far τ={} != near τ={}", far, near);
         // And the clip agrees with integrating the whole 500-cell segment.
-        let unclipped = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, 500.0), entity, &[], 0.5, None);
+        let unclipped = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, 500.0), entity, &[], 0.5, ATTEN_THRESHOLD, None);
         assert!((far - unclipped).abs() < 1e-6, "clip changed τ: {} vs {}", far, unclipped);
     }
 
@@ -800,7 +815,7 @@ mod tests {
         // A box far off to the side: the segment never enters it, so nothing
         // on it can attenuate and τ is 1.0 without sampling at all.
         let aabb = Some((Vec3::new(400.0, 400.0, 400.0), Vec3::new(420.0, 420.0, 420.0)));
-        let t = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, 20.0), Vec3::ZERO, &[], 0.5, aabb);
+        let t = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, 20.0), Vec3::ZERO, &[], 0.5, ATTEN_THRESHOLD, aabb);
         assert_eq!(t, 1.0);
     }
 
@@ -813,18 +828,71 @@ mod tests {
         let hash = SpatialHash::build(&sources);
         let (from, to) = (Vec3::new(0.0, 0.0, 20.0), Vec3::new(0.0, 0.0, -20.0));
         // Measure the integral itself with a k too small to trip the early-out.
-        let probe = segment_transmittance(&sources, &hash, from, to, &[], 1e-3, None);
+        let probe = segment_transmittance(&sources, &hash, from, to, &[], 1e-3, ATTEN_THRESHOLD, None);
         let integral = -probe.ln() / 1e-3;
         assert!(integral > 25.0, "test occluder too thin to reach the cutoff: ∫={}", integral);
         // Pick k so k·∫ = 25: past the cutoff, but exp(−25) is a perfectly
         // representable 1.4e-11 — so a plain exp would NOT give zero here.
         let k = 25.0 / integral;
         assert!((-25.0f32).exp() > 0.0, "exp(−25) underflowed; the test proves nothing");
-        let t = segment_transmittance(&sources, &hash, from, to, &[], k, None);
+        let t = segment_transmittance(&sources, &hash, from, to, &[], k, ATTEN_THRESHOLD, None);
         assert_eq!(t, 0.0, "early-out did not fire at k·∫≈25 (τ={})", t);
         // Just under the cutoff the normal path still returns a positive τ.
-        let under = segment_transmittance(&sources, &hash, from, to, &[], 19.0 / integral, None);
+        let under = segment_transmittance(&sources, &hash, from, to, &[], 19.0 / integral, ATTEN_THRESHOLD, None);
         assert!(under > 0.0 && under < 1e-8, "τ just under the cutoff: {}", under);
+    }
+
+    /// The threshold `relink` gives an entity's own segment: only density
+    /// *above* what already surrounds it can occlude it.
+    fn rel_threshold(sources: &[Source], hash: &SpatialHash, i: usize) -> f32 {
+        hash.density_at(sources, sources[i].position, &[i]).max(ATTEN_THRESHOLD)
+    }
+
+    /// The dino's receptor shell sits inside its own skeleton metaballs, so
+    /// ρ_others at a shell entity is already 4–8. A shell facing the eye must
+    /// still arrive: nothing between it and the eye is denser than the body it
+    /// is already buried in.
+    #[test]
+    fn relative_threshold_lets_a_front_shell_see_the_eye() {
+        let body = src(Vec3::new(0.0, 0.0, -14.0), Vec3::splat(4.0), 8.0);
+        let shell = src(Vec3::new(0.0, 0.0, -11.0), Vec3::ONE, 1.0); // e = (3/4)²
+        let sources = vec![body, shell];
+        let hash = SpatialHash::build(&sources);
+        let thr = rel_threshold(&sources, &hash, 1);
+        assert!(thr > 4.0, "test shell is not inside the body: ρ_self={}", thr);
+        let t = segment_transmittance(&sources, &hash, sources[1].position, Vec3::ZERO, &[1],
+            ATTEN_K_DEFAULT, thr, None);
+        assert!(t >= 0.9, "front shell occluded by its own body: τ={}", t);
+    }
+
+    /// The relative threshold must not make the body transparent: a shell on
+    /// the far side still crosses the core, where ρ ≫ ρ_self.
+    #[test]
+    fn relative_threshold_still_occludes_a_back_shell() {
+        let body = src(Vec3::new(0.0, 0.0, -14.0), Vec3::splat(4.0), 8.0);
+        let shell = src(Vec3::new(0.0, 0.0, -17.0), Vec3::ONE, 1.0); // symmetric, behind
+        let sources = vec![body, shell];
+        let hash = SpatialHash::build(&sources);
+        let thr = rel_threshold(&sources, &hash, 1);
+        let t = segment_transmittance(&sources, &hash, sources[1].position, Vec3::ZERO, &[1],
+            ATTEN_K_DEFAULT, thr, None);
+        assert!(t <= 0.05, "back shell shines through the body: τ={}", t);
+    }
+
+    /// Floor far below the dino has no body around it, so its threshold is the
+    /// absolute floor — and the body straight above it still blocks the eye.
+    #[test]
+    fn relative_threshold_still_occludes_the_floor_under_a_body() {
+        let body = src(Vec3::new(0.0, 0.0, -14.0), Vec3::splat(4.0), 8.0);
+        let floor = src(Vec3::new(0.0, -12.0, -14.0), Vec3::ZERO, 1.0);
+        let sources = vec![body, floor];
+        let hash = SpatialHash::build(&sources);
+        let thr = rel_threshold(&sources, &hash, 1);
+        assert_eq!(thr, ATTEN_THRESHOLD, "floor is not clear of the body: ρ_self={}", thr);
+        let eye = Vec3::new(0.0, 12.0, -14.0); // straight above, through the body
+        let t = segment_transmittance(&sources, &hash, sources[1].position, eye, &[1],
+            ATTEN_K_DEFAULT, thr, None);
+        assert!(t <= 0.05, "floor under the body is not shadowed: τ={}", t);
     }
 
     #[test]
