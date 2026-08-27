@@ -633,7 +633,9 @@ impl DiffField {
             let a = sources[i].position;
             let b = sources[t].position;
             if a.distance_squared(b) < cd_sq { return Some((kk, 1.0)); }
-            Some((kk, segment_transmittance(&sources, &hash, a, b, &[i, t], k)))
+            // No AABB clip: an edge spans two entities, so it is already inside
+            // the geometry box — clipping it would only cost the box test.
+            Some((kk, segment_transmittance(&sources, &hash, a, b, &[i, t], k, None)))
         }).collect();
         let mut attenuated = 0usize;
         for (kk, a) in atten {

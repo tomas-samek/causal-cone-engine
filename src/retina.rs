@@ -20,6 +20,9 @@ pub const ATTEN_END_MARGIN: f32 = 1.5;
 pub const ATTEN_SAMPLES_PER_CELL: f32 = 1.0;
 pub const ATTEN_THRESHOLD: f32 = 0.6;
 pub const ATTEN_K_DEFAULT: f32 = 0.5;
+/// Stop integrating a segment once k·∫ passes this: τ < 2e-9, well under an
+/// f16 denormal, so the rest of the walk cannot change the picture.
+pub const ATTEN_TAU_CUTOFF: f32 = 20.0;
 pub const MIN_RETINA_DIM: u32 = 20;
 pub const MAX_RETINA_DIM: u32 = 1280;
 /// Ceiling on the transient scratch images `arrive` may hold at once. Each
@@ -80,16 +83,21 @@ pub const HASH_CELL: f32 = 2.0;
 /// that can reach a point is in that point's cell.
 pub struct SpatialHash {
     map: HashMap<(i32, i32, i32), Vec<usize>>,
+    /// Widest kernel reach of any occluder, per axis. A clip box grown by this
+    /// is conservative: nothing outside it can reach a sample inside it.
+    max_extent: Vec3,
 }
 
 impl SpatialHash {
     pub fn build(sources: &[Source]) -> Self {
         let mut map: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+        let mut max_extent = Vec3::ZERO;
         for (i, s) in sources.iter().enumerate() {
             if !s.occluder { continue; }
             // kernel() > 0 requires |(p − position)/radii|² < 4 — i.e. p inside
             // the box position ± 2·radii.
             let extent = s.kernel_radii() * 2.0;
+            max_extent = max_extent.max(extent);
             let lo = Self::key(s.position - extent);
             let hi = Self::key(s.position + extent);
             for cz in lo.2..=hi.2 {
@@ -100,7 +108,7 @@ impl SpatialHash {
                 }
             }
         }
-        Self { map }
+        Self { map, max_extent }
     }
 
     fn key(p: Vec3) -> (i32, i32, i32) {
@@ -124,9 +132,36 @@ impl SpatialHash {
     }
 }
 
+/// Parametric entry/exit of `from + dir·t`, t ∈ [0, len], through an
+/// axis-aligned box. `None` when the segment never enters it.
+fn clip_to_box(from: Vec3, dir: Vec3, len: f32, bmin: Vec3, bmax: Vec3) -> Option<(f32, f32)> {
+    let (mut t0, mut t1) = (0.0f32, len);
+    for a in 0..3 {
+        if dir[a].abs() < 1e-12 {
+            // Parallel to this slab: either always inside it or never.
+            if from[a] < bmin[a] || from[a] > bmax[a] { return None; }
+            continue;
+        }
+        let mut ta = (bmin[a] - from[a]) / dir[a];
+        let mut tb = (bmax[a] - from[a]) / dir[a];
+        if ta > tb { std::mem::swap(&mut ta, &mut tb); }
+        t0 = t0.max(ta);
+        t1 = t1.min(tb);
+        if t0 > t1 { return None; }
+    }
+    Some((t0, t1))
+}
+
 /// Fraction of light surviving the segment from → to:
 /// exp(−k · ∫ max(0, ρ − ATTEN_THRESHOLD) ds), skipping ATTEN_END_MARGIN at
 /// both ends so an entity's own kernel (and its partner's) never self-shadows.
+///
+/// Two bounds keep the cost off the segment's length. `aabb` (the scene's
+/// geometry box) clips the walk to the stretch that can hold occluders at all —
+/// samples outside it are zero by construction, so this changes nothing but the
+/// work; the box is grown by the widest kernel reach in `hash` to stay
+/// conservative. And once `k·∫` passes ATTEN_TAU_CUTOFF the segment is opaque
+/// past anything the renderer can show, so the walk stops at a hard zero.
 pub fn segment_transmittance(
     sources: &[Source],
     hash: &SpatialHash,
@@ -134,17 +169,30 @@ pub fn segment_transmittance(
     to: Vec3,
     skip: &[usize],
     k: f32,
+    aabb: Option<(Vec3, Vec3)>,
 ) -> f32 {
     let ab = to - from;
     let len = ab.length();
     if len - 2.0 * ATTEN_END_MARGIN <= 0.0 { return 1.0; }
     let dir = ab / len;
     let step = 1.0 / ATTEN_SAMPLES_PER_CELL;
+    let (mut lo, mut hi) = (ATTEN_END_MARGIN, len - ATTEN_END_MARGIN);
+    if let Some((bmin, bmax)) = aabb {
+        let Some((t0, t1)) = clip_to_box(from, dir, len, bmin - hash.max_extent, bmax + hash.max_extent)
+            else { return 1.0; };
+        lo = lo.max(t0);
+        hi = hi.min(t1);
+        if lo >= hi { return 1.0; }
+    }
+    // The sample lattice stays anchored at `from` — t_m = margin + (m+½)·step —
+    // so clipping only drops samples, never moves the surviving ones.
+    let m0 = ((lo - ATTEN_END_MARGIN) / step - 0.5).ceil().max(0.0);
     let mut integral = 0.0f32;
-    let mut t = ATTEN_END_MARGIN + 0.5 * step;
-    while t < len - ATTEN_END_MARGIN {
+    let mut t = ATTEN_END_MARGIN + (m0 + 0.5) * step;
+    while t < hi {
         let rho = hash.density_at(sources, from + dir * t, skip);
         integral += (rho - ATTEN_THRESHOLD).max(0.0) * step;
+        if k * integral > ATTEN_TAU_CUTOFF { return 0.0; }
         t += step;
     }
     (-k * integral).exp()
@@ -380,8 +428,10 @@ impl Retina {
 
     /// Full rebuild: drop every pipe (subtracting what it last sent — the
     /// receptors are then exactly zero), re-project every drawable source,
-    /// recompute τ toward the eye.
-    pub fn relink(&mut self, sources: &[Source], hash: &SpatialHash, view_proj: Mat4, eye: Vec3, atten_k: f32) {
+    /// recompute τ toward the eye. `aabb_min/max` bound the scene's geometry,
+    /// which is the only stretch of an entity→eye segment that can attenuate.
+    pub fn relink(&mut self, sources: &[Source], hash: &SpatialHash, view_proj: Mat4, eye: Vec3,
+                  aabb_min: Vec3, aabb_max: Vec3, atten_k: f32) {
         let t0 = std::time::Instant::now();
         let (w, h) = (self.width, self.height);
 
@@ -436,9 +486,10 @@ impl Retina {
         // 5. τ toward the eye — only for entities that actually got pipes
         // (parallel — this is the cost).
         let pipe_count = &self.pipe_count;
+        let aabb = Some((aabb_min, aabb_max));
         self.entity_trans = (0..n).into_par_iter().map(|i| {
             if pipe_count[i] > 0 {
-                segment_transmittance(sources, hash, sources[i].position, eye, &[i], atten_k)
+                segment_transmittance(sources, hash, sources[i].position, eye, &[i], atten_k, aabb)
             } else { 1.0 }
         }).collect();
 
@@ -546,7 +597,7 @@ impl Retina {
         if force_relink || self.needs_relink(view_proj, aabb_min, aabb_max) {
             let hash = SpatialHash::build(sources);
             let eye = eye_from_view_proj(view_proj);
-            self.relink(sources, &hash, view_proj, eye, atten_k);
+            self.relink(sources, &hash, view_proj, eye, aabb_min, aabb_max, atten_k);
         }
         self.arrive(sources);
     }
@@ -581,6 +632,18 @@ impl Retina {
 mod tests {
     use super::*;
 
+    /// Scene AABB the way `advance_entities` builds it: every source's
+    /// position grown by its full kernel reach.
+    fn box_of(sources: &[Source]) -> (Vec3, Vec3) {
+        let mut lo = Vec3::splat(f32::MAX);
+        let mut hi = Vec3::splat(f32::MIN);
+        for s in sources {
+            lo = lo.min(s.position - s.kernel_radii() * 2.0);
+            hi = hi.max(s.position + s.kernel_radii() * 2.0);
+        }
+        (lo, hi)
+    }
+
     fn src(pos: Vec3, radii: Vec3, opacity: f32) -> Source {
         Source {
             position: pos,
@@ -609,7 +672,7 @@ mod tests {
     fn transmittance_is_one_with_no_occluder_on_the_segment() {
         let sources = vec![src(Vec3::new(10.0, 0.0, -5.0), Vec3::ONE, 10.0)];
         let hash = SpatialHash::build(&sources);
-        let t = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, -10.0), Vec3::ZERO, &[], 0.5);
+        let t = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, -10.0), Vec3::ZERO, &[], 0.5, None);
         assert!((t - 1.0).abs() < 1e-6, "off-segment occluder attenuated: {}", t);
     }
 
@@ -619,7 +682,7 @@ mod tests {
         let sources = vec![occ];
         let hash = SpatialHash::build(&sources);
         let k = 0.5;
-        let t = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, -10.0), Vec3::ZERO, &[], k);
+        let t = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, -10.0), Vec3::ZERO, &[], k, None);
         // Independent reference: fine quadrature of the same integrand
         let mut integral = 0.0f32;
         let dz = 0.01;
@@ -643,13 +706,68 @@ mod tests {
         let hash = SpatialHash::build(&sources);
         // Endpoint sources sit inside the 1.5-cell margins → never sampled
         let t_ends = segment_transmittance(&sources[..2], &SpatialHash::build(&sources[..2]),
-            a.position, b.position, &[], 0.5);
+            a.position, b.position, &[], 0.5, None);
         assert!((t_ends - 1.0).abs() < 1e-6, "endpoint sources leaked into the integral: {}", t_ends);
         // Skipping the middle occluder restores full transmittance
-        let t_skip = segment_transmittance(&sources, &hash, a.position, b.position, &[2], 0.5);
+        let t_skip = segment_transmittance(&sources, &hash, a.position, b.position, &[2], 0.5, None);
         assert!((t_skip - 1.0).abs() < 1e-6);
-        let t_block = segment_transmittance(&sources, &hash, a.position, b.position, &[], 0.5);
+        let t_block = segment_transmittance(&sources, &hash, a.position, b.position, &[], 0.5, None);
         assert!(t_block < 0.1);
+    }
+
+    /// The clip must be free of consequence: samples outside the geometry AABB
+    /// are zero anyway, so an eye 500 cells out must read exactly what an eye
+    /// 20 cells out reads. (Both distances differ by a whole number of steps,
+    /// so the sample lattice lands on the same world points.)
+    #[test]
+    fn aabb_clip_does_not_change_tau_for_a_distant_eye() {
+        let entity = Vec3::ZERO;
+        let occ = src(Vec3::new(0.0, 0.0, 6.0), Vec3::ONE, 10.0);
+        let sources = vec![occ];
+        let hash = SpatialHash::build(&sources);
+        // Scene AABB holds every solid — entity and occluder both.
+        let aabb = Some((Vec3::new(-8.0, -8.0, -8.0), Vec3::new(8.0, 8.0, 12.0)));
+        let near = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, 20.0), entity, &[], 0.5, aabb);
+        let far = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, 500.0), entity, &[], 0.5, aabb);
+        assert!(near < 0.9, "the occluder did not attenuate at all: {}", near);
+        assert!((near - far).abs() < 1e-6, "clipped far τ={} != near τ={}", far, near);
+        // And the clip agrees with integrating the whole 500-cell segment.
+        let unclipped = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, 500.0), entity, &[], 0.5, None);
+        assert!((far - unclipped).abs() < 1e-6, "clip changed τ: {} vs {}", far, unclipped);
+    }
+
+    #[test]
+    fn aabb_clip_skips_a_segment_that_misses_the_box() {
+        let sources = vec![src(Vec3::new(0.0, 0.0, 6.0), Vec3::ONE, 10.0)];
+        let hash = SpatialHash::build(&sources);
+        // A box far off to the side: the segment never enters it, so nothing
+        // on it can attenuate and τ is 1.0 without sampling at all.
+        let aabb = Some((Vec3::new(400.0, 400.0, 400.0), Vec3::new(420.0, 420.0, 420.0)));
+        let t = segment_transmittance(&sources, &hash, Vec3::new(0.0, 0.0, 20.0), Vec3::ZERO, &[], 0.5, aabb);
+        assert_eq!(t, 1.0);
+    }
+
+    /// Past k·∫ = 20 the survivor fraction is < 2e-9 — under f16 denormals and
+    /// under anything the renderer can show. The walk stops and returns a hard
+    /// zero, and that must be a real early-out, not `exp` underflowing.
+    #[test]
+    fn opaque_segment_early_outs_to_exactly_zero() {
+        let sources = vec![src(Vec3::new(0.0, 0.0, 0.0), Vec3::splat(4.0), 12.0)];
+        let hash = SpatialHash::build(&sources);
+        let (from, to) = (Vec3::new(0.0, 0.0, 20.0), Vec3::new(0.0, 0.0, -20.0));
+        // Measure the integral itself with a k too small to trip the early-out.
+        let probe = segment_transmittance(&sources, &hash, from, to, &[], 1e-3, None);
+        let integral = -probe.ln() / 1e-3;
+        assert!(integral > 25.0, "test occluder too thin to reach the cutoff: ∫={}", integral);
+        // Pick k so k·∫ = 25: past the cutoff, but exp(−25) is a perfectly
+        // representable 1.4e-11 — so a plain exp would NOT give zero here.
+        let k = 25.0 / integral;
+        assert!((-25.0f32).exp() > 0.0, "exp(−25) underflowed; the test proves nothing");
+        let t = segment_transmittance(&sources, &hash, from, to, &[], k, None);
+        assert_eq!(t, 0.0, "early-out did not fire at k·∫≈25 (τ={})", t);
+        // Just under the cutoff the normal path still returns a positive τ.
+        let under = segment_transmittance(&sources, &hash, from, to, &[], 19.0 / integral, None);
+        assert!(under > 0.0 && under < 1e-8, "τ just under the cutoff: {}", under);
     }
 
     #[test]
@@ -704,8 +822,9 @@ mod tests {
         let vp = test_view_proj(63, 35);
         let sources = vec![src(Vec3::new(0.0, 0.0, -10.0), Vec3::ZERO, 1.0)];
         let hash = SpatialHash::build(&sources);
+        let (lo, hi) = box_of(&sources);
         let mut r = Retina::new(63, 35);
-        r.relink(&sources, &hash, vp, Vec3::ZERO, ATTEN_K_DEFAULT);
+        r.relink(&sources, &hash, vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
         let center: u32 = 17 * 63 + 31;
         let w = r.pipes_of(0).find(|&(rc, _)| rc == center).map(|(_, w)| w);
         assert!(w.is_some(), "no pipe to the center receptor");
@@ -721,8 +840,9 @@ mod tests {
         let vp = test_view_proj(63, 35);
         let sources = vec![src(Vec3::new(0.0, 0.0, -10.0), Vec3::splat(2.0), 1.0)];
         let hash = SpatialHash::build(&sources);
+        let (lo, hi) = box_of(&sources);
         let mut r = Retina::new(63, 35);
-        r.relink(&sources, &hash, vp, Vec3::ZERO, ATTEN_K_DEFAULT);
+        r.relink(&sources, &hash, vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
         let pipes: HashMap<u32, f32> = r.pipes_of(0).collect();
         assert!(pipes.len() > 100 && pipes.len() < 200, "footprint {} pipes", pipes.len());
         for k in 1..=5u32 {
@@ -744,8 +864,9 @@ mod tests {
             hidden,
         ];
         let hash = SpatialHash::build(&sources);
+        let (lo, hi) = box_of(&sources);
         let mut r = Retina::new(63, 35);
-        r.relink(&sources, &hash, vp, Vec3::ZERO, ATTEN_K_DEFAULT);
+        r.relink(&sources, &hash, vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
         for i in 0..3 {
             assert_eq!(r.pipes_of(i).count(), 0, "source {} got pipes", i);
             assert_eq!(r.transmittance(i), 1.0, "source {} τ not defaulted to 1.0", i);
@@ -761,8 +882,9 @@ mod tests {
             src(Vec3::new(0.0, 0.0, -10.0), Vec3::ONE, 40.0), // in front
         ];
         let hash = SpatialHash::build(&sources);
+        let (lo, hi) = box_of(&sources);
         let mut r = Retina::new(63, 35);
-        r.relink(&sources, &hash, vp, Vec3::ZERO, ATTEN_K_DEFAULT);
+        r.relink(&sources, &hash, vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
         assert!(r.transmittance(0) < 0.2, "back τ={}", r.transmittance(0));
         assert!((r.transmittance(1) - 1.0).abs() < 1e-3, "front τ={}", r.transmittance(1));
     }
@@ -774,7 +896,7 @@ mod tests {
         let (lo, hi) = (Vec3::new(-5.0, -5.0, -15.0), Vec3::new(5.0, 5.0, -5.0));
         assert!(r.needs_relink(vp, lo, hi), "fresh retina must relink");
         let sources = vec![src(Vec3::new(0.0, 0.0, -10.0), Vec3::ONE, 1.0)];
-        r.relink(&sources, &SpatialHash::build(&sources), vp, Vec3::ZERO, ATTEN_K_DEFAULT);
+        r.relink(&sources, &SpatialHash::build(&sources), vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
         assert!(!r.needs_relink(vp, lo, hi), "same view must not relink");
         // Tiny nudge: 0.001 cells at distance 10 ≈ 0.002 receptors → no relink
         let nudge = Mat4::from_translation(Vec3::new(0.001, 0.0, 0.0));
