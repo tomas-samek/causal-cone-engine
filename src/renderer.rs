@@ -337,8 +337,10 @@ impl Renderer {
             self.diff_field.retina.dirty = true;
         }
         if self.diff_field.retina.dirty {
-            // write_texture needs bytes_per_row % 256 == 0 (true at 320 wide,
-            // not at every resolution keys 7/8 can produce) → padded rows.
+            // Rows are padded to a 256-byte multiple. `write_texture` does not
+            // require it (only `copy_buffer_to_texture` does), but keeping the
+            // staging rows 256-aligned costs a few bytes at odd resolutions
+            // (keys 7/8) and matches what the driver wants anyway.
             let row_bytes = ((rw * 8 + 255) / 256) * 256;
             let stride = (row_bytes / 2) as usize; // u16 per padded row
             let total = stride * rh as usize;

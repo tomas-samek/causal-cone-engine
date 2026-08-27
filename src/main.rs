@@ -1,10 +1,10 @@
 // Causal Cone Engine — v0.1
 //
-// The observer swims through a persistent diff field.
-// Entities deposit into the field. The field spreads at c (one cell per tick).
-// The observer samples the field to produce each frame.
+// Entities push light along the pipes that connect them, one graph hop per
+// tick. The observer is a receptor array: each frame is the persistent state
+// of what has arrived at it, not a sample of anything cached in space.
 //
-// There are no rays. There are no meshes. There is only the field.
+// There are no rays. There are no meshes. There is only what arrived.
 
 mod field;
 mod observer;

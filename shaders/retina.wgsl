@@ -32,6 +32,7 @@ var retina_nd: texture_2d<f32>;
 @group(1) @binding(2)
 var retina_sampler: sampler;
 
+// keep in sync with src/retina.rs RETINA_ISO
 const RETINA_ISO: f32 = 0.3;
 
 // --- Vertex shader: fullscreen triangle ---
