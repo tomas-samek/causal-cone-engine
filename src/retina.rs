@@ -21,7 +21,20 @@ pub const ATTEN_SAMPLES_PER_CELL: f32 = 1.0;
 pub const ATTEN_THRESHOLD: f32 = 0.6;
 pub const ATTEN_K_DEFAULT: f32 = 0.5;
 pub const MIN_RETINA_DIM: u32 = 20;
-pub const MAX_RETINA_DIM: u32 = 2560;
+pub const MAX_RETINA_DIM: u32 = 1280;
+/// Ceiling on the transient scratch images `arrive` may hold at once. Each
+/// worker chunk owns a full `n_rec × size_of::<Receptor>()` image, so without
+/// a bound the peak grows with the core count *and* the resolution.
+pub const ARRIVE_SCRATCH_BUDGET_BYTES: usize = 64 << 20;
+
+/// How many entity chunks `arrive` splits into: one per worker thread, minus
+/// however many the scratch budget cannot pay for, and never more than there
+/// are entities. Pure so the bound is testable without a retina.
+pub fn arrive_chunks(n_entities: usize, n_rec: usize, threads: usize) -> usize {
+    let per_scratch = n_rec * std::mem::size_of::<Receptor>();
+    let affordable = if per_scratch == 0 { threads } else { ARRIVE_SCRATCH_BUDGET_BYTES / per_scratch };
+    threads.max(1).min(affordable.max(1)).min(n_entities.max(1))
+}
 
 /// One entity's contribution as the retina sees it. Index-aligned with
 /// `DiffField::entities` so pipes and edges can name entities by index.
@@ -458,7 +471,9 @@ impl Retina {
     /// chunk of entities accumulates into a scratch image of its own. The
     /// chunking is by worker thread, not by rayon's adaptive splitting: a
     /// scratch image is the size of the retina, so the number of them (and of
-    /// full-image adds at the end) must not grow with the entity count.
+    /// full-image adds at the end) must not grow with the entity count — and
+    /// `arrive_chunks` caps it again so the peak does not grow with the
+    /// resolution × core count product either.
     pub fn arrive(&mut self, sources: &[Source]) -> usize {
         let n_rec = self.receptors.len();
         let n = sources.len().min(self.pipe_count.len());
@@ -478,10 +493,11 @@ impl Retina {
         let pipe_receptor = &self.pipe_receptor;
         let pipe_weight = &self.pipe_weight;
 
-        // One contiguous entity range per worker thread. The scratch image is
-        // allocated on the range's first delta, so a settled scene allocates
-        // nothing and adds nothing.
-        let chunk_len = n.div_ceil(rayon::current_num_threads().max(1)).max(1);
+        // One contiguous entity range per chunk — one chunk per worker thread,
+        // fewer when a full scratch image each would blow ARRIVE_SCRATCH_BUDGET_BYTES.
+        // The scratch image is allocated on the range's first delta, so a
+        // settled scene allocates nothing and adds nothing.
+        let chunk_len = n.div_ceil(arrive_chunks(n, n_rec, rayon::current_num_threads())).max(1);
         let parts: Vec<(Option<Vec<Receptor>>, usize)> = slices.par_chunks_mut(chunk_len)
             .enumerate()
             .map(|(c, chunk)| {
@@ -673,6 +689,17 @@ mod tests {
     }
 
     #[test]
+    fn eye_is_recovered_from_a_non_origin_view_proj() {
+        // The real scene's camera never sits at the origin: recover an eye
+        // 310 cells out along +Z, looking back at the field center.
+        let want = Vec3::new(256.0, 256.0, 310.0);
+        let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 16.0 / 9.0, 0.1, 2000.0);
+        let view = Mat4::look_at_rh(want, Vec3::new(256.0, 256.0, 256.0), Vec3::Y);
+        let eye = eye_from_view_proj(proj * view);
+        assert!((eye - want).length() < 1e-2, "eye={:?} want={:?}", eye, want);
+    }
+
+    #[test]
     fn point_source_on_axis_links_center_receptor_with_unit_weight() {
         let vp = test_view_proj(63, 35);
         let sources = vec![src(Vec3::new(0.0, 0.0, -10.0), Vec3::ZERO, 1.0)];
@@ -841,6 +868,32 @@ mod tests {
         sources[0].drawable = false; // culled between relinks (e.g. trie depth)
         r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
         assert_receptors_match(&r, &sources, 1e-2);
+    }
+
+    #[test]
+    fn arrive_scratch_stays_inside_the_memory_budget() {
+        let bytes = std::mem::size_of::<Receptor>();
+        assert_eq!(bytes, 32, "Receptor grew — the scratch budget math assumes 32 B");
+        // A 1280×720 retina (the new MAX_RETINA_DIM aspect) is 921_600
+        // receptors ≈ 29.5 MB of scratch each; 64 MB buys two.
+        let n_rec = 1280 * 720;
+        let affordable = ARRIVE_SCRATCH_BUDGET_BYTES / (n_rec * bytes);
+        assert_eq!(affordable, 2);
+        for threads in [1, 2, 4, 22, 128] {
+            let c = arrive_chunks(50_000, n_rec, threads);
+            assert!(c <= affordable, "{} chunks at {} threads exceeds {}", c, threads, affordable);
+            assert!(c >= 1);
+        }
+        // A retina small enough that every worker can afford a scratch gets
+        // one chunk per thread — the bound must not cost parallelism.
+        assert_eq!(arrive_chunks(50_000, (RETINA_W * RETINA_H) as usize, 22), 22);
+        // Never more chunks than entities, and never zero.
+        assert_eq!(arrive_chunks(3, 64, 22), 3);
+        assert_eq!(arrive_chunks(0, 64, 22), 1);
+        // Even a retina too big for a single scratch still gets one chunk.
+        assert_eq!(arrive_chunks(50_000, ARRIVE_SCRATCH_BUDGET_BYTES, 22), 1);
+        // The clamp that keeps it reachable at all.
+        assert_eq!(MAX_RETINA_DIM, 1280);
     }
 
     #[test]
