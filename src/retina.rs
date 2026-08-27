@@ -57,47 +57,55 @@ impl Source {
     }
 }
 
-/// Uniform grid over occluder sources; cell = the widest kernel extent so a
-/// 27-cell neighbourhood always covers every kernel that can reach a point.
+/// Cell edge of the occluder grid, in world cells. Small and fixed: buckets
+/// hold only the occluders that can actually reach the cell.
+pub const HASH_CELL: f32 = 2.0;
+
+/// Uniform grid over occluder sources. Each occluder is inserted into every
+/// cell its kernel extent box overlaps, so a single-cell lookup is exact:
+/// `kernel()` is zero outside `position ± 2·kernel_radii()`, so an occluder
+/// that can reach a point is in that point's cell.
 pub struct SpatialHash {
-    cell: f32,
     map: HashMap<(i32, i32, i32), Vec<usize>>,
 }
 
 impl SpatialHash {
     pub fn build(sources: &[Source]) -> Self {
-        let max_r = sources.iter()
-            .filter(|s| s.occluder)
-            .map(|s| s.kernel_radii().max_element())
-            .fold(1.0f32, f32::max);
-        let cell = max_r * 2.0;
         let mut map: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
         for (i, s) in sources.iter().enumerate() {
             if !s.occluder { continue; }
-            map.entry(Self::key(s.position, cell)).or_default().push(i);
-        }
-        Self { cell, map }
-    }
-
-    fn key(p: Vec3, cell: f32) -> (i32, i32, i32) {
-        ((p.x / cell).floor() as i32, (p.y / cell).floor() as i32, (p.z / cell).floor() as i32)
-    }
-
-    /// Σ opacity·kernel over occluders near `p`, excluding indices in `skip`.
-    pub fn density_at(&self, sources: &[Source], p: Vec3, skip: &[usize]) -> f32 {
-        let (cx, cy, cz) = Self::key(p, self.cell);
-        let mut rho = 0.0f32;
-        for dz in -1..=1_i32 {
-            for dy in -1..=1_i32 {
-                for dx in -1..=1_i32 {
-                    if let Some(bucket) = self.map.get(&(cx + dx, cy + dy, cz + dz)) {
-                        for &j in bucket {
-                            if skip.contains(&j) { continue; }
-                            rho += sources[j].opacity * sources[j].kernel(p);
-                        }
+            // kernel() > 0 requires |(p − position)/radii|² < 4 — i.e. p inside
+            // the box position ± 2·radii.
+            let extent = s.kernel_radii() * 2.0;
+            let lo = Self::key(s.position - extent);
+            let hi = Self::key(s.position + extent);
+            for cz in lo.2..=hi.2 {
+                for cy in lo.1..=hi.1 {
+                    for cx in lo.0..=hi.0 {
+                        map.entry((cx, cy, cz)).or_default().push(i);
                     }
                 }
             }
+        }
+        Self { map }
+    }
+
+    fn key(p: Vec3) -> (i32, i32, i32) {
+        (
+            (p.x / HASH_CELL).floor() as i32,
+            (p.y / HASH_CELL).floor() as i32,
+            (p.z / HASH_CELL).floor() as i32,
+        )
+    }
+
+    /// Σ opacity·kernel over occluders that can reach `p`, excluding indices
+    /// in `skip`. One cell: coverage is exact by how `build` inserts.
+    pub fn density_at(&self, sources: &[Source], p: Vec3, skip: &[usize]) -> f32 {
+        let Some(bucket) = self.map.get(&Self::key(p)) else { return 0.0; };
+        let mut rho = 0.0f32;
+        for &j in bucket {
+            if skip.contains(&j) { continue; }
+            rho += sources[j].opacity * sources[j].kernel(p);
         }
         rho
     }
@@ -148,6 +156,9 @@ impl Receptor {
         self.normal += p.normal;
         self.depth += p.depth;
     }
+    /// Withdraw what a pipe last delivered. Only `relink`'s debug-build check
+    /// that the receptors really are the sum of the pipes uses it.
+    #[cfg(debug_assertions)]
     fn sub(&mut self, p: &PipeState) {
         self.density -= p.density;
         self.color[0] -= p.color[0];
@@ -361,13 +372,18 @@ impl Retina {
         let t0 = std::time::Instant::now();
         let (w, h) = (self.width, self.height);
 
-        // 1. Drop. Receptors are the exact sum of pipe_last, so this lands on
-        //    zero; the explicit reset below only removes float drift.
-        for (k, &rc) in self.pipe_receptor.iter().enumerate() {
-            self.receptors[rc as usize].sub(&self.pipe_last[k]);
+        // 1. Drop every pipe. Receptors are the exact sum of pipe_last, so
+        //    withdrawing all of it lands on zero — which is what the reset
+        //    below writes regardless. So only debug builds pay for the scatter;
+        //    they pay it to check that invariant, which is the whole point.
+        #[cfg(debug_assertions)]
+        {
+            for (k, &rc) in self.pipe_receptor.iter().enumerate() {
+                self.receptors[rc as usize].sub(&self.pipe_last[k]);
+            }
+            debug_assert!(self.receptors.iter().all(|r| r.density.abs() < 1e-2),
+                "receptors not zero after dropping all pipes");
         }
-        debug_assert!(self.receptors.iter().all(|r| r.density.abs() < 1e-2),
-            "receptors not zero after dropping all pipes");
         for r in &mut self.receptors { *r = Receptor::default(); }
 
         // 2–3. Project footprints.
@@ -438,8 +454,11 @@ impl Retina {
     }
 
     /// Phase 3′: every pipe sends `new − last` if it exceeds DELTA_EPS.
-    /// Parallel over entities; receptors are shared by many entities, so each
-    /// rayon split accumulates into a scratch image that is reduced at the end.
+    /// Parallel over entities; receptors are shared by many entities, so a
+    /// chunk of entities accumulates into a scratch image of its own. The
+    /// chunking is by worker thread, not by rayon's adaptive splitting: a
+    /// scratch image is the size of the retina, so the number of them (and of
+    /// full-image adds at the end) must not grow with the entity count.
     pub fn arrive(&mut self, sources: &[Source]) -> usize {
         let n_rec = self.receptors.len();
         let n = sources.len().min(self.pipe_count.len());
@@ -459,36 +478,49 @@ impl Retina {
         let pipe_receptor = &self.pipe_receptor;
         let pipe_weight = &self.pipe_weight;
 
-        let (scratch, sent) = slices.into_par_iter().enumerate()
-            .fold(
-                || (vec![Receptor::default(); n_rec], 0usize),
-                |(mut acc, mut sent), (i, last)| {
+        // One contiguous entity range per worker thread. The scratch image is
+        // allocated on the range's first delta, so a settled scene allocates
+        // nothing and adds nothing.
+        let chunk_len = n.div_ceil(rayon::current_num_threads().max(1)).max(1);
+        let parts: Vec<(Option<Vec<Receptor>>, usize)> = slices.par_chunks_mut(chunk_len)
+            .enumerate()
+            .map(|(c, chunk)| {
+                let mut scratch: Option<Vec<Receptor>> = None;
+                let mut sent = 0usize;
+                for (off_i, last) in chunk.iter_mut().enumerate() {
+                    let i = c * chunk_len + off_i;
                     let start = pipe_start[i] as usize;
                     for (off, l) in last.iter_mut().enumerate() {
                         let k = start + off;
                         let new = contribs[i].scaled(pipe_weight[k]);
                         let delta = new.minus(l);
                         if delta.max_abs() > DELTA_EPS {
+                            let acc = scratch.get_or_insert_with(|| vec![Receptor::default(); n_rec]);
                             acc[pipe_receptor[k] as usize].add(&delta);
                             *l = new;
                             sent += 1;
                         }
                     }
-                    (acc, sent)
-                },
-            )
-            .reduce(
-                || (vec![Receptor::default(); n_rec], 0usize),
-                |(mut a, sa), (b, sb)| {
-                    for (x, y) in a.iter_mut().zip(&b) { x.add_receptor(y); }
-                    (a, sa + sb)
-                },
-            );
+                }
+                (scratch, sent)
+            })
+            .collect();
 
-        if sent > 0 {
-            for (r, s) in self.receptors.iter_mut().zip(&scratch) { r.add_receptor(s); }
-            self.dirty = true;
+        // Merge the ≤k scratches into the image, split by receptor range so
+        // every thread owns disjoint receptors — the adds are the same, and in
+        // the same order per receptor, as adding the scratches one by one.
+        let sent: usize = parts.iter().map(|(_, s)| *s).sum();
+        let scratches: Vec<&[Receptor]> = parts.iter().filter_map(|(s, _)| s.as_deref()).collect();
+        if !scratches.is_empty() {
+            let rec_chunk = n_rec.div_ceil(rayon::current_num_threads().max(1)).max(1);
+            self.receptors.par_chunks_mut(rec_chunk).enumerate().for_each(|(c, dst)| {
+                let (base, len) = (c * rec_chunk, dst.len());
+                for s in &scratches {
+                    for (r, x) in dst.iter_mut().zip(&s[base..base + len]) { r.add_receptor(x); }
+                }
+            });
         }
+        if sent > 0 { self.dirty = true; }
         self.stats.pipes_sent = sent;
         sent
     }
@@ -602,6 +634,19 @@ mod tests {
         assert!((t_skip - 1.0).abs() < 1e-6);
         let t_block = segment_transmittance(&sources, &hash, a.position, b.position, &[], 0.5);
         assert!(t_block < 0.1);
+    }
+
+    #[test]
+    fn spatial_hash_covers_the_whole_kernel_extent_of_a_big_source() {
+        // Radii 8 → the kernel is non-zero out to |d| = 2·8 = 16 cells.
+        let sources = vec![src(Vec3::ZERO, Vec3::splat(8.0), 3.0)];
+        let hash = SpatialHash::build(&sources);
+        // e = (15/8)² ≈ 3.52 < 4 → inside the extent, must be found.
+        let inside = hash.density_at(&sources, Vec3::new(15.0, 0.0, 0.0), &[]);
+        assert!(inside > 0.0, "big-radius source missed inside its extent: {}", inside);
+        assert!((inside - 3.0 * sources[0].kernel(Vec3::new(15.0, 0.0, 0.0))).abs() < 1e-6);
+        // e = (17/8)² ≈ 4.52 ≥ 4 → past the cutoff, exactly zero.
+        assert_eq!(hash.density_at(&sources, Vec3::new(17.0, 0.0, 0.0), &[]), 0.0);
     }
 
     #[test]

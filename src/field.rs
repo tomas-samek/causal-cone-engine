@@ -2085,6 +2085,83 @@ mod tests {
             "frozen scene still sends {} of {} pipes", s.pipes_sent, s.pipes_total);
     }
 
+    /// A tick must fit in a frame. The bounds are several times what a tick
+    /// actually costs, so this fires on a real regression, not on a slow
+    /// machine. Three costs on three schedules, so three bounds: a plain tick,
+    /// a tick that relinks the retina, and a tick that also rebuilds the
+    /// walker's cross links (link graph + edge attenuation — not the retina's
+    /// work, but it lands in the same frame).
+    ///
+    /// The whole ignored suite runs its tests in parallel over one rayon pool,
+    /// so a sample here can be two thirds contention. Cost is what the fastest
+    /// sample shows; the rest is other tests. So the budgets are judged on the
+    /// best of several samples, and every sample is printed.
+    #[test]
+    #[ignore] // builds the full demo scene (slow) — run: cargo test --release -- --ignored
+    fn tick_stays_inside_the_frame_budget() {
+        const STEADY_BUDGET_MS: f64 = 40.0;
+        const RELINK_BUDGET_MS: f64 = 60.0;
+        const REFRESH_BUDGET_MS: f64 = 150.0;
+
+        let mut field = DiffField::new();
+        let vp = test_view_proj();
+        let mut worst = 0.0f64;
+        let mut best = f64::MAX;
+        let mut sum = 0.0f64;
+        let mut steady = 0u32;
+        for i in 0..12 {
+            let relinks_before = field.retina.stats.relinks;
+            let refresh_before = field.last_refresh_tick;
+            let t0 = std::time::Instant::now();
+            field.tick(vp);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let s = field.retina.stats;
+            let relinked = s.relinks > relinks_before;
+            let refreshed = field.last_refresh_tick != refresh_before;
+            eprintln!("tick {:2}: {:7.2} ms  ({}{}relink {:.2} ms, {} of {} pipes sent)",
+                i, ms,
+                if relinked { "RELINK, " } else { "" },
+                if refreshed { "CROSS-LINK REFRESH, " } else { "" },
+                s.relink_ms, s.pipes_sent, s.pipes_total);
+            if relinked || refreshed {
+                assert!(ms < REFRESH_BUDGET_MS,
+                    "tick {} (relink/refresh) {:.2} ms exceeds the {:.0} ms budget", i, ms, REFRESH_BUDGET_MS);
+                continue;
+            }
+            worst = worst.max(ms);
+            best = best.min(ms);
+            sum += ms;
+            steady += 1;
+        }
+        assert!(steady >= 8, "only {} of 12 ticks were steady — nothing was measured", steady);
+        eprintln!("steady state over {} ticks: best {:.2} ms, mean {:.2} ms, worst {:.2} ms",
+            steady, best, sum / steady as f64, worst);
+        assert!(best < STEADY_BUDGET_MS,
+            "fastest steady-state tick {:.2} ms exceeds the {:.0} ms budget", best, STEADY_BUDGET_MS);
+
+        let mut best_relink = f64::MAX;
+        for _ in 0..3 {
+            let relinks_before = field.retina.stats.relinks;
+            let refresh_before = field.last_refresh_tick;
+            field.retina_force_relink = true;
+            let t0 = std::time::Instant::now();
+            field.tick(vp);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            assert!(field.retina.stats.relinks > relinks_before, "forced relink did not fire");
+            eprintln!("forced relink tick: {:.2} ms (retina relink {:.2} ms)", ms, field.retina.stats.relink_ms);
+            // A cross-link refresh may land on this tick too — that sample is
+            // measuring something else, so it only has to clear that budget.
+            if field.last_refresh_tick != refresh_before {
+                assert!(ms < REFRESH_BUDGET_MS,
+                    "forced-relink + refresh tick {:.2} ms exceeds the {:.0} ms budget", ms, REFRESH_BUDGET_MS);
+                continue;
+            }
+            best_relink = best_relink.min(ms);
+        }
+        assert!(best_relink < RELINK_BUDGET_MS,
+            "fastest forced-relink tick {:.2} ms exceeds the {:.0} ms budget", best_relink, RELINK_BUDGET_MS);
+    }
+
     #[test]
     #[ignore] // builds the full demo scene (slow) — run: cargo test --release -- --ignored
     fn long_edges_are_attenuated_short_edges_are_not() {
