@@ -109,8 +109,8 @@ pub struct Entity {
     pub prev_incoming_density: f32,
     /// Debounce: consecutive ticks with stable incoming (skip when >= edge_count)
     pub stable_ticks: u8,
-    /// Anisotropic deposit extent (rx, ry, rz). When non-zero, Phase 3 uses gaussian
-    /// deposit with these radii instead of the tent kernel.
+    /// Anisotropic gaussian kernel radii for the retina footprint and for
+    /// transmittance; ZERO = point source (unit radii).
     pub deposit_radii: glam::Vec3,
     /// Member of the rigid walker group (the dino) — moved by WalkController,
     /// never by per-entity velocity/bounce.
@@ -1480,7 +1480,7 @@ impl DiffField {
     /// floor-contrast probe. Answers "what reaches the receptors?" and
     /// "does the ground under the dino get lit differently from far away?".
     pub fn dump_field_stats(&self) {
-        self.retina.log_stats();
+        self.retina.log_stats(&self.sources);
 
         // Floor contrast probe: tiles under the walker footprint vs far tiles
         let mut wmin = glam::Vec3::splat(FIELD_SIZE as f32);

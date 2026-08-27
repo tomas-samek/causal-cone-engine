@@ -202,7 +202,7 @@ pub fn segment_transmittance(
 }
 
 /// Persistent state of one image-plane cell. Sums, never averages: the
-/// shader divides by density. Never decays; only deltas ever touch it.
+/// renderer divides by density at upload. Never decays; only deltas touch it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Receptor {
     pub density: f32,
@@ -397,6 +397,9 @@ impl Retina {
         *self = Retina::new(width, height);
     }
 
+    /// Test/diagnostic API: the retina itself never reads its pipes back, but
+    /// `log_stats`' debug self-check and the exactness tests do.
+    #[allow(dead_code)]
     pub fn pipes_of(&self, i: usize) -> impl Iterator<Item = (u32, f32)> + '_ {
         let (start, count) = if i < self.pipe_start.len() {
             (self.pipe_start[i] as usize, self.pipe_count[i] as usize)
@@ -404,10 +407,14 @@ impl Retina {
         (start..start + count).map(move |k| (self.pipe_receptor[k], self.pipe_weight[k]))
     }
 
+    /// Test/diagnostic API.
+    #[allow(dead_code)]
     pub fn transmittance(&self, i: usize) -> f32 {
         self.entity_trans.get(i).copied().unwrap_or(1.0)
     }
 
+    /// Test/diagnostic API.
+    #[allow(dead_code)]
     pub fn depth_of(&self, i: usize) -> f32 {
         self.entity_depth.get(i).copied().unwrap_or(0.0)
     }
@@ -633,6 +640,7 @@ impl Retina {
 
     /// Reference image: Σ over pipes of contribution·weight, from scratch.
     /// The incremental receptors must equal this (up to DELTA_EPS per pipe).
+    #[allow(dead_code)] // test/diagnostic API — release builds skip the self-check
     pub fn direct_sum(&self, sources: &[Source]) -> Vec<Receptor> {
         let mut out = vec![Receptor::default(); self.receptors.len()];
         for i in 0..sources.len().min(self.pipe_count.len()) {
@@ -644,7 +652,7 @@ impl Retina {
         out
     }
 
-    pub fn log_stats(&self) {
+    pub fn log_stats(&self, sources: &[Source]) {
         let above = self.receptors.iter().filter(|r| r.density >= RETINA_ISO).count();
         let max_d = self.receptors.iter().map(|r| r.density).fold(0.0f32, f32::max);
         log::info!(
@@ -654,6 +662,26 @@ impl Retina {
             self.stats.pipes_total, self.stats.pipes_sent, self.stats.mean_trans,
             self.stats.relinks, self.stats.relink_ms,
         );
+
+        // The incremental image is only ever as good as the claim that it
+        // equals the sum of the pipes. Debug builds check it against the
+        // from-scratch reference whenever the diagnostics key is pressed;
+        // anything past a pipe's worth of DELTA_EPS means deltas have drifted.
+        #[cfg(debug_assertions)]
+        {
+            let want = self.direct_sum(sources);
+            let dev = self.receptors.iter().zip(&want)
+                .map(|(got, want)| {
+                    (got.density - want.density).abs()
+                        .max((0..3).map(|c| (got.color[c] - want.color[c]).abs()).fold(0.0, f32::max))
+                        .max((got.normal - want.normal).abs().max_element())
+                        .max((got.depth - want.depth).abs())
+                })
+                .fold(0.0f32, f32::max);
+            log::info!("Retina self-check: max |receptor − direct_sum| = {:.2e}", dev);
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = sources;
     }
 }
 
@@ -1003,6 +1031,9 @@ mod tests {
             assert_receptors_match(&r, &sources, 1e-2);
         }
         assert_eq!(r.stats.relinks, 1, "static view must link exactly once");
+        // Smoke the diagnostics path, including the debug-only self-check that
+        // recomputes direct_sum — it must not panic or index out of range.
+        r.log_stats(&sources);
     }
 
     #[test]
