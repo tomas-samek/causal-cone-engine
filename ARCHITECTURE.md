@@ -5,43 +5,60 @@
 
 ## Core Principle
 
-There are no rays cast into a scene, no triangle meshes, and no scene graph.
-There is a **dense 3D field** of accumulated deposits and an **observer** moving
-through it. Each frame samples the field; what you see is what has already been
-deposited along your line of sight.
+There are no rays cast into a scene, no triangle meshes, no scene graph, and
+nothing cached in space. Light is **delivered**, never gathered.
 
 Two things hold the world:
 
-- **The grid** — a dense `512³` array of `FieldCell { density, r, g, b }`
-  (~134M cells, ~2 GB at f32). This is the observer's *retina*: the only thing
-  the GPU ever reads. It is regenerated, not persisted, each tick.
 - **The entity graph** — entities (nodes) connected by directed edges (pipes).
-  Light does **not** diffuse cell-to-cell through the grid; it flows along the
-  graph between entities. The grid only ever receives the *result* of that flow.
+  Light flows along the graph between entities, one hop per tick. Occlusion
+  is *dimming along a pipe* by a transmittance `τ`, never a visibility test.
+- **The retina** — a persistent `W×H` array of receptors on the image plane
+  (`retina.rs`, default 320×180). Receptors are the observer's *state*, not a
+  snapshot: each is the running sum of what entities have delivered to it. It
+  never decays and is never rebuilt per frame — only deltas ever touch it.
 
 ```
 Entity --emits/relays--> EdgeDeposit on pipe --delivered--> neighbour Entity
-Entity --deposits color--> grid cell   (only what the observer can see)
-Observer --marches--> grid cell        (one iso-surface hit per pixel)
+Entity --sends (new − last)--> receptor pipe --accumulates--> Receptor
+Observer --reads--> Receptor            (no march; the pixel is already there)
 ```
 
 ## Data Model
 
-### FieldCell (`field.rs`)
+### Receptor (`retina.rs`)
 ```rust
-struct FieldCell { density: f32, color_r: f32, color_g: f32, color_b: f32 }
+struct Receptor { density: f32, color: [f32; 3], normal: Vec3, depth: f32 }
 ```
-A flat `Vec<FieldCell>` of length `512³`. Uploaded to the GPU as an
-`Rgba16Float` 3D texture (density in R, color in GBA).
+`W×H` of them. They **sum, never average**; the renderer divides color and depth
+by density on upload, so the shader reads them already normalized. Because each
+pipe remembers what it last sent (`pipe_last`), the sum is exactly reversible:
+relinking subtracts every pipe's last contribution and lands the array on zero
+before rebuilding.
+
+### Source (`retina.rs`)
+One entity's contribution as the retina sees it, rebuilt each tick and index-
+aligned with `DiffField::entities`: `position`, `radii` (the anisotropic
+gaussian kernel), `normal`, `opacity` (static density, used for transmittance),
+`density` + `color` (what it delivers this tick), and two independent flags —
+`drawable` (gets pipes: solid, in frustum, not depth-culled) and `occluder`
+(dims segments: solid, in or out of frustum).
+
+### Pipes — structure-of-arrays (`retina.rs`)
+Entity → receptor links, one contiguous slice per entity: `pipe_start` /
+`pipe_count` index into `pipe_receptor` (which receptor), `pipe_weight` (the
+projected gaussian's feathered weight there), and `pipe_last` (what this pipe
+last delivered). Per entity, `entity_trans` holds `τ` toward the eye and
+`entity_depth` the eye distance at the last relink.
 
 ### Entity (`field.rs`)
 A point that participates in light transport. Key fields:
 - `position`, `velocity`, `color`, `deposit_magnitude`
 - `pass_through` — fraction of incoming light that continues through it
 - `reemit` — fraction of absorbed light re-emitted as its own color
-- `scatter` / `base_scatter` — atmosphere: fraction bled into the grid
+- `scatter` / `base_scatter` — marks a relay as part of the atmosphere column
 - `is_heat` — interior entity whose light can't escape the absorbing skin;
-  conducts through the graph but never deposits to the grid
+  conducts through the graph but never becomes a drawable source
 - `is_vacuum` — invisible relay (sun, atmosphere) that moves light but isn't drawn
 - `specular`, oscillation params (for slow skin-texture shimmer), `deposit_radii`
 - `edge_start` / `edge_count` — slice into the SoA edge arrays
@@ -51,8 +68,12 @@ A point that participates in light transport. Key fields:
 Edges are stored as parallel flat arrays for cache-friendly iteration, not as
 per-entity `Vec`s:
 `edge_targets`, `edge_deposits` (the `EdgeDeposit` in each pipe), `edge_gammas`
-(per-edge conductance weight), `edge_dirs` (normalized source→target). A reverse
-index (`reverse_*`) lets a target find its incoming edges.
+(per-edge conductance weight), `edge_dirs` (normalized source→target), and
+`edge_atten` — per-edge transmittance `τ ∈ [0,1]`, the fraction of light that
+survives the density between the two endpoints. Only **radiation** edges (longer
+than `link_connect_dist`) are attenuated; connection edges stay at `1.0`. A
+segment buried in a metaball core underflows to exactly `0` — a fully opaque
+pipe. A reverse index (`reverse_*`) lets a target find its incoming edges.
 
 ### Consumption trie (`consumption.rs`)
 A separate, optional learning layer running parallel to the body entities:
@@ -75,45 +96,53 @@ the "causal cone": chains that don't feed a visible pixel are skipped.
 | Phase | What happens |
 |-------|--------------|
 | **Cross-link refresh** | When the walker (dino) has drifted ≥1 cell since links were last built, walker↔world connection and radiation edges are re-searched and the SoA edge arrays repacked; internal edges and their in-flight deposits are preserved. |
-| **Active set** | `compute_active_set` extracts frustum planes (Gribb–Hartmann) and marks each entity `active` (participates in transport) and `visible` (deposits to grid). Emitters like the sun are always active; heat entities never are. |
+| **Active set** | `compute_active_set` extracts frustum planes (Gribb–Hartmann) and marks each entity `active` (participates in transport) and `visible` (may become a drawable source). Emitters like the sun are always active; heat entities never are. |
 | **Atmosphere modulation** | Vacuum relay entities' `scatter`/`magnitude` are modulated by distance from the current geometry AABB center, so the atmosphere column follows the subject. |
-| **Phase 0 — decay** | Cells inside the AABB are multiplied by 0.85 (tiny values cleared); slabs outside the AABB are cleared. Only *dirty* slabs are touched. |
 | **Phase 1 — deliver** | Each edge's `EdgeDeposit` is pushed into its target's accumulator (active targets only). Targets apply incoming, compute incoming direction, update a debounce counter, and build re-emission energy. |
 | **Consumption** | Each body entity's incoming is tokenized and run through `cascade_process` (consume / reject / seed / promote). |
-| **Phase 2 — push** | Each active, non-debounced entity rewrites its outgoing edge deposits = own emission + pass-through of incoming, weighted by `edge_gamma × distance_factor`, with optional directional bias for vacuum relays. Parallelized with `rayon` (each entity owns a disjoint edge range). |
-| **Phase 3 — deposit** | The walker group (dino) translates rigidly by `speed × time_lapse` and paces ±6 cells along Z; other entities move by velocity (and bounce off bounds). Heat and too-deep entities are skipped; vacuum entities scatter into the grid; visible solids deposit color/density into cells. Dirty slabs and the new AABB are recorded. |
+| **Phase 2 — push** | Each active, non-debounced entity rewrites its outgoing edge deposits = own emission + pass-through of incoming, weighted by `edge_gamma × distance_factor × edge_atten`, with optional directional bias for vacuum relays. Weights are then **renormalized** to sum to 1 — see the shadow note below. Parallelized with `rayon` (each entity owns a disjoint edge range). |
+| **Advance entities** | The walker group (dino) translates rigidly by `speed × time_lapse` and paces ±6 cells along Z; other entities move by velocity (and bounce off `FIELD_SIZE`). Each solid becomes a `Source` with its animated position, boosted density/color, and `drawable` flag, and the geometry AABB is recomputed. |
+| **Relink** (conditional) | If the cross-links refreshed, a tuning key fired, or the AABB's projected corners moved ≥ `RELINK_SHIFT` (½ receptor), the retina drops every pipe (subtracting what it last sent, landing on exactly zero), re-projects every drawable source's gaussian footprint into image space, and recomputes `τ` toward the eye. This is the expensive step, and it runs only when the picture's geometry actually moved. |
+| **Phase 3′ — arrive** | Every pipe sends `new − last`, and only if that delta exceeds `DELTA_EPS`. A settled scene sends nothing. Parallel over entities into per-split scratch images, reduced at the end. |
+
+Two asymmetries in **Advance entities** are deliberate: `oscillation_phase`
+advances for *every* solid, in frustum or not, so skin texture doesn't jump when
+an entity re-enters view; and the AABB spans every solid including depth-culled
+ones, so the atmosphere column and the relink trigger track the geometry rather
+than the render cutoff.
 
 ## GPU Upload (`renderer.rs`)
 
-Only what changed crosses the bus. When the tick advances, for each **dirty
-slab** the renderer converts the AABB sub-rectangle of `FieldCell`s from f32 to
-`f16` and `write_texture`s just that sub-region into the 3D texture. Empty space
-and unchanged slabs cost nothing.
+Two `W×H` `Rgba16Float` textures — `dc` = (density, r, g, b) and `nd` =
+(nx, ny, nz, depth) — uploaded **whole**, and only when the retina is `dirty`
+(some delta arrived since the last upload). Color and depth are divided by
+density here, on the CPU, and converted f32 → f16. At 320×180 each texture is
+~450 KB — there is no sub-region bookkeeping because nothing is large enough to
+need it.
 
-## GPU Render (`shaders/field_sample.wgsl`)
+## GPU Render (`shaders/retina.wgsl`)
 
 A single fullscreen triangle; all the work is in the fragment shader. Present
-mode is uncapped (`AutoNoVsync`).
+mode is uncapped (`AutoNoVsync`). **No marching** — the receptor under the pixel
+already holds the answer.
 
 ```
 For each pixel:
-  reconstruct world ray from inv_view_proj
-  ray ∩ AABB (slab test) ───────────── miss → sky background
-  march with growing step (0.5 × 1.02^i, ≤192 steps, clipped to AABB/200)
-    first sample with density ≥ iso (0.3)?
-      └─ 12-iteration bisection → sub-voxel iso crossing (crisp silhouette)
-         shade surface:
-           normal = density gradient (central differences)
-           if creature (green): procedural reptile skin
-             - Voronoi scales at two frequencies + normal perturbation
-             - fbm mottling, dorsal stripe, warm belly tint
-           Lambert diffuse + ambient floor + rim + specular (fixed sun_dir)
+  sample dc/nd at the pixel's receptor
+  density < RETINA_ISO (0.3)? ──────── sky background
+  else:
+    color = dc.gba, normal = normalize(nd.xyz), depth = nd.w (pre-divided)
+    if creature (green): procedural reptile skin
+      - Voronoi scales at two frequencies + normal perturbation
+      - fbm mottling, dorsal stripe, warm belly tint
+    Lambert diffuse + ambient floor + rim + specular (fixed sun_dir)
   composite over sky gradient (zenith/horizon/ground + sun glow)
   velocity vignette → ACES tone map → gamma
 ```
 
-The iso-surface is found by **bisection**, not fog/alpha accumulation, so the
-silhouette stays sharp and halo-free — sub-`iso` Gaussian tails are never drawn.
+The silhouette is a **threshold on arrived density**, so it stays sharp and
+halo-free: sub-`iso` gaussian tails are never drawn. `RETINA_ISO` is duplicated
+in `retina.rs` and `retina.wgsl` and must be kept in sync.
 
 ## Observer (`observer.rs`)
 
@@ -125,7 +154,7 @@ darkens screen edges at speed — fewer diffs reach you per tick the faster you 
 ## Time-Lapse World Clock (`walker.rs`)
 
 Two clocks are separated. A **sim step** is the 30 Hz wall-clock unit: one
-graph hop of light, one decay + deposit pass. A **world tick** is the physics
+graph hop of light, one arrival at the retina. A **world tick** is the physics
 unit where c = 1 cell/tick. Each sim step advances `time_lapse` world-ticks
 (default ×100,000, keys `-`/`=`, clamped to [1, 2²⁰]).
 
@@ -151,9 +180,31 @@ re-emit ~30% as color via radiation links. Entities fully enclosed by opaque
 neighbors are turned to **heat** (conduct through the graph, never drawn).
 
 The scene is lit by a **sun disc** of vacuum emitters pushing light through the
-graph, wrapped in an **atmosphere** column of vacuum relays that scatter a little
-blue light into the grid, and stands on a **40×40 dirt/grass floor** beside a
-rock. The sky and sun glow are procedural background in the fragment shader.
+graph, wrapped in an **atmosphere** column of vacuum relays that carries it down
+to the subject, and stands on a **40×40 dirt/grass floor** beside a rock. The sky
+and sun glow are procedural background in the fragment shader.
+
+### On the shadow
+
+Two different transmittances exist, and only one of them is doing visible work.
+
+The retina's per-entity `τ` (density between an entity and the *eye*) is what
+makes the dino occlude what is behind it — that works, and it is what keys
+`5`/`6` tune.
+
+`edge_atten` is the other one, and in this scene it does **not** produce a floor
+shadow. Only radiation edges (longer than `link_connect_dist`) carry it;
+connection edges are exempt at `τ = 1`, and the sun→atmosphere→floor path is
+made entirely of connection edges, because radiation links are never built to or
+from vacuum relays. At the current constants `τ` is also effectively binary: of
+~111k directed edges, only a few dozen are attenuated at all, and those go to
+zero. Worse, Phase 2 renormalizes each emitter's pipe weights *after* applying
+`τ`, so a blocked pipe's energy is redistributed to that emitter's other pipes
+instead of being absorbed — the result is a relative deficit between one
+entity's outgoing pipes, not light removed from the scene. Making the shadow
+real needs absorption instead of renormalization, and node transmittance for
+vacuum relays sitting inside solid density; both are on the
+[roadmap](ROADMAP.md).
 
 ## Theoretical Basis
 

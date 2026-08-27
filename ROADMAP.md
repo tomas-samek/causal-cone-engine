@@ -67,21 +67,30 @@
 - Iso-surface bisection march: replaced fog/alpha compositing with first-crossing detection at `iso = 0.3` plus 12-step bisection — crisp, halo-free silhouettes (sub-`iso` Gaussian tails are never drawn).
 - Procedural reptile skin: two-frequency Voronoi scales with normal perturbation, fbm mottling, dorsal stripe, warm belly tint, and a waxy specular sheen.
 
-## v0.8: Multiple objects interacting
+## v0.8: Receptor retina (the grid is gone) ✅
+- Receptor retina (`retina.rs`): the observer is a persistent `W×H` array of receptors on the image plane, each the running sum of what entities delivered along entity→receptor pipes. Sums, never averages — the renderer divides by density on upload.
+- Delta pipes: each pipe remembers what it last sent and transmits only `new − last` above `DELTA_EPS`. A settled scene sends almost nothing; the sum stays exactly reversible, so a relink can subtract every pipe and land on zero.
+- Relink on movement only: pipes are rebuilt when the scene AABB's projected corners shift ≥ ½ receptor, the cross-links refresh, or a tuning key fires — not per frame.
+- Occlusion as transmittance: `segment_transmittance` integrates `exp(−k·∫max(0, ρ−threshold))` through the gaussian density along a segment. Used both per entity toward the eye and per radiation edge (`edge_atten`). Replaced the old binary line-of-sight test.
+- Display shader (`shaders/retina.wgsl`): threshold at `RETINA_ISO`, shade with the arrived normal, composite over the procedural sky — no ray march, no 3D texture.
+- Live tuning keys: `H` stats dump, `1`/`2` density, `3`/`4` color, `5`/`6` occlusion strength, `7`/`8` receptor resolution.
+- Deleted: the `512³` `FieldCell` grid (~2 GB), Phase 0 decay, the Phase 3 voxel deposit, dirty-slab uploads, and `shaders/field_sample.wgsl`.
+
+## v0.9: Multiple objects interacting
 - Multiple independent entity groups
 - Inter-object interaction rules
 - Leverages hierarchical entities from v0.3
 
-## v0.9: Sound propagation
+## v0.10: Sound propagation
 - Field carries additional signal types beyond light
 - Acoustic wave simulation through entity graph
 
-## v0.10: Water/reflection
+## v0.11: Water/reflection
 - Reflective surface simulation
 - Extends specular material properties
 - Dynamic reflection via field re-emission
 
-## v0.11: Scene scale (landscape, multiple creatures)
+## v0.12: Scene scale (landscape, multiple creatures)
 - Larger worlds beyond 512³
 - Hierarchical or streaming field
 - Multiple animated creatures
@@ -94,5 +103,8 @@
 ---
 
 ## Future improvements (deferred)
-- **Observer-dependent resolution (LOD)**: Multi-resolution field varying with observer distance. Closer = finer grid, far = coarser. Causal cone driven LOD. May be needed if scene complexity outgrows 512³.
+- **Real shadow**: `edge_atten` currently dims a pipe and then Phase 2 renormalizes the emitter's weights, so the blocked energy is rerouted to its other pipes rather than absorbed — a relative deficit, not a missing photon. Absorb instead of renormalizing, and/or give vacuum relays a node transmittance so an atmosphere entity sitting inside solid density passes less on. Today's sun→atmosphere→floor path is all connection edges (`τ = 1`), so it is untouched by attenuation; see the shadow note in [ARCHITECTURE.md](ARCHITECTURE.md).
+- **Per-pipe transmittance (retina Approach 2)**: `τ` is currently one value per entity toward the eye, so a partially occluded entity dims uniformly across its whole footprint. Computing `τ` per entity→receptor pipe would let a silhouette edge cut through a single source.
+- **Hierarchical receptors (Approach 3)**: a receptor pyramid so distant or low-contrast regions link at a coarser level and only the busy parts of the image pay full pipe count — the relink cost is what bounds scene size today.
+- **Observer-dependent resolution (LOD)**: entity detail varying with observer distance — near groups resolved finely, distant ones merged into a single source. Causal-cone driven LOD; largely subsumed by hierarchical receptors above.
 - **Distance-based debounce**: Entities closer to observer use stricter debounce thresholds (update more often), distant entities debounce more aggressively.

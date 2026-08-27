@@ -2,12 +2,12 @@
 
 > A personal pet project — an experimental renderer, built for fun and exploration.
 
-A rendering engine where the observer swims through a persistent diff field.
+A rendering engine where light is delivered, not gathered.
 
 There are no rays. There are no meshes. There are no lights.
-Entities deposit diffs into a 3D field and propagate them along a graph of
-connections. The observer moves through the field, reading what's there.
-What you see is what has already arrived.
+Entities push light along a graph of connections, one hop per tick, and the
+observer is a **receptor array** on the image plane that those same pipes feed.
+What you see is what has already arrived at it.
 
 ## Build & Run
 
@@ -32,33 +32,41 @@ First build will take a while (downloading + compiling wgpu). Subsequent builds 
 | I | Dump trie / entity info to the log |
 | `[` / `]` | Decrease / increase render-depth cutoff (progressive rendering by trie depth) |
 | `-` / `=` | Halve / double the time-lapse factor (×1 = literal real-time 1e-6 c) |
+| H | Dump retina + floor-probe stats to the log |
+| `1` / `2` | Halve / double density tuning |
+| `3` / `4` | Halve / double color tuning |
+| `5` / `6` | Halve / double occlusion strength (`atten_k`) |
+| `7` / `8` | Halve / double receptor resolution |
 
 ## What You're Seeing
 
-The screen is produced by sampling the diff field from the observer's position.
-For each pixel, the fragment shader marches a direction into a 3D texture and
-bisects to the iso-surface — the first deposit dense enough to count as solid.
+The screen **is** the receptor array. Each receptor holds a running sum of what
+entities delivered to it along their pipes, attenuated by the density sitting
+between the entity and the eye. Nothing is sampled, marched, or looked up: the
+image is already there when the frame starts, and the fragment shader only
+thresholds it, shades it with the normal that arrived, and composites it over a
+procedural sky.
 
-- **Bright regions**: Dense deposits from entities
-- **Dark regions**: Empty field (vacuum)
-- **Color**: Derived from entity properties and accumulated light
-- **Depth**: March distance before hitting a deposit (lag)
-- **Vignette at speed**: Moving fast narrows your effective field of view
+- **Bright regions**: receptors many entities reached
+- **Dark regions**: receptors nothing reached, or whose pipes are dimmed
+- **Color**: entity color and re-emitted light, density-weighted per receptor
+- **Depth**: density-weighted eye distance of what arrived
+- **Vignette at speed**: moving fast narrows your effective field of view
 
 ## Architecture
 
 ```
 CPU (30 ticks/sec):
-  Entities deposit → light propagates along connection graph →
-  field updates → dirty slabs uploaded (f32 → f16) to the GPU 3D texture
+  Entities push light along the connection graph → each drawable entity
+  sends its change since last tick down its pipes → receptors accumulate
 
 GPU (uncapped):
-  For each pixel → march into the 3D texture → bisect to iso-surface → shade
+  Upload two W×H receptor textures (f32 → f16) → threshold, shade, composite
 ```
 
-The field is a **512³** grid (~134M cells). Uploads are restricted to dirty
-slabs within the active geometry's AABB and converted to `Rgba16Float`, so only
-what actually changed crosses the bus each tick.
+Pipes carry **deltas**: an entity whose contribution hasn't changed sends
+nothing, so a still scene costs almost no traffic. They are relinked only when
+the view or the geometry has shifted by half a receptor.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the fuller design.
 
@@ -66,8 +74,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the fuller design.
 
 A dinosaur whose body is a *skeleton* of overlapping metaball entities — body,
 belly, tail, neck, head, jaw, mouth, yellow eyes, legs and feet, plus midpoints
-at the joints — each depositing a wide anisotropic gaussian blob that merges into
-seamless geometry, wrapped in a procedural reptile-skin texture. A separate
+at the joints — each carrying a wide anisotropic gaussian kernel, projected onto
+the retina so the overlapping blobs merge into seamless geometry, wrapped in a
+procedural reptile-skin texture. A separate
 lightweight receptor shell on the surface catches light and re-emits it as color.
 It paces slowly back and forth on a 40×40 dirt/grass floor beside a rock —
 moving at a true 1e-6 c, rendered visible through a ×100,000 time-lapse
