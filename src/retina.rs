@@ -15,7 +15,10 @@ pub const RETINA_W: u32 = 320;
 pub const RETINA_H: u32 = 180;
 pub const RETINA_ISO: f32 = 0.3;
 pub const DELTA_EPS: f32 = 1e-4;
-pub const RELINK_SHIFT: f32 = 0.5;
+/// Projected motion, in receptors, that forces a relink — of the scene box's
+/// corners or of any linked source's center. A tenth of a receptor: below it
+/// the pipes are still where the picture wants them.
+pub const RELINK_SHIFT: f32 = 0.1;
 pub const ATTEN_END_MARGIN: f32 = 1.5;
 pub const ATTEN_SAMPLES_PER_CELL: f32 = 1.0;
 pub const ATTEN_THRESHOLD: f32 = 0.6;
@@ -357,6 +360,10 @@ pub struct Retina {
     entity_trans: Vec<f32>,
     /// Eye distance per entity at the last relink.
     entity_depth: Vec<f32>,
+    /// Projected center (u, v) per entity at the last relink, NaN for the
+    /// entities that had no footprint. The baseline `needs_relink` compares
+    /// against to catch a source that moves under a motionless camera.
+    last_centers: Vec<(f32, f32)>,
     last_view_proj: Option<Mat4>,
     pub stats: RetinaStats,
     /// Set when any delta arrived since the renderer last uploaded.
@@ -376,6 +383,7 @@ impl Retina {
             pipe_last: Vec::new(),
             entity_trans: Vec::new(),
             entity_depth: Vec::new(),
+            last_centers: Vec::new(),
             last_view_proj: None,
             stats: RetinaStats::default(),
             dirty: true,
@@ -404,24 +412,42 @@ impl Retina {
         self.entity_depth.get(i).copied().unwrap_or(0.0)
     }
 
-    /// True when the scene AABB's corners have shifted ≥ RELINK_SHIFT
-    /// receptors between the last linking view and this one.
-    pub fn needs_relink(&self, view_proj: Mat4, aabb_min: Vec3, aabb_max: Vec3) -> bool {
+    /// True when the picture's geometry has moved on the image plane since the
+    /// last relink — because the *camera* moved (the scene AABB's corners
+    /// project ≥ RELINK_SHIFT receptors away from where they did) or because a
+    /// *source* moved (its center projects ≥ RELINK_SHIFT receptors from where
+    /// it sat when it was linked).
+    ///
+    /// The second half is not redundant: pipes are frozen between relinks, so
+    /// an animating scene under a motionless camera is a still image until the
+    /// trigger notices the sources themselves.
+    pub fn needs_relink(&self, sources: &[Source], view_proj: Mat4, aabb_min: Vec3, aabb_max: Vec3) -> bool {
         let Some(last) = self.last_view_proj else { return true; };
-        if last == view_proj { return false; }
-        for i in 0..8 {
-            let corner = Vec3::new(
-                if i & 1 == 0 { aabb_min.x } else { aabb_max.x },
-                if i & 2 == 0 { aabb_min.y } else { aabb_max.y },
-                if i & 4 == 0 { aabb_min.z } else { aabb_max.z },
-            );
-            match (project(&last, self.width, self.height, corner),
-                   project(&view_proj, self.width, self.height, corner)) {
-                (Some(a), Some(b)) => {
-                    if (a.0 - b.0).abs().max((a.1 - b.1).abs()) >= RELINK_SHIFT { return true; }
+        if last != view_proj {
+            for i in 0..8 {
+                let corner = Vec3::new(
+                    if i & 1 == 0 { aabb_min.x } else { aabb_max.x },
+                    if i & 2 == 0 { aabb_min.y } else { aabb_max.y },
+                    if i & 4 == 0 { aabb_min.z } else { aabb_max.z },
+                );
+                match (project(&last, self.width, self.height, corner),
+                       project(&view_proj, self.width, self.height, corner)) {
+                    (Some(a), Some(b)) => {
+                        if (a.0 - b.0).abs().max((a.1 - b.1).abs()) >= RELINK_SHIFT { return true; }
+                    }
+                    _ => return true,
                 }
-                _ => return true,
             }
+        }
+        // The entity set itself changed shape — nothing to compare against.
+        if self.last_centers.len() != sources.len() { return true; }
+        for (i, s) in sources.iter().enumerate() {
+            let (lu, lv) = self.last_centers[i];
+            // NaN: this source had no footprint at the last relink, so it has
+            // no pipes to be stale. Whether it draws is `contribution`'s call.
+            if !s.drawable || lu.is_nan() { continue; }
+            let Some((u, v, _)) = project(&view_proj, self.width, self.height, s.position) else { return true; };
+            if (u - lu).abs().max((v - lv).abs()) >= RELINK_SHIFT { return true; }
         }
         false
     }
@@ -455,6 +481,9 @@ impl Retina {
             .collect();
         let n = sources.len();
         self.entity_depth = fps.iter().map(|f| f.as_ref().map(|f| f.depth).unwrap_or(0.0)).collect();
+        self.last_centers = fps.iter()
+            .map(|f| f.as_ref().map(|f| (f.u, f.v)).unwrap_or((f32::NAN, f32::NAN)))
+            .collect();
 
         // 4. Pipes with feathered gaussian weights.
         self.pipe_start = vec![0; n];
@@ -594,7 +623,7 @@ impl Retina {
 
     /// One retina step: relink if the view or the links moved, then arrive.
     pub fn tick(&mut self, sources: &[Source], view_proj: Mat4, aabb_min: Vec3, aabb_max: Vec3, force_relink: bool, atten_k: f32) {
-        if force_relink || self.needs_relink(view_proj, aabb_min, aabb_max) {
+        if force_relink || self.needs_relink(sources, view_proj, aabb_min, aabb_max) {
             let hash = SpatialHash::build(sources);
             let eye = eye_from_view_proj(view_proj);
             self.relink(sources, &hash, view_proj, eye, aabb_min, aabb_max, atten_k);
@@ -894,16 +923,41 @@ mod tests {
         let vp = test_view_proj(63, 35);
         let mut r = Retina::new(63, 35);
         let (lo, hi) = (Vec3::new(-5.0, -5.0, -15.0), Vec3::new(5.0, 5.0, -5.0));
-        assert!(r.needs_relink(vp, lo, hi), "fresh retina must relink");
         let sources = vec![src(Vec3::new(0.0, 0.0, -10.0), Vec3::ONE, 1.0)];
+        assert!(r.needs_relink(&sources, vp, lo, hi), "fresh retina must relink");
         r.relink(&sources, &SpatialHash::build(&sources), vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
-        assert!(!r.needs_relink(vp, lo, hi), "same view must not relink");
+        assert!(!r.needs_relink(&sources, vp, lo, hi), "same view must not relink");
         // Tiny nudge: 0.001 cells at distance 10 ≈ 0.002 receptors → no relink
         let nudge = Mat4::from_translation(Vec3::new(0.001, 0.0, 0.0));
-        assert!(!r.needs_relink(vp * nudge, lo, hi));
+        assert!(!r.needs_relink(&sources, vp * nudge, lo, hi));
         // 1 cell sideways ≈ 1.75 receptors → relink
         let shove = Mat4::from_translation(Vec3::new(1.0, 0.0, 0.0));
-        assert!(r.needs_relink(vp * shove, lo, hi));
+        assert!(r.needs_relink(&sources, vp * shove, lo, hi));
+    }
+
+    /// Pipes are fixed at the last relink, so a source that moves under a
+    /// motionless camera is frozen on screen until the next one. The trigger
+    /// has to watch the sources, not just the view.
+    #[test]
+    fn relink_trigger_follows_a_source_that_moves_under_a_still_camera() {
+        let vp = test_view_proj(63, 35);
+        let mut r = Retina::new(63, 35);
+        let mut sources = vec![
+            src(Vec3::new(0.0, 0.0, -10.0), Vec3::ONE, 1.0),
+            src(Vec3::new(2.0, 1.0, -12.0), Vec3::ONE, 1.0),
+        ];
+        let (lo, hi) = box_of(&sources);
+        r.relink(&sources, &SpatialHash::build(&sources), vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
+        assert!(!r.needs_relink(&sources, vp, lo, hi), "nothing moved but a relink was asked for");
+        // One walker step: 0.1 cells at distance 10 ≈ 0.17 receptors ≥ RELINK_SHIFT.
+        sources[1].position.x += 0.1;
+        assert!(r.needs_relink(&sources, vp, lo, hi), "a moving source did not trigger a relink");
+        // Relinking re-baselines it, and the new position is then quiet again.
+        r.relink(&sources, &SpatialHash::build(&sources), vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
+        assert!(!r.needs_relink(&sources, vp, lo, hi));
+        // Sub-threshold drift still costs nothing.
+        sources[1].position.x += 0.01;
+        assert!(!r.needs_relink(&sources, vp, lo, hi), "0.01 cells ≈ 0.017 receptors must not relink");
     }
 
     fn lcg(seed: &mut u64) -> f32 {

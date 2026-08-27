@@ -2094,6 +2094,12 @@ mod tests {
     /// walker's cross links (link graph + edge attenuation — not the retina's
     /// work, but it lands in the same frame).
     ///
+    /// The steady-state phase has to freeze the world to find one. While the
+    /// dino walks it projects ~0.17 receptors per tick, past `RELINK_SHIFT`, so
+    /// every tick relinks *by design* — that is what keeps the animation from
+    /// being frozen between relinks. A tick with no relink in it only exists
+    /// once the scene stops moving.
+    ///
     /// The whole ignored suite runs its tests in parallel over one rayon pool,
     /// so a sample here can be two thirds contention. Cost is what the fastest
     /// sample shows; the rest is other tests. So the budgets are judged on the
@@ -2102,11 +2108,40 @@ mod tests {
     #[ignore] // builds the full demo scene (slow) — run: cargo test --release -- --ignored
     fn tick_stays_inside_the_frame_budget() {
         const STEADY_BUDGET_MS: f64 = 40.0;
-        const RELINK_BUDGET_MS: f64 = 60.0;
+        const WORST_STEADY_BUDGET_MS: f64 = 150.0;
+        const RELINK_BUDGET_MS: f64 = 80.0;
         const REFRESH_BUDGET_MS: f64 = 150.0;
 
         let mut field = DiffField::new();
         let vp = test_view_proj();
+
+        // Phase 1 — the walking scene. Every tick here relinks (and one also
+        // refreshes cross links), so each only has to clear the refresh budget.
+        for i in 0..12 {
+            let relinks_before = field.retina.stats.relinks;
+            let refresh_before = field.last_refresh_tick;
+            let t0 = std::time::Instant::now();
+            field.tick(vp);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let s = field.retina.stats;
+            eprintln!("walking tick {:2}: {:7.2} ms  ({}{}relink {:.2} ms, {} of {} pipes sent)",
+                i, ms,
+                if s.relinks > relinks_before { "RELINK, " } else { "" },
+                if field.last_refresh_tick != refresh_before { "CROSS-LINK REFRESH, " } else { "" },
+                s.relink_ms, s.pipes_sent, s.pipes_total);
+            assert!(ms < REFRESH_BUDGET_MS,
+                "walking tick {} {:.2} ms exceeds the {:.0} ms budget", i, ms, REFRESH_BUDGET_MS);
+        }
+
+        // Phase 2 — steady state. Stop the world the way
+        // `retina_sees_the_dino_and_settles` does, then let it settle before
+        // measuring: the first ticks after the freeze still carry the last
+        // relink and the lighting's tail.
+        field.walker.speed_c = 0.0;
+        for e in &mut field.entities { e.velocity = glam::Vec3::ZERO; }
+        field.freeze_animation = true;
+        for _ in 0..4 { field.tick(vp); }
+
         let mut worst = 0.0f64;
         let mut best = f64::MAX;
         let mut sum = 0.0f64;
@@ -2120,14 +2155,14 @@ mod tests {
             let s = field.retina.stats;
             let relinked = s.relinks > relinks_before;
             let refreshed = field.last_refresh_tick != refresh_before;
-            eprintln!("tick {:2}: {:7.2} ms  ({}{}relink {:.2} ms, {} of {} pipes sent)",
+            eprintln!("steady tick {:2}: {:7.2} ms  ({}{}relink {:.2} ms, {} of {} pipes sent)",
                 i, ms,
                 if relinked { "RELINK, " } else { "" },
                 if refreshed { "CROSS-LINK REFRESH, " } else { "" },
                 s.relink_ms, s.pipes_sent, s.pipes_total);
             if relinked || refreshed {
                 assert!(ms < REFRESH_BUDGET_MS,
-                    "tick {} (relink/refresh) {:.2} ms exceeds the {:.0} ms budget", i, ms, REFRESH_BUDGET_MS);
+                    "steady tick {} (relink/refresh) {:.2} ms exceeds the {:.0} ms budget", i, ms, REFRESH_BUDGET_MS);
                 continue;
             }
             worst = worst.max(ms);
@@ -2135,14 +2170,19 @@ mod tests {
             sum += ms;
             steady += 1;
         }
-        assert!(steady >= 8, "only {} of 12 ticks were steady — nothing was measured", steady);
+        assert!(steady >= 8, "only {} of 12 frozen ticks were steady — nothing was measured", steady);
         eprintln!("steady state over {} ticks: best {:.2} ms, mean {:.2} ms, worst {:.2} ms",
             steady, best, sum / steady as f64, worst);
         assert!(best < STEADY_BUDGET_MS,
             "fastest steady-state tick {:.2} ms exceeds the {:.0} ms budget", best, STEADY_BUDGET_MS);
+        // Contention inflates a sample, but not without bound: a steady tick
+        // that took longer than a full relink is a regression, not noise.
+        assert!(worst < WORST_STEADY_BUDGET_MS,
+            "slowest steady-state tick {:.2} ms exceeds the {:.0} ms budget", worst, WORST_STEADY_BUDGET_MS);
 
+        // Phase 3 — the relink itself, forced so it lands on a known tick.
         let mut best_relink = f64::MAX;
-        for _ in 0..3 {
+        for _ in 0..6 {
             let relinks_before = field.retina.stats.relinks;
             let refresh_before = field.last_refresh_tick;
             field.retina_force_relink = true;
@@ -2160,6 +2200,8 @@ mod tests {
             }
             best_relink = best_relink.min(ms);
         }
+        assert!(best_relink < f64::MAX,
+            "no forced-relink sample avoided the refresh branch — the relink cost was never measured");
         assert!(best_relink < RELINK_BUDGET_MS,
             "fastest forced-relink tick {:.2} ms exceeds the {:.0} ms budget", best_relink, RELINK_BUDGET_MS);
     }

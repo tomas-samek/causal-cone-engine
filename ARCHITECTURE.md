@@ -49,7 +49,11 @@ Entity → receptor links, one contiguous slice per entity: `pipe_start` /
 `pipe_count` index into `pipe_receptor` (which receptor), `pipe_weight` (the
 projected gaussian's feathered weight there), and `pipe_last` (what this pipe
 last delivered). Per entity, `entity_trans` holds `τ` toward the eye and
-`entity_depth` the eye distance at the last relink.
+`entity_depth` the eye distance at the last relink. `τ` is integrated only over
+the stretch of the entity→eye segment that lies inside the scene's geometry
+AABB (grown by the widest kernel reach — everything outside it samples empty
+space), and the walk stops at a hard `0.0` once `k·∫` passes `ATTEN_TAU_CUTOFF`.
+So the cost does not grow with how far the observer has flown.
 
 ### Entity (`field.rs`)
 A point that participates in light transport. Key fields:
@@ -102,8 +106,8 @@ the "causal cone": chains that don't feed a visible pixel are skipped.
 | **Consumption** | Each body entity's incoming is tokenized and run through `cascade_process` (consume / reject / seed / promote). |
 | **Phase 2 — push** | Each active, non-debounced entity rewrites its outgoing edge deposits = own emission + pass-through of incoming, weighted by `edge_gamma × distance_factor × edge_atten`, with optional directional bias for vacuum relays. Weights are then **renormalized** to sum to 1 — see the shadow note below. Parallelized with `rayon` (each entity owns a disjoint edge range). |
 | **Advance entities** | The walker group (dino) translates rigidly by `speed × time_lapse` and paces ±6 cells along Z; other entities move by velocity (and bounce off `FIELD_SIZE`). Each solid becomes a `Source` with its animated position, boosted density/color, and `drawable` flag, and the geometry AABB is recomputed. |
-| **Relink** (conditional) | If the cross-links refreshed, a tuning key fired, or the AABB's projected corners moved ≥ `RELINK_SHIFT` (½ receptor), the retina drops every pipe (subtracting what it last sent, landing on exactly zero), re-projects every drawable source's gaussian footprint into image space, and recomputes `τ` toward the eye. This is the expensive step, and it runs only when the picture's geometry actually moved. |
-| **Phase 3′ — arrive** | Every pipe sends `new − last`, and only if that delta exceeds `DELTA_EPS`. A settled scene sends nothing. Parallel over entities into per-split scratch images, reduced at the end. |
+| **Relink** (conditional) | If the cross-links refreshed, a tuning key fired, the AABB's projected corners moved ≥ `RELINK_SHIFT` (0.1 receptor), or **any linked source's projected center** moved that far from where it sat when it was linked, the retina drops every pipe (subtracting what it last sent, landing on exactly zero), re-projects every drawable source's gaussian footprint into image space, and recomputes `τ` toward the eye. The second trigger is what animates the picture: pipes are fixed between relinks, so a source that moves under a motionless camera is a still image until the next one — the walking dino shifts ~0.17 receptors per tick, so it relinks every tick. Note that a relink **resends every pipe**; deltas-only is what holds *between* relinks, not across one. |
+| **Phase 3′ — arrive** | Every pipe sends `new − last`, and only if that delta exceeds `DELTA_EPS`. A settled scene sends nothing. Parallel over entities in contiguous chunks — one per worker thread, fewer when a full-image scratch each would exceed `ARRIVE_SCRATCH_BUDGET_BYTES` (64 MB). Each chunk allocates its scratch lazily, on its first delta, and the scratches are merged into the receptors by disjoint receptor range. |
 
 Two asymmetries in **Advance entities** are deliberate: `oscillation_phase`
 advances for *every* solid, in frustum or not, so skin texture doesn't jump when
