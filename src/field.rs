@@ -2169,11 +2169,13 @@ mod tests {
             field.tick(vp);
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             let s = field.retina.stats;
-            eprintln!("walking tick {:2}: {:7.2} ms  ({}{}relink {:.2} ms, {} of {} pipes sent)",
+            eprintln!("walking tick {:2}: {:7.2} ms  ({}{}hash {:.2} + relink {:.2} ms [footprints {:.2}, pipes {:.2}, τ {:.2}, rest {:.2}], {} of {} pipes sent)",
                 i, ms,
                 if s.relinks > relinks_before { "RELINK, " } else { "" },
                 if field.last_refresh_tick != refresh_before { "CROSS-LINK REFRESH, " } else { "" },
-                s.relink_ms, s.pipes_sent, s.pipes_total);
+                s.hash_build_ms, s.relink_ms, s.relink_footprint_ms, s.relink_pipes_ms, s.relink_tau_ms,
+                s.relink_ms - s.relink_footprint_ms - s.relink_pipes_ms - s.relink_tau_ms,
+                s.pipes_sent, s.pipes_total);
             assert!(ms < REFRESH_BUDGET_MS,
                 "walking tick {} {:.2} ms exceeds the {:.0} ms budget", i, ms, REFRESH_BUDGET_MS);
         }
@@ -2235,7 +2237,10 @@ mod tests {
             field.tick(vp);
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             assert!(field.retina.stats.relinks > relinks_before, "forced relink did not fire");
-            eprintln!("forced relink tick: {:.2} ms (retina relink {:.2} ms)", ms, field.retina.stats.relink_ms);
+            let s = field.retina.stats;
+            eprintln!("forced relink tick: {:.2} ms (hash {:.2} + retina relink {:.2} ms [footprints {:.2}, pipes {:.2}, τ {:.2}, rest {:.2}])",
+                ms, s.hash_build_ms, s.relink_ms, s.relink_footprint_ms, s.relink_pipes_ms, s.relink_tau_ms,
+                s.relink_ms - s.relink_footprint_ms - s.relink_pipes_ms - s.relink_tau_ms);
             // A cross-link refresh may land on this tick too — that sample is
             // measuring something else, so it only has to clear that budget.
             if field.last_refresh_tick != refresh_before {

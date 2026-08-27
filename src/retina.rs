@@ -290,6 +290,12 @@ pub struct RetinaStats {
     pub relinks: u64,
     pub mean_trans: f32,
     pub relink_ms: f32,
+    /// Where `relink_ms` went. `hash_build_ms` is `SpatialHash::build`, which
+    /// `tick` pays just before the relink, so it is *not* part of `relink_ms`.
+    pub relink_footprint_ms: f32,
+    pub relink_tau_ms: f32,
+    pub relink_pipes_ms: f32,
+    pub hash_build_ms: f32,
 }
 
 /// Image-space footprint of a projected axis-aligned gaussian: center,
@@ -489,6 +495,7 @@ impl Retina {
                 "receptors not zero after dropping all pipes");
         }
         for r in &mut self.receptors { *r = Receptor::default(); }
+        let t_reset = t0.elapsed();
 
         // 2–3. Project footprints.
         let fps: Vec<Option<Footprint>> = sources.par_iter()
@@ -499,6 +506,7 @@ impl Retina {
         self.last_centers = fps.iter()
             .map(|f| f.as_ref().map(|f| (f.u, f.v)).unwrap_or((f32::NAN, f32::NAN)))
             .collect();
+        let t_fps = t0.elapsed();
 
         // 4. Pipes with feathered gaussian weights.
         self.pipe_start = vec![0; n];
@@ -526,9 +534,11 @@ impl Retina {
             self.pipe_count[i] = self.pipe_receptor.len() as u32 - self.pipe_start[i];
         }
         self.pipe_last = vec![PipeState::default(); self.pipe_receptor.len()];
+        let t_pipes = t0.elapsed();
 
         // 5. τ toward the eye — only for entities that actually got pipes
-        // (parallel — this is the cost).
+        // (parallel). Measured at ~8.5 ms of a ~36 ms relink on the demo
+        // scene: a quarter of it. The serial pipe loop above is the cost.
         let pipe_count = &self.pipe_count;
         let aabb = Some((aabb_min, aabb_max));
         self.entity_trans = (0..n).into_par_iter().map(|i| {
@@ -543,6 +553,7 @@ impl Retina {
                 segment_transmittance(sources, hash, sources[i].position, eye, &[i], atten_k, threshold, aabb)
             } else { 1.0 }
         }).collect();
+        let t_tau = t0.elapsed();
 
         // 6. Bookkeeping.
         self.last_view_proj = Some(view_proj);
@@ -550,7 +561,20 @@ impl Retina {
         self.stats.relinks += 1;
         self.stats.pipes_total = self.pipe_receptor.len();
         self.stats.mean_trans = if linked.is_empty() { 1.0 } else { linked.iter().sum::<f32>() / linked.len() as f32 };
-        self.stats.relink_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+        self.stats.relink_footprint_ms = ms(t_fps - t_reset);
+        self.stats.relink_pipes_ms = ms(t_pipes - t_fps);
+        self.stats.relink_tau_ms = ms(t_tau - t_pipes);
+        // `tick` builds the hash; a direct `relink` was handed one, so the
+        // number it last recorded says nothing about this call.
+        self.stats.hash_build_ms = 0.0;
+        self.stats.relink_ms = ms(t0.elapsed());
+        log::debug!(
+            "relink {:.2} ms = reset {:.2} + footprints {:.2} + pipes {:.2} + τ {:.2} + bookkeeping {:.2} ({} entities, {} pipes; hash build is `tick`'s, not counted here)",
+            self.stats.relink_ms, ms(t_reset), self.stats.relink_footprint_ms,
+            self.stats.relink_pipes_ms, self.stats.relink_tau_ms,
+            self.stats.relink_ms - ms(t_tau), n, self.stats.pipes_total,
+        );
         self.dirty = true;
     }
 
@@ -646,9 +670,12 @@ impl Retina {
     /// One retina step: relink if the view or the links moved, then arrive.
     pub fn tick(&mut self, sources: &[Source], view_proj: Mat4, aabb_min: Vec3, aabb_max: Vec3, force_relink: bool, atten_k: f32) {
         if force_relink || self.needs_relink(sources, view_proj, aabb_min, aabb_max) {
+            let t0 = std::time::Instant::now();
             let hash = SpatialHash::build(sources);
+            let build_ms = t0.elapsed().as_secs_f32() * 1000.0;
             let eye = eye_from_view_proj(view_proj);
             self.relink(sources, &hash, view_proj, eye, aabb_min, aabb_max, atten_k);
+            self.stats.hash_build_ms = build_ms;
         }
         self.arrive(sources);
     }
@@ -676,6 +703,11 @@ impl Retina {
             100.0 * above as f64 / self.receptors.len().max(1) as f64, max_d,
             self.stats.pipes_total, self.stats.pipes_sent, self.stats.mean_trans,
             self.stats.relinks, self.stats.relink_ms,
+        );
+        log::info!(
+            "Retina relink breakdown: hash build {:.2} ms + relink {:.2} ms (footprints {:.2}, pipes {:.2}, τ {:.2})",
+            self.stats.hash_build_ms, self.stats.relink_ms,
+            self.stats.relink_footprint_ms, self.stats.relink_pipes_ms, self.stats.relink_tau_ms,
         );
 
         // The incremental image is only ever as good as the claim that it
