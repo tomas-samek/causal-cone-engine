@@ -60,6 +60,10 @@ pub struct Source {
     pub drawable: bool,
     /// Attenuates segments: solid, regardless of frustum.
     pub occluder: bool,
+    /// This source's `position`, `radii` and `opacity` are the same every tick,
+    /// so the spatial hash may keep its cell insertions across relinks. Only
+    /// the sources that actually move — the walker — pay to be re-hashed.
+    pub is_static: bool,
 }
 
 impl Source {
@@ -80,23 +84,72 @@ impl Source {
 /// hold only the occluders that can actually reach the cell.
 pub const HASH_CELL: f32 = 2.0;
 
+type CellMap = HashMap<(i32, i32, i32), Vec<usize>>;
+
 /// Uniform grid over occluder sources. Each occluder is inserted into every
 /// cell its kernel extent box overlaps, so a single-cell lookup is exact:
 /// `kernel()` is zero outside `position ± 2·kernel_radii()`, so an occluder
 /// that can reach a point is in that point's cell.
+///
+/// Split in two by `Source::is_static`. The scene is overwhelmingly furniture —
+/// floor, rock, sun — that occupies the same cells forever, and only the walker
+/// moves. Hashing the furniture once and re-hashing only the walker each relink
+/// is the whole point of the split; a lookup reads both cells and sums them, so
+/// it is exactly the density one combined map would have given.
+#[derive(Default)]
 pub struct SpatialHash {
-    map: HashMap<(i32, i32, i32), Vec<usize>>,
-    /// Widest kernel reach of any occluder, per axis. A clip box grown by this
-    /// is conservative: nothing outside it can reach a sample inside it.
+    static_map: CellMap,
+    dynamic_map: CellMap,
+    static_extent: Vec3,
+    dynamic_extent: Vec3,
+    /// Widest kernel reach of any occluder in *either* map, per axis. A clip box
+    /// grown by this is conservative: nothing outside it can reach a sample
+    /// inside it.
     max_extent: Vec3,
+    /// The static set the static map was built from: (source count, static
+    /// occluder count). A change means the indices in `static_map` no longer
+    /// name what they used to, so the map is rebuilt.
+    static_key: Option<(usize, usize)>,
+    /// How many times the static map has been (re)built. Diagnostic only —
+    /// the incremental-hash test watches it to prove the reuse is real.
+    static_builds: u64,
 }
 
 impl SpatialHash {
+    /// One-shot hash of a whole source set. Same split as `update`, so a fresh
+    /// build and an updated hash read identically.
     pub fn build(sources: &[Source]) -> Self {
-        let mut map: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+        let mut hash = Self::default();
+        hash.update(sources);
+        hash
+    }
+
+    /// Re-hash for this tick's source positions. The static map survives
+    /// untouched unless the source set itself changed shape; the dynamic map is
+    /// rebuilt every time.
+    ///
+    /// The contract `is_static` carries is that such a source never moves and
+    /// never changes radii or opacity. A source that breaks it goes stale in the
+    /// static map, silently.
+    pub fn update(&mut self, sources: &[Source]) {
+        let key = (sources.len(), sources.iter().filter(|s| s.occluder && s.is_static).count());
+        if self.static_key != Some(key) {
+            self.static_map.clear();
+            self.static_extent = Self::insert(&mut self.static_map, sources, true);
+            self.static_key = Some(key);
+            self.static_builds += 1;
+        }
+        self.dynamic_map.clear();
+        self.dynamic_extent = Self::insert(&mut self.dynamic_map, sources, false);
+        self.max_extent = self.static_extent.max(self.dynamic_extent);
+    }
+
+    /// Insert every occluder whose `is_static` matches `want_static` into every
+    /// cell its kernel extent box overlaps. Returns the widest extent inserted.
+    fn insert(map: &mut CellMap, sources: &[Source], want_static: bool) -> Vec3 {
         let mut max_extent = Vec3::ZERO;
         for (i, s) in sources.iter().enumerate() {
-            if !s.occluder { continue; }
+            if !s.occluder || s.is_static != want_static { continue; }
             // kernel() > 0 requires |(p − position)/radii|² < 4 — i.e. p inside
             // the box position ± 2·radii.
             let extent = s.kernel_radii() * 2.0;
@@ -111,7 +164,7 @@ impl SpatialHash {
                 }
             }
         }
-        Self { map, max_extent }
+        max_extent
     }
 
     fn key(p: Vec3) -> (i32, i32, i32) {
@@ -122,14 +175,26 @@ impl SpatialHash {
         )
     }
 
+    /// Widest kernel reach of any occluder in the hash, per axis.
+    #[allow(dead_code)] // test/diagnostic API — `segment_transmittance` reads the field
+    pub fn max_extent(&self) -> Vec3 { self.max_extent }
+
+    /// How many times the static map has been built. Test/diagnostic API.
+    #[allow(dead_code)]
+    pub fn static_builds(&self) -> u64 { self.static_builds }
+
     /// Σ opacity·kernel over occluders that can reach `p`, excluding indices
-    /// in `skip`. One cell: coverage is exact by how `build` inserts.
+    /// in `skip`. One cell per map: coverage is exact by how `insert` inserts,
+    /// and the two maps partition the occluders, so the sum is the total.
     pub fn density_at(&self, sources: &[Source], p: Vec3, skip: &[usize]) -> f32 {
-        let Some(bucket) = self.map.get(&Self::key(p)) else { return 0.0; };
+        let cell = Self::key(p);
         let mut rho = 0.0f32;
-        for &j in bucket {
-            if skip.contains(&j) { continue; }
-            rho += sources[j].opacity * sources[j].kernel(p);
+        for map in [&self.static_map, &self.dynamic_map] {
+            let Some(bucket) = map.get(&cell) else { continue; };
+            for &j in bucket {
+                if skip.contains(&j) { continue; }
+                rho += sources[j].opacity * sources[j].kernel(p);
+            }
         }
         rho
     }
@@ -290,7 +355,7 @@ pub struct RetinaStats {
     pub relinks: u64,
     pub mean_trans: f32,
     pub relink_ms: f32,
-    /// Where `relink_ms` went. `hash_build_ms` is `SpatialHash::build`, which
+    /// Where `relink_ms` went. `hash_build_ms` is `SpatialHash::update`, which
     /// `tick` pays just before the relink, so it is *not* part of `relink_ms`.
     pub relink_footprint_ms: f32,
     pub relink_tau_ms: f32,
@@ -379,6 +444,12 @@ pub struct Retina {
     /// against to catch a source that moves under a motionless camera.
     last_centers: Vec<(f32, f32)>,
     last_view_proj: Option<Mat4>,
+    /// Occluder grid, kept across ticks so its static half is hashed once.
+    hash: SpatialHash,
+    /// Per-chunk pipe scratch, kept across relinks for its capacity:
+    /// (receptors, weights, per-entity counts). One entry per worker chunk, not
+    /// per entity — 17k relink-time allocations is a cost of its own.
+    pipe_scratch: Vec<(Vec<u32>, Vec<f32>, Vec<u32>)>,
     pub stats: RetinaStats,
     /// Set when any delta arrived since the renderer last uploaded.
     pub dirty: bool,
@@ -399,6 +470,8 @@ impl Retina {
             entity_depth: Vec::new(),
             last_centers: Vec::new(),
             last_view_proj: None,
+            hash: SpatialHash::default(),
+            pipe_scratch: Vec::new(),
             stats: RetinaStats::default(),
             dirty: true,
         }
@@ -508,32 +581,74 @@ impl Retina {
             .collect();
         let t_fps = t0.elapsed();
 
-        // 4. Pipes with feathered gaussian weights.
-        self.pipe_start = vec![0; n];
-        self.pipe_count = vec![0; n];
-        self.pipe_receptor.clear();
-        self.pipe_weight.clear();
-        for (i, fp) in fps.iter().enumerate() {
-            self.pipe_start[i] = self.pipe_receptor.len() as u32;
-            let Some(fp) = fp else { continue; };
-            let u0 = (fp.u - fp.hu).floor().max(0.0) as i64;
-            let u1 = (fp.u + fp.hu).ceil().min(w as f32 - 1.0) as i64;
-            let v0 = (fp.v - fp.hv).floor().max(0.0) as i64;
-            let v1 = (fp.v + fp.hv).ceil().min(h as f32 - 1.0) as i64;
-            if u0 > u1 || v0 > v1 { continue; }
-            for rv in v0..=v1 {
-                for ru in u0..=u1 {
-                    let du = ru as f32 + 0.5 - fp.u;
-                    let dv = rv as f32 + 0.5 - fp.v;
-                    let e = fp.a * du * du + 2.0 * fp.b * du * dv + fp.c * dv * dv;
-                    if e >= 4.0 { continue; }
-                    self.pipe_receptor.push(rv as u32 * w + ru as u32);
-                    self.pipe_weight.push((-e).exp() * cutoff_window(e));
-                }
-            }
-            self.pipe_count[i] = self.pipe_receptor.len() as u32 - self.pipe_start[i];
+        // 4. Pipes with feathered gaussian weights. Embarrassingly parallel:
+        //    each footprint writes only its own receptor/weight run. Chunks of
+        //    entities fill scratch buffers in parallel, then the chunks are
+        //    concatenated in order — so the SoA arrays come out byte-for-byte
+        //    what the serial loop produced (entity order, row-major within a
+        //    footprint), which is what the exactness tests pin down.
+        let chunks = (rayon::current_num_threads() * 8).max(1);
+        let chunk_len = n.div_ceil(chunks).max(1);
+        let n_chunks = n.div_ceil(chunk_len);
+        // Scratch is kept across relinks for its capacity — per chunk, never
+        // per entity.
+        if self.pipe_scratch.len() < n_chunks {
+            self.pipe_scratch.resize_with(n_chunks, Default::default);
         }
-        self.pipe_last = vec![PipeState::default(); self.pipe_receptor.len()];
+        self.pipe_scratch[..n_chunks].par_iter_mut().zip(fps.par_chunks(chunk_len))
+            .for_each(|((recs, weights, counts), fps_chunk)| {
+                recs.clear();
+                weights.clear();
+                counts.clear();
+                for fp in fps_chunk {
+                    let before = recs.len() as u32;
+                    let Some(fp) = fp else { counts.push(0); continue; };
+                    let u0 = (fp.u - fp.hu).floor().max(0.0) as i64;
+                    let u1 = (fp.u + fp.hu).ceil().min(w as f32 - 1.0) as i64;
+                    let v0 = (fp.v - fp.hv).floor().max(0.0) as i64;
+                    let v1 = (fp.v + fp.hv).ceil().min(h as f32 - 1.0) as i64;
+                    if u0 > u1 || v0 > v1 { counts.push(0); continue; }
+                    for rv in v0..=v1 {
+                        for ru in u0..=u1 {
+                            let du = ru as f32 + 0.5 - fp.u;
+                            let dv = rv as f32 + 0.5 - fp.v;
+                            let e = fp.a * du * du + 2.0 * fp.b * du * dv + fp.c * dv * dv;
+                            if e >= 4.0 { continue; }
+                            recs.push(rv as u32 * w + ru as u32);
+                            weights.push((-e).exp() * cutoff_window(e));
+                        }
+                    }
+                    counts.push(recs.len() as u32 - before);
+                }
+            });
+
+        self.pipe_start.clear();
+        self.pipe_start.resize(n, 0);
+        self.pipe_count.clear();
+        self.pipe_count.resize(n, 0);
+        let total: usize = self.pipe_scratch[..n_chunks].iter().map(|(r, _, _)| r.len()).sum();
+        self.pipe_receptor.clear();
+        self.pipe_receptor.reserve(total);
+        self.pipe_weight.clear();
+        self.pipe_weight.reserve(total);
+        let mut i = 0usize;
+        let mut base = 0u32;
+        for (recs, weights, counts) in &self.pipe_scratch[..n_chunks] {
+            for &c in counts.iter() {
+                self.pipe_start[i] = base;
+                self.pipe_count[i] = c;
+                base += c;
+                i += 1;
+            }
+            self.pipe_receptor.extend_from_slice(recs);
+            self.pipe_weight.extend_from_slice(weights);
+        }
+        debug_assert_eq!(i, n, "chunked pipe counts did not cover every entity");
+        debug_assert_eq!(base as usize, total);
+        // Reuse the allocation: at ~577k pipes this buffer is ~18 MB, and
+        // handing it back to the allocator every relink is not free.
+        self.pipe_last.clear();
+        self.pipe_last.resize(total, PipeState::default());
         let t_pipes = t0.elapsed();
 
         // 5. τ toward the eye — only for entities that actually got pipes
@@ -670,12 +785,17 @@ impl Retina {
     /// One retina step: relink if the view or the links moved, then arrive.
     pub fn tick(&mut self, sources: &[Source], view_proj: Mat4, aabb_min: Vec3, aabb_max: Vec3, force_relink: bool, atten_k: f32) {
         if force_relink || self.needs_relink(sources, view_proj, aabb_min, aabb_max) {
+            // The hash lives in the retina so its static half survives the
+            // tick; take it out for the duration so `relink` can borrow `self`
+            // mutably, and hand it straight back.
+            let mut hash = std::mem::take(&mut self.hash);
             let t0 = std::time::Instant::now();
-            let hash = SpatialHash::build(sources);
+            hash.update(sources);
             let build_ms = t0.elapsed().as_secs_f32() * 1000.0;
             let eye = eye_from_view_proj(view_proj);
             self.relink(sources, &hash, view_proj, eye, aabb_min, aabb_max, atten_k);
             self.stats.hash_build_ms = build_ms;
+            self.hash = hash;
         }
         self.arrive(sources);
     }
@@ -758,6 +878,7 @@ mod tests {
             color: [1.0, 1.0, 1.0],
             drawable: true,
             occluder: true,
+            is_static: false,
         }
     }
 
@@ -949,6 +1070,109 @@ mod tests {
         assert_eq!(hash.density_at(&sources, Vec3::ZERO, &[]), 0.0);
     }
 
+    /// A few points that straddle both occluders, their overlap, and empty air.
+    fn probe_points() -> Vec<Vec3> {
+        vec![
+            Vec3::ZERO,
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(3.0, 0.5, -0.5),
+            Vec3::new(4.0, 0.0, 0.0),
+            Vec3::new(-1.5, 1.0, 1.0),
+            Vec3::new(40.0, 40.0, 40.0), // nothing here
+        ]
+    }
+
+    /// Splitting the occluders across a static and a dynamic map must be
+    /// invisible: `density_at` sums both cells, so it reads exactly what one
+    /// combined build reads.
+    #[test]
+    fn split_hash_reads_the_same_density_as_a_combined_build() {
+        let mut stat = src(Vec3::ZERO, Vec3::splat(1.5), 4.0);
+        stat.is_static = true;
+        let mut dynamic = src(Vec3::new(3.0, 0.0, 0.0), Vec3::ONE, 7.0);
+        dynamic.is_static = false;
+        let sources = vec![stat, dynamic];
+
+        let split = SpatialHash::build(&sources);
+        // Reference: the same occluders, every one of them declared static, so
+        // they all land in one map.
+        let all_static: Vec<Source> = sources.iter().map(|s| Source { is_static: true, ..*s }).collect();
+        let combined = SpatialHash::build(&all_static);
+
+        let mut nonzero = 0;
+        for p in probe_points() {
+            let a = split.density_at(&sources, p, &[]);
+            let b = combined.density_at(&all_static, p, &[]);
+            assert_eq!(a, b, "split vs combined at {:?}: {} vs {}", p, a, b);
+            if a > 0.0 { nonzero += 1; }
+        }
+        assert!(nonzero >= 4, "probe points barely touched the occluders ({} hits)", nonzero);
+        assert_eq!(split.max_extent(), combined.max_extent(), "max_extent must cover both maps");
+        // `skip` still reaches into both maps.
+        let p = Vec3::new(2.0, 0.0, 0.0);
+        assert_eq!(split.density_at(&sources, p, &[0]), 7.0 * sources[1].kernel(p));
+        assert_eq!(split.density_at(&sources, p, &[1]), 4.0 * sources[0].kernel(p));
+    }
+
+    /// Moving the dynamic occluder and re-running `update` must rebuild only
+    /// the dynamic map yet read exactly like a hash built from scratch.
+    #[test]
+    fn updating_only_the_dynamic_map_matches_a_fresh_build() {
+        let mut stat = src(Vec3::ZERO, Vec3::splat(1.5), 4.0);
+        stat.is_static = true;
+        let mut dynamic = src(Vec3::new(3.0, 0.0, 0.0), Vec3::ONE, 7.0);
+        dynamic.is_static = false;
+        let mut sources = vec![stat, dynamic];
+
+        let mut hash = SpatialHash::build(&sources);
+        let static_builds = hash.static_builds();
+
+        for step in 0..4 {
+            sources[1].position += Vec3::new(-1.25, 0.75, 0.5);
+            hash.update(&sources);
+            assert_eq!(hash.static_builds(), static_builds,
+                "step {}: the static map was rebuilt though the static set never changed", step);
+            let fresh = SpatialHash::build(&sources);
+            for p in probe_points() {
+                let a = hash.density_at(&sources, p, &[]);
+                let b = fresh.density_at(&sources, p, &[]);
+                assert_eq!(a, b, "step {} at {:?}: incremental {} vs fresh {}", step, p, a, b);
+            }
+            assert_eq!(hash.max_extent(), fresh.max_extent());
+        }
+
+        // A changed entity set is the one thing `update` cannot carry over, so
+        // it must notice and rebuild the static map.
+        let mut extra = src(Vec3::new(-6.0, 0.0, 0.0), Vec3::ONE, 3.0);
+        extra.is_static = true;
+        sources.push(extra);
+        hash.update(&sources);
+        assert_eq!(hash.static_builds(), static_builds + 1, "static set grew but the map did not");
+        let fresh = SpatialHash::build(&sources);
+        for p in probe_points().into_iter().chain([Vec3::new(-6.0, 0.0, 0.0)]) {
+            assert_eq!(hash.density_at(&sources, p, &[]), fresh.density_at(&sources, p, &[]), "at {:?}", p);
+        }
+    }
+
+    /// `segment_transmittance` walks the split hash and must not care.
+    #[test]
+    fn transmittance_is_unchanged_by_the_static_dynamic_split() {
+        let mut floor = src(Vec3::new(0.0, 0.0, -5.0), Vec3::ONE, 10.0);
+        floor.is_static = true;
+        let mut walker = src(Vec3::new(0.0, 0.0, -7.0), Vec3::ONE, 10.0);
+        walker.is_static = false;
+        let sources = vec![floor, walker];
+        let split = SpatialHash::build(&sources);
+        let all_static: Vec<Source> = sources.iter().map(|s| Source { is_static: true, ..*s }).collect();
+        let combined = SpatialHash::build(&all_static);
+        let (from, to) = (Vec3::new(0.0, 0.0, -12.0), Vec3::ZERO);
+        let a = segment_transmittance(&sources, &split, from, to, &[], 0.5, ATTEN_THRESHOLD, None);
+        let b = segment_transmittance(&all_static, &combined, from, to, &[], 0.5, ATTEN_THRESHOLD, None);
+        assert!(a < 0.5, "test occluders do not attenuate: {}", a);
+        assert_eq!(a, b, "split τ={} combined τ={}", a, b);
+    }
+
     /// Eye at origin looking down −Z, 90° fov, aspect w/h. With odd w/h a
     /// point on the axis projects exactly onto the center receptor's center.
     pub(super) fn test_view_proj(w: u32, h: u32) -> Mat4 {
@@ -1029,6 +1253,70 @@ mod tests {
             assert_eq!(r.transmittance(i), 1.0, "source {} τ not defaulted to 1.0", i);
         }
         assert_eq!(r.stats.pipes_total, 0);
+    }
+
+    /// The pipe arrays are built in parallel over chunks of entities and then
+    /// concatenated. The layout that comes out has to be the one the serial
+    /// loop produced: entity order, row-major within a footprint, `pipe_start`
+    /// the prefix sum of `pipe_count`. Enough sources here to span many chunks.
+    #[test]
+    fn chunked_pipe_build_matches_the_serial_layout() {
+        let (w, h) = (63u32, 35u32);
+        let vp = test_view_proj(w, h);
+        let mut seed = 11u64;
+        let n = 4 * rayon::current_num_threads() * 8 + 37; // several entities per chunk
+        let sources: Vec<Source> = (0..n).map(|_| {
+            src(
+                Vec3::new(lcg(&mut seed) * 16.0 - 8.0, lcg(&mut seed) * 12.0 - 6.0, -6.0 - lcg(&mut seed) * 20.0),
+                Vec3::splat(0.4 + lcg(&mut seed) * 2.5),
+                1.0,
+            )
+        }).collect();
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.relink(&sources, &SpatialHash::build(&sources), vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
+
+        // Reference: the same footprints, walked serially exactly as `relink`
+        // walked them before it was parallelised.
+        let mut want_rec: Vec<u32> = Vec::new();
+        let mut want_w: Vec<f32> = Vec::new();
+        let mut want_start: Vec<u32> = Vec::new();
+        for s in &sources {
+            want_start.push(want_rec.len() as u32);
+            let Some(fp) = footprint(&vp, w, h, s) else { continue; };
+            let u0 = (fp.u - fp.hu).floor().max(0.0) as i64;
+            let u1 = (fp.u + fp.hu).ceil().min(w as f32 - 1.0) as i64;
+            let v0 = (fp.v - fp.hv).floor().max(0.0) as i64;
+            let v1 = (fp.v + fp.hv).ceil().min(h as f32 - 1.0) as i64;
+            if u0 > u1 || v0 > v1 { continue; }
+            for rv in v0..=v1 {
+                for ru in u0..=u1 {
+                    let du = ru as f32 + 0.5 - fp.u;
+                    let dv = rv as f32 + 0.5 - fp.v;
+                    let e = fp.a * du * du + 2.0 * fp.b * du * dv + fp.c * dv * dv;
+                    if e >= 4.0 { continue; }
+                    want_rec.push(rv as u32 * w + ru as u32);
+                    want_w.push((-e).exp() * cutoff_window(e));
+                }
+            }
+        }
+        assert!(want_rec.len() > 10_000, "test scene is too thin to prove anything: {} pipes", want_rec.len());
+        assert_eq!(r.stats.pipes_total, want_rec.len(), "pipe count differs from the serial build");
+
+        let mut k = 0usize;
+        for i in 0..n {
+            let got: Vec<(u32, f32)> = r.pipes_of(i).collect();
+            assert_eq!(r.pipe_start[i], want_start[i], "entity {} start", i);
+            assert_eq!(r.pipe_start[i] as usize, k, "entity {} start is not the running prefix sum", i);
+            for (off, &(rc, weight)) in got.iter().enumerate() {
+                assert_eq!(rc, want_rec[k + off], "entity {} pipe {} receptor", i, off);
+                assert_eq!(weight, want_w[k + off], "entity {} pipe {} weight", i, off);
+            }
+            // Row-major within the footprint: receptor indices strictly ascend.
+            assert!(got.windows(2).all(|p| p[0].0 < p[1].0), "entity {} pipes are out of order", i);
+            k += got.len();
+        }
+        assert_eq!(k, want_rec.len(), "pipes_of did not cover the whole array");
     }
 
     #[test]

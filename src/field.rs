@@ -593,6 +593,16 @@ impl DiffField {
         );
     }
 
+    /// Does this entity's deposit sit at the same world point every tick?
+    /// That is what `Source::is_static` promises the spatial hash, so it has to
+    /// rule out all three ways `advance_entities` can move a deposit: the
+    /// walker's step, per-entity velocity, and the surface oscillation. The
+    /// scene's furniture — floor, rock, sun — clears all three, and it is the
+    /// bulk of the hash's cell insertions.
+    fn is_static_entity(e: &Entity) -> bool {
+        !e.is_walker && e.velocity == glam::Vec3::ZERO && e.oscillation_amplitude == 0.0
+    }
+
     /// Static occluder set for edge attenuation: every solid entity at its
     /// current position. Nothing is drawable here — this is only for τ.
     fn occluder_sources(&self) -> Vec<crate::retina::Source> {
@@ -605,6 +615,7 @@ impl DiffField {
             color: [0.0; 3],
             drawable: false,
             occluder: !e.is_heat && !e.is_vacuum,
+            is_static: Self::is_static_entity(e),
         }).collect()
     }
 
@@ -1803,6 +1814,7 @@ impl DiffField {
         self.sources.resize(n, Source {
             position: glam::Vec3::ZERO, radii: glam::Vec3::ZERO, normal: glam::Vec3::Y,
             opacity: 0.0, density: 0.0, color: [0.0; 3], drawable: false, occluder: false,
+            is_static: true,
         });
 
         let mut aabb_min = glam::Vec3::splat(FIELD_SIZE as f32);
@@ -1895,6 +1907,7 @@ impl DiffField {
                 color: [total_r, total_g, total_b],
                 drawable,
                 occluder: true,
+                is_static: Self::is_static_entity(entity),
             };
         }
         self.aabb_min = aabb_min.max(glam::Vec3::ZERO);
@@ -2156,12 +2169,24 @@ mod tests {
         const WORST_STEADY_BUDGET_MS: f64 = 150.0;
         const RELINK_BUDGET_MS: f64 = 80.0;
         const REFRESH_BUDGET_MS: f64 = 150.0;
+        /// A relinking walking tick, which is every tick while the dino moves.
+        /// Uncontended it lands near 22 ms on the reference machine; 60 leaves
+        /// the room a shared rayon pool takes. Judged, like every other budget
+        /// here, on the fastest sample — see the doc comment.
+        const WALKING_BUDGET_MS: f64 = 60.0;
+        /// The first two relinks grow every SoA array (pipes, weights,
+        /// pipe_last — ~55 MB together) from nothing and build the static half
+        /// of the spatial hash, so they cost roughly twice a settled relink.
+        /// That is a process-lifetime cost, not a frame cost, so they are
+        /// printed and held to the loose ceiling but never taken as the best.
+        const WALKING_WARMUP_TICKS: usize = 2;
 
         let mut field = DiffField::new();
         let vp = test_view_proj();
 
-        // Phase 1 — the walking scene. Every tick here relinks (and one also
-        // refreshes cross links), so each only has to clear the refresh budget.
+        // Phase 1 — the walking scene. Every tick here relinks; one also
+        // refreshes cross links, and that sample is measuring the refresh.
+        let mut best_walking = f64::MAX;
         for i in 0..12 {
             let relinks_before = field.retina.stats.relinks;
             let refresh_before = field.last_refresh_tick;
@@ -2169,16 +2194,23 @@ mod tests {
             field.tick(vp);
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             let s = field.retina.stats;
+            let refreshed = field.last_refresh_tick != refresh_before;
             eprintln!("walking tick {:2}: {:7.2} ms  ({}{}hash {:.2} + relink {:.2} ms [footprints {:.2}, pipes {:.2}, τ {:.2}, rest {:.2}], {} of {} pipes sent)",
                 i, ms,
                 if s.relinks > relinks_before { "RELINK, " } else { "" },
-                if field.last_refresh_tick != refresh_before { "CROSS-LINK REFRESH, " } else { "" },
+                if refreshed { "CROSS-LINK REFRESH, " } else { "" },
                 s.hash_build_ms, s.relink_ms, s.relink_footprint_ms, s.relink_pipes_ms, s.relink_tau_ms,
                 s.relink_ms - s.relink_footprint_ms - s.relink_pipes_ms - s.relink_tau_ms,
                 s.pipes_sent, s.pipes_total);
             assert!(ms < REFRESH_BUDGET_MS,
-                "walking tick {} {:.2} ms exceeds the {:.0} ms budget", i, ms, REFRESH_BUDGET_MS);
+                "walking tick {} {:.2} ms exceeds the {:.0} ms ceiling", i, ms, REFRESH_BUDGET_MS);
+            // A cross-link refresh lands on one of these ticks and dominates
+            // it: that sample is measuring the refresh, not a walking tick.
+            if !refreshed && i >= WALKING_WARMUP_TICKS { best_walking = best_walking.min(ms); }
         }
+        eprintln!("walking: best settled tick {:.2} ms", best_walking);
+        assert!(best_walking < WALKING_BUDGET_MS,
+            "fastest walking tick {:.2} ms exceeds the {:.0} ms budget", best_walking, WALKING_BUDGET_MS);
 
         // Phase 2 — steady state. Stop the world the way
         // `retina_sees_the_dino_and_settles` does, then let it settle before
