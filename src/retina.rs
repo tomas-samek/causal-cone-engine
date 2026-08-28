@@ -365,9 +365,10 @@ pub struct RetinaStats {
 
 /// Image-space footprint of a projected axis-aligned gaussian: center,
 /// eye distance, inverse 2×2 covariance (e = a·du² + 2b·du·dv + c·dv²),
-/// and the kernel's projected extent as a screen-space bounding box. The box
-/// is not `center ± 2σ`: it is the hull of the projected kernel itself, which
-/// off-axis and near the eye is neither centred on `(u, v)` nor symmetric.
+/// and the receptor rectangle the pipe loop walks. The rectangle is the
+/// intersection of two boxes — the 2σ box the covariance needs and the
+/// kernel's true projected extent (see `footprint`) — so it is neither
+/// centred on `(u, v)` nor symmetric.
 struct Footprint {
     u: f32,
     v: f32,
@@ -398,6 +399,40 @@ fn project(vp: &Mat4, w: u32, h: u32, p: Vec3) -> Option<(f32, f32, f32)> {
 /// surface is the kernel's true extent and the outer edge of its footprint.
 const KERNEL_EXTENT: f32 = 2.0;
 
+/// Exact range of the projective coordinate `(num·p̃) / (den·p̃)` over the
+/// axis-aligned ellipsoid `centre ± semi` — the ellipsoid's true perspective
+/// silhouette along one clip axis. `None` if the ellipsoid is not strictly in
+/// front of the plane `den·p̃ = 0`, i.e. it straddles the eye and has no
+/// screen-space hull at all.
+///
+/// Sampling the six axis endpoints instead would *under*estimate this: the
+/// silhouette's extreme is a tangency somewhere on the surface, generally not
+/// on an axis. Writing `p = c + diag(semi)·z` with `|z| ≤ 1`, the value is
+/// `(A + α·z)/(B + β·z)`, and at an extremum `t` the supporting hyperplane
+/// gives `|α − tβ| = |tB − A|`. Squaring that is a quadratic in `t` whose two
+/// roots are exactly the min and max:
+///
+/// ```text
+/// P t² + 2Q t + R = 0,  P = B² − |β|², Q = α·β − AB, R = A² − |α|²
+/// ```
+///
+/// `P > 0` is precisely "the ellipsoid is in front of the eye", and then the
+/// discriminant is `|Bα − Aβ|² − (|α|²|β|² − (α·β)²) ≥ 0` by Cauchy–Schwarz —
+/// which is also the form evaluated here, since `Q² − PR` in f32 cancels two
+/// large products against each other.
+fn projective_range(num: Vec4, den: Vec4, centre: Vec3, semi: Vec3) -> Option<(f32, f32)> {
+    let c = centre.extend(1.0);
+    let (a, b) = (num.dot(c), den.dot(c));
+    let (alpha, beta) = (num.truncate() * semi, den.truncate() * semi);
+    let p = b * b - beta.length_squared();
+    if b <= 0.0 || p <= 1e-6 { return None; }
+    let q = alpha.dot(beta) - a * b;
+    let disc = ((b * alpha - a * beta).length_squared()
+        - (alpha.length_squared() * beta.length_squared() - alpha.dot(beta).powi(2))).max(0.0);
+    let s = disc.sqrt();
+    Some(((-q - s) / p, (-q + s) / p))
+}
+
 /// Image-space footprint of `s` under `vp`, or `None` if it has none.
 ///
 /// The gaussian is modelled in image space by a 2×2 covariance, which is a
@@ -411,27 +446,54 @@ const KERNEL_EXTENT: f32 = 2.0;
 ///    endpoint's offset raw, and as that endpoint approached the near plane
 ///    its offset grew without bound — the needle that striped the image. The
 ///    two sides move oppositely under the divide, so most of that cancels.
-/// 2. **A bounding box that is the kernel's own projected extent**, the hull
-///    of the six endpoints scaled out to `KERNEL_EXTENT`, rather than
-///    `centre ± 2σ`. The gaussian model is only trusted where the kernel
-///    actually lands, so a kernel whose extent projects entirely off-screen
-///    contributes nothing however wide its covariance came out. That is what
-///    removes the rock needles beside the camera, with no depth heuristic:
-///    they are simply not on screen.
+/// 2. **A bounding box that is the intersection of two boxes**, each
+///    correcting the other's failure mode:
+///    - the **extent box**: the exact screen-space bounding box of the
+///      kernel's extent ellipsoid, `position ± KERNEL_EXTENT·r`, which is
+///      precisely the surface where `kernel()` stops being zero. It is the
+///      true perspective silhouette — a tangency on the ellipsoid, computed
+///      in closed form by `projective_range`, *not* the hull of the six axis
+///      endpoints, which is a strict underestimate of it. The gaussian model
+///      is only trusted where the kernel actually lands, so a kernel whose
+///      extent projects entirely off-screen contributes nothing however wide
+///      its covariance came out. That is what removes the rock needles beside
+///      the camera, with no depth heuristic: they are simply not on screen.
+///    - the **2σ box**, `centre ± 2·sqrt(s_uu)` by `± 2·sqrt(s_vv)`, which
+///      circumscribes the `e = 4` ellipse the pipe loop actually evaluates.
+///      The ellipse's support in a direction `n` is `2·sqrt(Σ(v·n)²)`, and for
+///      an oblique kernel that is strictly *wider* than the hull of the
+///      projected axis endpoints, `2·max|v·n|`. Bounding by that hull stopped
+///      the pipes while the weights were still ~0.06 — the axis-aligned
+///      staircase cut out of the dino's silhouette. Wherever the linearisation
+///      holds (everything not right against the eye) the extent box is the
+///      wider of the two, the 2σ box binds, and the weights fade to zero
+///      before the edge by construction.
+///    Both boxes contain the projected centre, so the intersection is never
+///    empty and a source too small to span a receptor still keeps the one
+///    receptor under it. The screen clip is the pipe loop's.
 ///
 /// Two cases have no footprint at all. If the eye is *inside* the kernel
-/// (`depth < max radius`) there is no outside view of it to project. If any
-/// endpoint projects to `None` it is behind the eye, so the kernel straddles
-/// the eye and its hull is not a screen-space box — then the whole footprint
-/// goes, not just that axis, which would otherwise report a flat blob.
+/// (`depth < max radius`) there is no outside view of it to project — a cheap
+/// early-out. And if the extent ellipsoid straddles the eye plane, it has no
+/// screen-space hull at all: `projective_range` returns `None` and so does the
+/// whole footprint, rather than reporting a flat blob from one good axis. That
+/// second case is the real gate, and it subsumes the first: an eye within
+/// `KERNEL_EXTENT·r` of the entity sees no footprint for it.
 fn footprint(vp: &Mat4, w: u32, h: u32, s: &Source) -> Option<Footprint> {
     let (u, v, depth) = project(vp, w, h, s.position)?;
     let r = s.kernel_radii();
     if depth < r.max_element() { return None; }
+
+    // Extent box: exact silhouette of the ellipsoid position ± 2r. `den` is
+    // the clip-w row; `num` is clip-x for u and clip-y for v. v runs down the
+    // screen, so its range is the y range mirrored.
+    let (den, reach) = (vp.row(3), r * KERNEL_EXTENT);
+    let (gx0, gx1) = projective_range(vp.row(0), den, s.position, reach)?;
+    let (gy0, gy1) = projective_range(vp.row(1), den, s.position, reach)?;
+    let (eu0, eu1) = ((gx0 * 0.5 + 0.5) * w as f32, (gx1 * 0.5 + 0.5) * w as f32);
+    let (ev0, ev1) = ((0.5 - gy1 * 0.5) * h as f32, (0.5 - gy0 * 0.5) * h as f32);
+
     let (mut suu, mut suv, mut svv) = (0.0f32, 0.0f32, 0.0f32);
-    // The hull always contains the centre, so a source too small to span a
-    // receptor still keeps the one receptor under it.
-    let (mut u0, mut u1, mut v0, mut v1) = (u, u, v, v);
     for axis in [Vec3::X * r.x, Vec3::Y * r.y, Vec3::Z * r.z] {
         let (pu, pv, _) = project(vp, w, h, s.position + axis)?;
         let (mu, mv, _) = project(vp, w, h, s.position - axis)?;
@@ -440,25 +502,23 @@ fn footprint(vp: &Mat4, w: u32, h: u32, s: &Source) -> Option<Footprint> {
         suu += du * du;
         suv += du * dv;
         svv += dv * dv;
-        for (eu, ev) in [(pu, pv), (mu, mv)] {
-            let (bu, bv) = (u + (eu - u) * KERNEL_EXTENT, v + (ev - v) * KERNEL_EXTENT);
-            u0 = u0.min(bu);
-            u1 = u1.max(bu);
-            v0 = v0.min(bv);
-            v1 = v1.max(bv);
-        }
     }
     // Floor the variance at half a receptor so distant entities keep a pipe.
     let min_var = 0.25;
     suu = suu.max(min_var);
     svv = svv.max(min_var);
     let det = (suu * svv - suv * suv).max(1e-6);
+    // 2σ box ∩ extent box.
+    let (hu, hv) = (2.0 * suu.sqrt(), 2.0 * svv.sqrt());
     Some(Footprint {
         u, v, depth,
         a: svv / det,
         b: -suv / det,
         c: suu / det,
-        u0, u1, v0, v1,
+        u0: (u - hu).max(eu0),
+        u1: (u + hu).min(eu1),
+        v0: (v - hv).max(ev0),
+        v1: (v + hv).min(ev1),
     })
 }
 
@@ -1396,6 +1456,111 @@ mod tests {
         let u1 = pipes.iter().map(|rc| rc % w).max().unwrap();
         assert!(u1 - u0 + 1 < 100,
             "footprint spans {} of {} columns — still a band", u1 - u0 + 1, w);
+    }
+
+    /// The closed-form silhouette must be exactly the min/max of the projected
+    /// ellipsoid — tight enough that nothing on the surface escapes it, and no
+    /// looser than that. Brute-forced against a dense sampling of the surface,
+    /// for an off-axis ellipsoid whose extremes are nowhere near an axis
+    /// endpoint (which is the whole reason the six-endpoint hull was wrong).
+    #[test]
+    fn projective_range_is_the_exact_silhouette_of_the_ellipsoid() {
+        let (w, h) = (141u32, 79u32);
+        let vp = test_view_proj(w, h);
+        let (c, semi) = (Vec3::new(6.0, 2.0, -18.0), Vec3::new(10.0, 12.0, 16.0));
+        let (g0, g1) = projective_range(vp.row(0), vp.row(3), c, semi)
+            .expect("ellipsoid is in front of the eye");
+
+        let g_of = |z: Vec3| { let clip = vp * (c + z * semi).extend(1.0); clip.x / clip.w };
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for i in 0..=600 {
+            for j in 0..=600 {
+                let theta = i as f32 / 600.0 * std::f32::consts::PI;
+                let phi = j as f32 / 600.0 * std::f32::consts::TAU;
+                let z = Vec3::new(theta.sin() * phi.cos(), theta.sin() * phi.sin(), theta.cos());
+                let g = g_of(z);
+                lo = lo.min(g);
+                hi = hi.max(g);
+            }
+        }
+        assert!(g0 <= lo + 1e-3 && g1 >= hi - 1e-3, "silhouette misses the surface: [{}, {}] vs [{}, {}]", g0, g1, lo, hi);
+        assert!((g0 - lo).abs() < 2e-3 && (g1 - hi).abs() < 2e-3, "silhouette is loose: [{}, {}] vs [{}, {}]", g0, g1, lo, hi);
+
+        // The extremes are tangencies, not axis endpoints — which is exactly
+        // why the hull of the six endpoints is a strict underestimate.
+        let (mut hull_lo, mut hull_hi) = (f32::MAX, f32::MIN);
+        for z in [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z] {
+            hull_lo = hull_lo.min(g_of(z));
+            hull_hi = hull_hi.max(g_of(z));
+        }
+        assert!(hull_lo > g0 + 0.01 && hull_hi < g1 - 0.01,
+            "six-endpoint hull [{}, {}] is not strictly inside the silhouette [{}, {}]",
+            hull_lo, hull_hi, g0, g1);
+
+        // Straddling the eye plane: |β| = 2 exceeds B = 1.5, no hull at all.
+        assert!(projective_range(vp.row(0), vp.row(3), Vec3::new(0.0, 0.0, -1.5), Vec3::ONE * 2.0).is_none());
+    }
+
+    /// A big oblique metaball must fade out inside its own bounding box, not
+    /// stop at the box edge with the weights still large — that hard stop is
+    /// the axis-aligned staircase cut through the dino's silhouette.
+    ///
+    /// The bound has to be the *ellipse's* support, `2·sqrt(Σ(v·n)²)`, which
+    /// for an oblique kernel is strictly wider than the hull of the projected
+    /// axis endpoints, `2·max|v·n|`. The three axes here project to spans of
+    /// ~11, ~13 and ~(7, −2) receptors, so the u-hull stops ~4.5 receptors
+    /// short of the ellipse and cuts the blob where its weight is still ~0.06.
+    #[test]
+    fn a_big_oblique_metaball_fades_out_before_its_footprint_edge() {
+        let (w, h) = (141u32, 79u32);
+        let vp = test_view_proj(w, h);
+        // Off-axis in x and y, so no projected axis lines up with a screen axis.
+        let sources = vec![src(Vec3::new(6.0, 2.0, -18.0), Vec3::new(5.0, 6.0, 8.0), 1.0)];
+        let hash = SpatialHash::build(&sources);
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.relink(&sources, &hash, vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
+        let pipes: Vec<(u32, u32, f32)> = r.pipes_of(0)
+            .map(|(rc, weight)| (rc % w, rc / w, weight)).collect();
+        assert!(!pipes.is_empty(), "the metaball got no pipes at all");
+
+        // The centre is on screen, so somewhere in there a pipe carries ~all
+        // of the source. Without this the "no hard cut" check is vacuous.
+        let max_w = pipes.iter().map(|&(_, _, x)| x).fold(0.0f32, f32::max);
+        assert!(max_w >= 0.9, "centre is not on screen: max weight {}", max_w);
+
+        let (cu0, cu1) = (pipes.iter().map(|p| p.0).min().unwrap(), pipes.iter().map(|p| p.0).max().unwrap());
+        let (rv0, rv1) = (pipes.iter().map(|p| p.1).min().unwrap(), pipes.iter().map(|p| p.1).max().unwrap());
+        // The footprint must be well inside the screen, or "the border of the
+        // pipe set" would be the screen edge and prove nothing about the box.
+        assert!(cu0 > 0 && cu1 < w - 1 && rv0 > 0 && rv1 < h - 1,
+            "footprint touches the screen edge: u {}..{}, v {}..{}", cu0, cu1, rv0, rv1);
+        for &(cu, rv, weight) in &pipes {
+            if cu == cu0 || cu == cu1 || rv == rv0 || rv == rv1 {
+                assert!(weight < 0.05,
+                    "hard cut at the footprint border: weight {} at (u {}, v {}) of u {}..{}, v {}..{}",
+                    weight, cu, rv, cu0, cu1, rv0, rv1);
+            }
+        }
+    }
+
+    /// The eye inside the kernel's *extent* — not just its core — has no
+    /// outside view of it either: the −Z endpoint at 2r sits behind the eye,
+    /// so the projected hull is not a screen-space box at all.
+    #[test]
+    fn a_kernel_whose_extent_straddles_the_eye_gets_no_pipes() {
+        let (w, h) = (141u32, 79u32);
+        let vp = test_view_proj(w, h);
+        // depth 1.5 > r = 1, so the cheap eye-inside-core early-out misses it;
+        // the +Z extent endpoint is at z = +0.5, behind the eye.
+        let sources = vec![src(Vec3::new(0.0, 0.0, -1.5), Vec3::ONE, 1.0)];
+        let hash = SpatialHash::build(&sources);
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.relink(&sources, &hash, vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
+        assert_eq!(r.pipes_of(0).count(), 0,
+            "kernel straddling the eye got {} pipes", r.pipes_of(0).count());
+        assert_eq!(r.stats.pipes_total, 0);
     }
 
     /// The pipe arrays are built in parallel over chunks of entities and then
