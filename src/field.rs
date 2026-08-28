@@ -2388,5 +2388,67 @@ mod tests {
             far_avg, cross_avg
         );
     }
+
+    /// Close-range probe: the eye parked inside the walker's own bounding box,
+    /// the pose the user's screenshot was taken from. Prints `pipes_total` and
+    /// the walking tick time there, plus the widest footprint at the pose —
+    /// the diagnostic that exposed the near-plane needle. Not a cost budget:
+    /// the numbers are the measurement, and the one assertion pins only that
+    /// the near-plane cut is still in force.
+    #[test]
+    #[ignore] // builds the full demo scene (slow) — run: cargo test --release -- --ignored
+    fn close_range_probe_reports_pipe_count() {
+        let mut field = DiffField::new();
+        let (mut lo, mut hi) = (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN));
+        for e in field.entities.iter().filter(|e| e.is_walker) {
+            lo = lo.min(e.position);
+            hi = hi.max(e.position);
+        }
+        let centre = (lo + hi) * 0.5;
+        let eye = glam::Vec3::new(centre.x + 2.0, lo.y + 3.0, hi.z + 6.0);
+        let proj = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 16.0 / 9.0, 0.1, 500.0);
+        let vp = proj * glam::Mat4::look_at_rh(eye, centre, glam::Vec3::Y);
+        eprintln!("probe pose: eye {:?} → walker centre {:?} (walker aabb {:?}..{:?})", eye, centre, lo, hi);
+
+        let mut best = f64::MAX;
+        let mut pipes = 0usize;
+        let mut widest = (0usize, 0u32, 0u32); // entity, columns, rows
+        for i in 0..5 {
+            let t0 = std::time::Instant::now();
+            field.tick(vp);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let s = field.retina.stats;
+            eprintln!("probe tick {}: {:7.2} ms, pipes_total {}", i, ms, s.pipes_total);
+            best = best.min(ms);
+            pipes = s.pipes_total;
+        }
+        // Widest footprint at this pose, in receptor columns.
+        let w = field.retina.width;
+        for i in 0..field.entities.len() {
+            let (mut u0, mut u1, mut v0, mut v1) = (u32::MAX, 0u32, u32::MAX, 0u32);
+            let mut n = 0u32;
+            for (rc, _) in field.retina.pipes_of(i) {
+                u0 = u0.min(rc % w); u1 = u1.max(rc % w);
+                v0 = v0.min(rc / w); v1 = v1.max(rc / w);
+                n += 1;
+            }
+            if n == 0 { continue; }
+            let cols = u1 - u0 + 1;
+            if cols > widest.1 { widest = (i, cols, v1 - v0 + 1); }
+        }
+        {
+            let e = &field.entities[widest.0];
+            eprintln!("WIDEST: group {} radii {:?} pos {:?} depth {:.3} dist {:.2}",
+                e.group, e.deposit_radii, e.position, field.retina.depth_of(widest.0),
+                e.position.distance(eye));
+        }
+        eprintln!("PROBE RESULT: pipes_total {}, best walking tick {:.2} ms, widest footprint entity {} spans {}×{} receptors (retina {}×{})",
+            pipes, best, widest.0, widest.1, widest.2, field.retina.width, field.retina.height);
+        // Regression guard on the measurement itself: before the near-plane
+        // cut this pose linked 8.93 M pipes, most of them from two unit
+        // kernels beside the camera painting bands across the whole image.
+        assert!(pipes < 5_000_000,
+            "pipes_total {} at the probe pose — the near-plane cut is not holding", pipes);
+    }
 }
 

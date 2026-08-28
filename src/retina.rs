@@ -390,18 +390,35 @@ fn project(vp: &Mat4, w: u32, h: u32, p: Vec3) -> Option<(f32, f32, f32)> {
     ))
 }
 
+/// How far in front of the eye a kernel must sit, in units of its own largest
+/// radius, to have an image-plane footprint at all. The kernel reaches
+/// `2·radii` (`kernel()` is zero past that), so a source closer than this
+/// either encloses the eye or brushes past it: `footprint()` linearises the
+/// projection by projecting the axis endpoints, and once an endpoint
+/// approaches the near plane its projected offset blows up and the covariance
+/// degenerates into a needle striping the whole image. Neither case has a
+/// meaningful footprint, so there is nothing to draw.
+pub const NEAR_FOOTPRINT_DEPTH_FACTOR: f32 = 2.0;
+
 fn footprint(vp: &Mat4, w: u32, h: u32, s: &Source) -> Option<Footprint> {
     let (u, v, depth) = project(vp, w, h, s.position)?;
     let r = s.kernel_radii();
+    if depth < NEAR_FOOTPRINT_DEPTH_FACTOR * r.max_element() { return None; }
     let (mut suu, mut suv, mut svv) = (0.0f32, 0.0f32, 0.0f32);
     for axis in [Vec3::X * r.x, Vec3::Y * r.y, Vec3::Z * r.z] {
-        if let Some((pu, pv, _)) = project(vp, w, h, s.position + axis) {
-            let du = pu - u;
-            let dv = pv - v;
-            suu += du * du;
-            suv += du * dv;
-            svv += dv * dv;
-        }
+        // An endpoint behind the eye means the kernel straddles it — drop the
+        // whole footprint rather than silently omitting that axis, which would
+        // report a flat blob for a source wrapped around the camera. Under the
+        // depth cut above this is already unreachable for a plain perspective
+        // view — an axis is at most `r.max_element()` ≤ `depth/2` long, so an
+        // endpoint still sits at `depth/2` or more in front of the eye — but
+        // the invariant belongs here, not in a caller's choice of matrix.
+        let (pu, pv, _) = project(vp, w, h, s.position + axis)?;
+        let du = pu - u;
+        let dv = pv - v;
+        suu += du * du;
+        suv += du * dv;
+        svv += dv * dv;
     }
     // Floor the variance at half a receptor so distant entities keep a pipe.
     let min_var = 0.25;
@@ -1253,6 +1270,54 @@ mod tests {
             assert_eq!(r.transmittance(i), 1.0, "source {} τ not defaulted to 1.0", i);
         }
         assert_eq!(r.stats.pipes_total, 0);
+    }
+
+    /// A kernel whose extent reaches the near plane has no image-plane
+    /// footprint. `footprint()` linearises the projection by projecting the
+    /// three axis endpoints; once `w < 2·r` the depth endpoint lands at
+    /// `w' ≈ 0⁺` and its projected offset is unbounded, so the covariance
+    /// degenerates into a needle painting a band across the whole image.
+    /// Both entities in the user's screenshot were exactly this: unit kernels
+    /// at view depth 0.30 and 0.45, spanning 299×18 and 181×26 receptors.
+    #[test]
+    fn kernels_that_reach_the_near_plane_get_no_pipes() {
+        let (w, h) = (141u32, 79u32);
+        let vp = test_view_proj(w, h);
+        let sources = vec![
+            // Beside the camera, well outside the frustum, but at view depth
+            // 0.304 — the 299-column band from the screenshot.
+            src(Vec3::new(15.7, 0.5, -0.304), Vec3::ONE, 1.0),
+            // Straight ahead but inside the kernel extent: the eye is engulfed.
+            src(Vec3::new(0.0, 0.5, -0.304), Vec3::ONE, 1.0),
+        ];
+        let hash = SpatialHash::build(&sources);
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.relink(&sources, &hash, vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
+        for i in 0..sources.len() {
+            assert_eq!(r.pipes_of(i).count(), 0,
+                "near-plane source {} got {} pipes", i, r.pipes_of(i).count());
+        }
+        assert_eq!(r.stats.pipes_total, 0);
+    }
+
+    /// The cut is exactly at the kernel extent: one radius further out and the
+    /// source is drawn normally, as a compact blob rather than a band.
+    #[test]
+    fn a_source_just_past_the_kernel_extent_still_gets_a_compact_footprint() {
+        let (w, h) = (141u32, 79u32);
+        let vp = test_view_proj(w, h);
+        let sources = vec![src(Vec3::new(0.0, 0.5, -3.0), Vec3::ONE, 1.0)];
+        let hash = SpatialHash::build(&sources);
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.relink(&sources, &hash, vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
+        let pipes: Vec<u32> = r.pipes_of(0).map(|(rc, _)| rc).collect();
+        assert!(!pipes.is_empty(), "w = 3 > 2·r, the source must still be drawn");
+        let u0 = pipes.iter().map(|rc| rc % w).min().unwrap();
+        let u1 = pipes.iter().map(|rc| rc % w).max().unwrap();
+        assert!(u1 - u0 + 1 < 100,
+            "footprint spans {} of {} columns — still a band", u1 - u0 + 1, w);
     }
 
     /// The pipe arrays are built in parallel over chunks of entities and then
