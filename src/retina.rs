@@ -430,10 +430,14 @@ const KERNEL_EXTENT: f32 = 2.0;
 /// P t² + 2Q t + R = 0,  P = B² − |β|², Q = α·β − AB, R = A² − |α|²
 /// ```
 ///
-/// `P > 0` is precisely "the ellipsoid is in front of the eye", and then the
-/// discriminant is `|Bα − Aβ|² − (|α|²|β|² − (α·β)²) ≥ 0` by Cauchy–Schwarz —
-/// which is also the form evaluated here, since `Q² − PR` in f32 cancels two
-/// large products against each other.
+/// `P > 0` is precisely "the ellipsoid is in front of the eye", and it is also
+/// what makes the discriminant `|Bα − Aβ|² − |α × β|²` non-negative — not
+/// Cauchy–Schwarz, which only says the second term is ≥ 0. Split `α` into the
+/// parts parallel and perpendicular to `β`: the perpendicular part of
+/// `Bα − Aβ` is `Bα_⊥`, so `|Bα − Aβ| ≥ B|α_⊥| ≥ |β||α_⊥| = |α × β|` exactly
+/// when `B ≥ |β|`. That form is also what is evaluated here — `Q² − PR` in f32
+/// cancels two large products against each other, and `|α|²|β|² − (α·β)²`
+/// cancels two more.
 fn projective_range(num: Vec4, den: Vec4, centre: Vec3, semi: Vec3) -> Option<(f32, f32)> {
     let c = centre.extend(1.0);
     let (a, b) = (num.dot(c), den.dot(c));
@@ -441,8 +445,7 @@ fn projective_range(num: Vec4, den: Vec4, centre: Vec3, semi: Vec3) -> Option<(f
     let p = b * b - beta.length_squared();
     if b <= 0.0 || p <= 1e-6 { return None; }
     let q = alpha.dot(beta) - a * b;
-    let disc = ((b * alpha - a * beta).length_squared()
-        - (alpha.length_squared() * beta.length_squared() - alpha.dot(beta).powi(2))).max(0.0);
+    let disc = ((b * alpha - a * beta).length_squared() - alpha.cross(beta).length_squared()).max(0.0);
     let s = disc.sqrt();
     Some(((-q - s) / p, (-q + s) / p))
 }
@@ -486,13 +489,17 @@ fn projective_range(num: Vec4, den: Vec4, centre: Vec3, semi: Vec3) -> Option<(f
 ///    empty and a source too small to span a receptor still keeps the one
 ///    receptor under it. The screen clip is the pipe loop's.
 ///
-/// Two cases have no footprint at all. If the eye is *inside* the kernel
-/// (`depth < max radius`) there is no outside view of it to project — a cheap
-/// early-out. And if the extent ellipsoid straddles the eye plane, it has no
-/// screen-space hull at all: `projective_range` returns `None` and so does the
-/// whole footprint, rather than reporting a flat blob from one good axis. That
-/// second case is the real gate, and it subsumes the first: an eye within
-/// `KERNEL_EXTENT·r` of the entity sees no footprint for it.
+/// Two independent gates give no footprint at all, and both are kept. If the
+/// eye is *inside* the kernel (`depth < max radius`) there is no outside view
+/// of it to project. And if the extent ellipsoid straddles the eye plane it has
+/// no screen-space hull at all: `projective_range` returns `None` and so does
+/// the whole footprint, rather than reporting a flat blob from one good axis.
+/// Neither subsumes the other. The ellipsoid gate is usually the stricter one
+/// (it reaches out to `KERNEL_EXTENT·r`, not `r`), but for anisotropic radii
+/// whose long axis runs across the view — say `r = (8, 8, 1)` seen along −Z at
+/// depth 4 — the ellipsoid's depth half-extent is only 2, so `|β| < B` passes
+/// while `depth < r.max_element()` still fires. That is the case the cheap
+/// early-out is there for.
 fn footprint(vp: &Mat4, w: u32, h: u32, s: &Source) -> Option<Footprint> {
     let (u, v, depth) = project(vp, w, h, s.position)?;
     let r = s.kernel_radii();

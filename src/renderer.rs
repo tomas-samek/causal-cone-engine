@@ -45,9 +45,10 @@ pub struct Renderer {
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
 
-    // The retina — two W×H textures on GPU
+    // The retina — three W×H textures on GPU
     retina_dc: wgpu::Texture,
     retina_nd: wgpu::Texture,
+    retina_skin: wgpu::Texture,
     retina_bind_group: wgpu::BindGroup,
     retina_layout: wgpu::BindGroupLayout,
     retina_sampler: wgpu::Sampler,
@@ -55,31 +56,37 @@ pub struct Renderer {
 
     // The field data on CPU
     diff_field: DiffField,
-    upload_buf: Vec<u16>, // f16 staging buffer for both textures (padded rows)
+    upload_buf: Vec<u16>, // f16 staging buffer for dc + nd (padded rows)
+    skin_buf: Vec<u8>,    // u8 staging buffer for the skin fraction (padded rows)
 }
 
-/// Allocate the two receptor textures at `w`×`h` and bind them with `sampler`.
+/// Allocate the three receptor textures at `w`×`h` and bind them with
+/// `sampler`. `dc`/`nd` are Rgba16Float; `skin` is a single R8Unorm channel —
+/// a fraction in [0, 1] needs nothing more, and giving it its own texture is
+/// what lets `nd.w` stay a plain unsigned depth (see the upload loop).
 fn create_retina_textures(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     w: u32,
     h: u32,
-) -> (wgpu::Texture, wgpu::Texture, wgpu::BindGroup) {
-    let make = |label: &str| device.create_texture(&wgpu::TextureDescriptor {
+) -> (wgpu::Texture, wgpu::Texture, wgpu::Texture, wgpu::BindGroup) {
+    let make = |label: &str, format| device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba16Float,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let dc = make("RetinaDC");
-    let nd = make("RetinaND");
+    let dc = make("RetinaDC", wgpu::TextureFormat::Rgba16Float);
+    let nd = make("RetinaND", wgpu::TextureFormat::Rgba16Float);
+    let skin = make("RetinaSkin", wgpu::TextureFormat::R8Unorm);
     let dc_view = dc.create_view(&Default::default());
     let nd_view = nd.create_view(&Default::default());
+    let skin_view = skin.create_view(&Default::default());
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("RetinaBindGroup"),
         layout,
@@ -87,9 +94,10 @@ fn create_retina_textures(
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&dc_view) },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&nd_view) },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&skin_view) },
         ],
     });
-    (dc, nd, bind_group)
+    (dc, nd, skin, bind_group)
 }
 
 impl Renderer {
@@ -220,6 +228,20 @@ impl Renderer {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    // Skin fraction (R8Unorm). Filterable like the others: the
+                    // shader thresholds the interpolated value at 0.5, so the
+                    // boundary between creature and scenery lands where the
+                    // arrived density says it does.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -235,7 +257,7 @@ impl Renderer {
         // --- The retina textures — sized by the CPU receptor array ---
         let diff_field = DiffField::new();
         let retina_size = (diff_field.retina.width, diff_field.retina.height);
-        let (retina_dc, retina_nd, retina_bind_group) = create_retina_textures(
+        let (retina_dc, retina_nd, retina_skin, retina_bind_group) = create_retina_textures(
             &device, &retina_layout, &retina_sampler, retina_size.0, retina_size.1,
         );
 
@@ -297,12 +319,14 @@ impl Renderer {
             uniform_bind_group,
             retina_dc,
             retina_nd,
+            retina_skin,
             retina_bind_group,
             retina_layout,
             retina_sampler,
             retina_size,
             diff_field,
             upload_buf: Vec::new(),
+            skin_buf: Vec::new(),
         }
     }
 
@@ -329,9 +353,10 @@ impl Renderer {
         // Resolution changed (keys 7/8)? Recreate the textures.
         let (rw, rh) = (self.diff_field.retina.width, self.diff_field.retina.height);
         if (rw, rh) != self.retina_size {
-            let (dc, nd, bg) = create_retina_textures(&self.device, &self.retina_layout, &self.retina_sampler, rw, rh);
+            let (dc, nd, skin, bg) = create_retina_textures(&self.device, &self.retina_layout, &self.retina_sampler, rw, rh);
             self.retina_dc = dc;
             self.retina_nd = nd;
+            self.retina_skin = skin;
             self.retina_bind_group = bg;
             self.retina_size = (rw, rh);
             self.diff_field.retina.dirty = true;
@@ -346,6 +371,11 @@ impl Renderer {
             let total = stride * rh as usize;
             self.upload_buf.resize(total * 2, 0);
             let (dc_buf, nd_buf) = self.upload_buf.split_at_mut(total);
+            // Same padding scheme for the skin texture, at 1 byte per texel.
+            let skin_row_bytes = ((rw + 255) / 256) * 256;
+            let skin_stride = skin_row_bytes as usize;
+            self.skin_buf.clear();
+            self.skin_buf.resize(skin_stride * rh as usize, 0);
             let f = |x: f32| half::f16::from_f32(x).to_bits();
             for (i, r) in self.diff_field.retina.receptors.iter().enumerate() {
                 let (x, y) = ((i % rw as usize), (i / rw as usize));
@@ -361,16 +391,15 @@ impl Renderer {
                 nd_buf[o] = f(nrm.x);
                 nd_buf[o + 1] = f(nrm.y);
                 nd_buf[o + 2] = f(nrm.z);
-                // nd.w packs two things in one f16: |nd.w| is the mean eye
-                // distance (always positive — the retina only sees what is in
-                // front of it), and its *sign* is the creature flag. Positive
-                // means most of what arrived here is dino skin, negative means
-                // scenery. That is what the shader keys its reptile scales off,
-                // replacing a colour heuristic that had started matching the
-                // lit floor. Fractions exactly at half count as creature.
-                let skin_fraction = r.skin * inv;
-                let sign = if skin_fraction >= 0.5 { 1.0 } else { -1.0 };
-                nd_buf[o + 3] = f(sign * (r.depth * inv).min(60000.0));
+                nd_buf[o + 3] = f((r.depth * inv).min(60000.0));
+                // The creature flag rides in its own texture rather than in the
+                // sign of nd.w. The sampler is Linear, and across a dino/floor
+                // boundary an interpolated ±depth passes through zero — |nd.w|
+                // would ramp to ~0 and collapse `sample_pos` onto the observer,
+                // fringing every silhouette with noise. A fraction in [0, 1]
+                // interpolates to a fraction, and the shader thresholds it.
+                self.skin_buf[y * skin_stride + x] =
+                    ((r.skin * inv).clamp(0.0, 1.0) * 255.0).round() as u8;
             }
             for (tex, buf) in [(&self.retina_dc, &*dc_buf), (&self.retina_nd, &*nd_buf)] {
                 self.queue.write_texture(
@@ -380,6 +409,12 @@ impl Renderer {
                     wgpu::Extent3d { width: rw, height: rh, depth_or_array_layers: 1 },
                 );
             }
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture { texture: &self.retina_skin, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                &self.skin_buf,
+                wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(skin_row_bytes), rows_per_image: Some(rh) },
+                wgpu::Extent3d { width: rw, height: rh, depth_or_array_layers: 1 },
+            );
             self.diff_field.retina.dirty = false;
         }
 

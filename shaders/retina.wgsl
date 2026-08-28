@@ -23,8 +23,8 @@ var<uniform> u: Uniforms;
 
 // --- Retina textures ---
 // dc: (density, r, g, b)  — color is Σ density·color / Σ density
-// nd: (nx, ny, nz, ±depth) — unit normal; |w| is the density-weighted eye
-//     distance and sign(w) is the creature flag (+ = dino skin, − = scenery)
+// nd: (nx, ny, nz, depth) — unit normal, density-weighted eye distance
+// skin: r — density-weighted fraction of this receptor that is creature
 
 @group(1) @binding(0)
 var retina_dc: texture_2d<f32>;
@@ -32,6 +32,8 @@ var retina_dc: texture_2d<f32>;
 var retina_nd: texture_2d<f32>;
 @group(1) @binding(2)
 var retina_sampler: sampler;
+@group(1) @binding(3)
+var retina_skin: texture_2d<f32>;
 
 // keep in sync with src/retina.rs RETINA_ISO
 const RETINA_ISO: f32 = 0.3;
@@ -181,13 +183,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         var norm_color = dc.gba;
         let n_len = length(nd.xyz);
         var normal = select(vec3<f32>(0.0, 1.0, 0.0), nd.xyz / max(n_len, 1e-5), n_len > 1e-4);
-        // nd.w packs the mean eye distance in its magnitude and the creature
-        // flag in its sign (see the upload loop in renderer.rs): positive means
-        // most of what arrived at this receptor came from the dino. It is a
-        // real per-source flag, not a guess from the colour — the floor's lit
-        // colour had grown green enough to pass the old greenness test.
-        let is_creature = select(0.0, 1.0, nd.w > 0.0);
-        let depth = abs(nd.w);
+        // Creature or scenery, from a real per-source flag rather than a guess
+        // at the colour — the floor's lit colour had grown green enough to pass
+        // the old greenness test. `skin` is the density-weighted fraction of
+        // this receptor that arrived from the dino, so most-of-it wins.
+        let skin = textureSample(retina_skin, retina_sampler, in.uv).r;
+        let is_creature = select(0.0, 1.0, skin > 0.5);
+        let depth = nd.w;
         // Surface point for texture coordinates: along this pixel's ray at the arrived depth
         let sample_pos = u.observer_pos + ray_dir * depth;
 
