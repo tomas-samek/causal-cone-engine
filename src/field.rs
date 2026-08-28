@@ -1878,11 +1878,17 @@ impl DiffField {
             if !freeze { entity.oscillation_phase += entity.oscillation_freq; }
 
             let use_gaussian = entity.deposit_radii != glam::Vec3::ZERO;
+            // Density boosts calibrated by eye on the retina (2026-08-28):
+            // the grid-era 40/10 bloated the silhouette into a green halo of
+            // gaussian tails above RETINA_ISO; ×0.25 tightened it without
+            // thinning the feet. Keys 1/2 still scale from this baseline.
             let (density_boost, color_boost) = if use_gaussian {
-                (40.0 * tune_density, 10.0 * tune_color)
-            } else {
                 (10.0 * tune_density, 10.0 * tune_color)
+            } else {
+                (2.5 * tune_density, 10.0 * tune_color)
             };
+            // Transmittance opacity is deliberately NOT retuned: τ is about
+            // what blocks light, not how the silhouette reads.
             let static_boost = if use_gaussian { 40.0 } else { 10.0 };
 
             // Visible? (frustum + trie-depth cutoff)
