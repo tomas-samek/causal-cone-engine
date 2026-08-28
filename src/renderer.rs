@@ -361,7 +361,16 @@ impl Renderer {
                 nd_buf[o] = f(nrm.x);
                 nd_buf[o + 1] = f(nrm.y);
                 nd_buf[o + 2] = f(nrm.z);
-                nd_buf[o + 3] = f((r.depth * inv).min(60000.0));
+                // nd.w packs two things in one f16: |nd.w| is the mean eye
+                // distance (always positive — the retina only sees what is in
+                // front of it), and its *sign* is the creature flag. Positive
+                // means most of what arrived here is dino skin, negative means
+                // scenery. That is what the shader keys its reptile scales off,
+                // replacing a colour heuristic that had started matching the
+                // lit floor. Fractions exactly at half count as creature.
+                let skin_fraction = r.skin * inv;
+                let sign = if skin_fraction >= 0.5 { 1.0 } else { -1.0 };
+                nd_buf[o + 3] = f(sign * (r.depth * inv).min(60000.0));
             }
             for (tex, buf) in [(&self.retina_dc, &*dc_buf), (&self.retina_nd, &*nd_buf)] {
                 self.queue.write_texture(

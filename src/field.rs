@@ -616,6 +616,7 @@ impl DiffField {
             drawable: false,
             occluder: !e.is_heat && !e.is_vacuum,
             is_static: Self::is_static_entity(e),
+            skin: false, // τ only — nothing here is ever drawn
         }).collect()
     }
 
@@ -1814,7 +1815,7 @@ impl DiffField {
         self.sources.resize(n, Source {
             position: glam::Vec3::ZERO, radii: glam::Vec3::ZERO, normal: glam::Vec3::Y,
             opacity: 0.0, density: 0.0, color: [0.0; 3], drawable: false, occluder: false,
-            is_static: true,
+            is_static: true, skin: false,
         });
 
         let mut aabb_min = glam::Vec3::splat(FIELD_SIZE as f32);
@@ -1908,6 +1909,9 @@ impl DiffField {
                 drawable,
                 occluder: true,
                 is_static: Self::is_static_entity(entity),
+                // Every walker group is dino — body, limbs, eyes, mouth. The
+                // shader reads this back as "give it reptile scales".
+                skin: entity.is_walker,
             };
         }
         self.aabb_min = aabb_min.max(glam::Vec3::ZERO);

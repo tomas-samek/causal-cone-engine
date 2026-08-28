@@ -64,6 +64,10 @@ pub struct Source {
     /// so the spatial hash may keep its cell insertions across relinks. Only
     /// the sources that actually move — the walker — pay to be re-hashed.
     pub is_static: bool,
+    /// Creature, not scenery: the shader gives it reptile scales. Carried as a
+    /// real flag because the colour heuristic it replaced ("green enough")
+    /// started matching the lit floor.
+    pub skin: bool,
 }
 
 impl Source {
@@ -282,6 +286,9 @@ pub struct Receptor {
     pub color: [f32; 3],
     pub normal: Vec3,
     pub depth: f32,
+    /// Σ density·skin over what arrived, so `skin / density` is the
+    /// density-weighted fraction of this receptor that is creature.
+    pub skin: f32,
 }
 
 impl Receptor {
@@ -292,6 +299,7 @@ impl Receptor {
         self.color[2] += p.color[2];
         self.normal += p.normal;
         self.depth += p.depth;
+        self.skin += p.skin;
     }
     /// Withdraw what a pipe last delivered. Only `relink`'s debug-build check
     /// that the receptors really are the sum of the pipes uses it.
@@ -303,6 +311,7 @@ impl Receptor {
         self.color[2] -= p.color[2];
         self.normal -= p.normal;
         self.depth -= p.depth;
+        self.skin -= p.skin;
     }
     fn add_receptor(&mut self, o: &Receptor) {
         self.density += o.density;
@@ -311,6 +320,7 @@ impl Receptor {
         self.color[2] += o.color[2];
         self.normal += o.normal;
         self.depth += o.depth;
+        self.skin += o.skin;
     }
 }
 
@@ -321,6 +331,7 @@ pub struct PipeState {
     pub color: [f32; 3],
     pub normal: Vec3,
     pub depth: f32,
+    pub skin: f32,
 }
 
 impl PipeState {
@@ -330,6 +341,7 @@ impl PipeState {
             color: [self.color[0] * w, self.color[1] * w, self.color[2] * w],
             normal: self.normal * w,
             depth: self.depth * w,
+            skin: self.skin * w,
         }
     }
     fn minus(&self, o: &PipeState) -> PipeState {
@@ -338,6 +350,7 @@ impl PipeState {
             color: [self.color[0] - o.color[0], self.color[1] - o.color[1], self.color[2] - o.color[2]],
             normal: self.normal - o.normal,
             depth: self.depth - o.depth,
+            skin: self.skin - o.skin,
         }
     }
     fn max_abs(&self) -> f32 {
@@ -345,6 +358,7 @@ impl PipeState {
             .max(self.color[0].abs()).max(self.color[1].abs()).max(self.color[2].abs())
             .max(self.normal.abs().max_element())
             .max(self.depth.abs())
+            .max(self.skin.abs())
     }
 }
 
@@ -808,6 +822,9 @@ impl Retina {
             color: [s.color[0] * self.entity_trans[i], s.color[1] * self.entity_trans[i], s.color[2] * self.entity_trans[i]],
             normal: s.normal * d,
             depth: self.entity_depth[i] * d,
+            // Density-weighted, exactly like `depth`: the receptor sums it and
+            // the renderer divides by density to get a fraction back.
+            skin: if s.skin { d } else { 0.0 },
         }
     }
 
@@ -947,6 +964,7 @@ impl Retina {
                         .max((0..3).map(|c| (got.color[c] - want.color[c]).abs()).fold(0.0, f32::max))
                         .max((got.normal - want.normal).abs().max_element())
                         .max((got.depth - want.depth).abs())
+                        .max((got.skin - want.skin).abs())
                 })
                 .fold(0.0f32, f32::max);
             log::info!("Retina self-check: max |receptor − direct_sum| = {:.2e}", dev);
@@ -983,6 +1001,7 @@ mod tests {
             drawable: true,
             occluder: true,
             is_static: false,
+            skin: false,
         }
     }
 
@@ -1627,6 +1646,54 @@ mod tests {
         assert_eq!(k, want_rec.len(), "pipes_of did not cover the whole array");
     }
 
+    /// `skin` is a density-weighted sum like every other receptor channel, so
+    /// `skin / density` is the fraction of what arrived at this receptor that
+    /// came from a creature. Where a dino overlaps the floor the renderer needs
+    /// that fraction — not a colour guess — to decide who gets scales.
+    #[test]
+    fn skin_fraction_is_the_density_weighted_share_of_creature_sources() {
+        let (w, h) = (63u32, 35u32);
+        let vp = test_view_proj(w, h);
+        // Opacity 0 so nothing attenuates anything: τ = 1 for both, and the
+        // fraction is decided purely by density × footprint weight.
+        let mut creature = src(Vec3::new(-1.0, 0.0, -10.0), Vec3::splat(2.0), 0.0);
+        creature.density = 3.0;
+        creature.skin = true;
+        let mut scenery = src(Vec3::new(1.5, 0.8, -10.0), Vec3::splat(2.0), 0.0);
+        scenery.density = 1.0;
+        scenery.skin = false;
+        let sources = vec![creature, scenery];
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        assert!((r.transmittance(0) - 1.0).abs() < 1e-6 && (r.transmittance(1) - 1.0).abs() < 1e-6);
+
+        // Centre receptor: both reach it, with different weights.
+        let centre = 17 * w + 31;
+        let weight = |i: usize| r.pipes_of(i).find(|&(rc, _)| rc == centre).map(|(_, x)| x);
+        let (wc, ws) = (weight(0).expect("creature misses the centre"), weight(1).expect("scenery misses the centre"));
+        assert!(wc > 0.1 && ws > 0.1 && (wc - ws).abs() > 1e-3,
+            "the two sources must overlap with unequal weight: {} {}", wc, ws);
+        let rec = r.receptors[centre as usize];
+        let want = 3.0 * wc / (3.0 * wc + ws);
+        assert!((rec.skin / rec.density - want).abs() < 1e-5,
+            "skin fraction {} want {}", rec.skin / rec.density, want);
+
+        // A receptor only the creature reaches is all skin, and one only the
+        // scenery reaches is none of it.
+        let only = |i: usize, j: usize| {
+            let other: Vec<u32> = r.pipes_of(j).map(|(rc, _)| rc).collect();
+            r.pipes_of(i).map(|(rc, _)| rc).find(|rc| !other.contains(rc))
+                .expect("no receptor exclusive to this source")
+        };
+        let pure = r.receptors[only(0, 1) as usize];
+        assert!(pure.density > 1e-3 && (pure.skin / pure.density - 1.0).abs() < 1e-5,
+            "creature-only receptor is not all skin: {}/{}", pure.skin, pure.density);
+        let bare = r.receptors[only(1, 0) as usize];
+        assert!(bare.density > 1e-3 && bare.skin.abs() < 1e-6,
+            "scenery-only receptor picked up skin: {}", bare.skin);
+    }
+
     #[test]
     fn occluded_source_has_low_transmittance() {
         let vp = test_view_proj(63, 35);
@@ -1708,6 +1775,7 @@ mod tests {
             }
             assert!((got.normal - want.normal).length() < tol, "receptor {} normal", i);
             assert!((got.depth - want.depth).abs() < tol * 30.0, "receptor {} depth", i);
+            assert!((got.skin - want.skin).abs() < tol, "receptor {} skin {} vs {}", i, got.skin, want.skin);
         }
     }
 
@@ -1776,9 +1844,9 @@ mod tests {
     #[test]
     fn arrive_scratch_stays_inside_the_memory_budget() {
         let bytes = std::mem::size_of::<Receptor>();
-        assert_eq!(bytes, 32, "Receptor grew — the scratch budget math assumes 32 B");
+        assert_eq!(bytes, 36, "Receptor changed size — the scratch budget math below assumes it");
         // A 1280×720 retina (the new MAX_RETINA_DIM aspect) is 921_600
-        // receptors ≈ 29.5 MB of scratch each; 64 MB buys two.
+        // receptors ≈ 33 MB of scratch each; 64 MB buys two.
         let n_rec = 1280 * 720;
         let affordable = ARRIVE_SCRATCH_BUDGET_BYTES / (n_rec * bytes);
         assert_eq!(affordable, 2);
