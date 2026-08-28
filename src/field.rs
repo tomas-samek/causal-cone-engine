@@ -2444,11 +2444,13 @@ mod tests {
         }
         eprintln!("PROBE RESULT: pipes_total {}, best walking tick {:.2} ms, widest footprint entity {} spans {}×{} receptors (retina {}×{})",
             pipes, best, widest.0, widest.1, widest.2, field.retina.width, field.retina.height);
-        // Regression guard on the measurement itself: before the near-plane
-        // cut this pose linked 8.93 M pipes, most of them from two unit
-        // kernels beside the camera painting bands across the whole image.
-        assert!(pipes < 5_000_000,
-            "pipes_total {} at the probe pose — the near-plane cut is not holding", pipes);
+        // Regression guard on the measurement itself. Before the near gate
+        // this pose linked 8.93 M pipes, most of them from unit kernels beside
+        // the camera painting bands across the whole image; with the gate on
+        // the centre only, 3.10 M; with it on every projected endpoint, 1.29 M.
+        // The bound sits under the middle number, so losing either gate fails.
+        assert!(pipes < 2_000_000,
+            "pipes_total {} at the probe pose — the near gate is not holding", pipes);
     }
 }
 

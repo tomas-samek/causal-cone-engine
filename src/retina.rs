@@ -390,30 +390,40 @@ fn project(vp: &Mat4, w: u32, h: u32, p: Vec3) -> Option<(f32, f32, f32)> {
     ))
 }
 
-/// How far in front of the eye a kernel must sit, in units of its own largest
-/// radius, to have an image-plane footprint at all. The kernel reaches
-/// `2·radii` (`kernel()` is zero past that), so a source closer than this
-/// either encloses the eye or brushes past it: `footprint()` linearises the
-/// projection by projecting the axis endpoints, and once an endpoint
-/// approaches the near plane its projected offset blows up and the covariance
-/// degenerates into a needle striping the whole image. Neither case has a
-/// meaningful footprint, so there is nothing to draw.
+/// How far in front of the eye a point must sit, in units of the kernel's
+/// largest radius, for the projection around it to be linearisable. The kernel
+/// reaches `2·radii` (`kernel()` is zero past that), so a point closer than
+/// this has the near plane inside the kernel: its projected offset blows up
+/// and the covariance degenerates into a needle striping the whole image.
 pub const NEAR_FOOTPRINT_DEPTH_FACTOR: f32 = 2.0;
 
+/// Image-space footprint of `s` under `vp`, or `None` if it has none.
+///
+/// The footprint is a linearisation: the covariance comes from projecting the
+/// three axis endpoints `position + axis·radius` and reading off their offsets
+/// from the projected centre. That linearisation is only valid while the whole
+/// kernel stays clear of the near plane, so two gates guard it, and both drop
+/// the entire footprint rather than one axis:
+///
+/// 1. **Centre.** `depth < NEAR_FOOTPRINT_DEPTH_FACTOR · max radius` — the
+///    source encloses the eye or brushes past it. It has no image-plane
+///    footprint at all.
+/// 2. **Each endpoint.** Same test on the endpoint's own depth. The centre can
+///    clear gate 1 while an endpoint does not: an off-axis kernel is magnified
+///    by the perspective divide, so its depth-axis endpoint reaches the near
+///    plane while the centre is still comfortably in front of it. Dropping only
+///    that axis would report a flat blob; the source is a needle either way.
+///    An endpoint that projects to `None` (behind the eye) is the same failure
+///    past its limit, and is dropped the same way.
 fn footprint(vp: &Mat4, w: u32, h: u32, s: &Source) -> Option<Footprint> {
     let (u, v, depth) = project(vp, w, h, s.position)?;
     let r = s.kernel_radii();
-    if depth < NEAR_FOOTPRINT_DEPTH_FACTOR * r.max_element() { return None; }
+    let near = NEAR_FOOTPRINT_DEPTH_FACTOR * r.max_element();
+    if depth < near { return None; }
     let (mut suu, mut suv, mut svv) = (0.0f32, 0.0f32, 0.0f32);
     for axis in [Vec3::X * r.x, Vec3::Y * r.y, Vec3::Z * r.z] {
-        // An endpoint behind the eye means the kernel straddles it — drop the
-        // whole footprint rather than silently omitting that axis, which would
-        // report a flat blob for a source wrapped around the camera. Under the
-        // depth cut above this is already unreachable for a plain perspective
-        // view — an axis is at most `r.max_element()` ≤ `depth/2` long, so an
-        // endpoint still sits at `depth/2` or more in front of the eye — but
-        // the invariant belongs here, not in a caller's choice of matrix.
-        let (pu, pv, _) = project(vp, w, h, s.position + axis)?;
+        let (pu, pv, ed) = project(vp, w, h, s.position + axis)?;
+        if ed < near { return None; }
         let du = pu - u;
         let dv = pv - v;
         suu += du * du;
@@ -1298,6 +1308,36 @@ mod tests {
             assert_eq!(r.pipes_of(i).count(), 0,
                 "near-plane source {} got {} pipes", i, r.pipes_of(i).count());
         }
+        assert_eq!(r.stats.pipes_total, 0);
+    }
+
+    /// A centre that clears the near gate does not mean the footprint does.
+    /// Entity 7540 in the demo scene — a unit kernel (GROUP_ROCK,
+    /// `deposit_radii == ZERO`) 23.5 cells off the view axis at centre depth
+    /// 2.43 — passed the centre gate by 20 % and still striped all 320 columns
+    /// of the retina, because its depth-axis endpoint sits at depth 1.43 and
+    /// the perspective divide magnifies that endpoint's offset to ~530
+    /// receptors. The gate has to be applied to every projected endpoint, not
+    /// just the centre.
+    #[test]
+    fn an_off_axis_kernel_whose_endpoint_reaches_the_near_plane_gets_no_pipes() {
+        let (w, h) = (141u32, 79u32);
+        let vp = test_view_proj(w, h);
+        // Eye at the origin looking −Z, so view depth is just −z.
+        let s = src(Vec3::new(23.5, 0.0, -2.43), Vec3::ONE, 1.0);
+        // The centre clears the gate; the +Z endpoint, one radius nearer, does not.
+        let (_, _, depth) = project(&vp, w, h, s.position).expect("centre is in front of the eye");
+        assert!(depth >= NEAR_FOOTPRINT_DEPTH_FACTOR, "centre depth {} must clear the gate", depth);
+        let (_, _, ed) = project(&vp, w, h, s.position + Vec3::Z).expect("endpoint is in front of the eye");
+        assert!(ed < NEAR_FOOTPRINT_DEPTH_FACTOR, "endpoint depth {} must not clear the gate", ed);
+
+        let sources = vec![s];
+        let hash = SpatialHash::build(&sources);
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.relink(&sources, &hash, vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
+        assert_eq!(r.pipes_of(0).count(), 0,
+            "off-axis near-plane source got {} pipes", r.pipes_of(0).count());
         assert_eq!(r.stats.pipes_total, 0);
     }
 
