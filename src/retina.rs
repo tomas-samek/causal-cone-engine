@@ -152,7 +152,7 @@ impl SpatialHash {
             if !s.occluder || s.is_static != want_static { continue; }
             // kernel() > 0 requires |(p − position)/radii|² < 4 — i.e. p inside
             // the box position ± 2·radii.
-            let extent = s.kernel_radii() * 2.0;
+            let extent = s.kernel_radii() * KERNEL_EXTENT;
             max_extent = max_extent.max(extent);
             let lo = Self::key(s.position - extent);
             let hi = Self::key(s.position + extent);
@@ -365,7 +365,9 @@ pub struct RetinaStats {
 
 /// Image-space footprint of a projected axis-aligned gaussian: center,
 /// eye distance, inverse 2×2 covariance (e = a·du² + 2b·du·dv + c·dv²),
-/// and half-extents of the e < 4 bounding box.
+/// and the kernel's projected extent as a screen-space bounding box. The box
+/// is not `center ± 2σ`: it is the hull of the projected kernel itself, which
+/// off-axis and near the eye is neither centred on `(u, v)` nor symmetric.
 struct Footprint {
     u: f32,
     v: f32,
@@ -373,8 +375,10 @@ struct Footprint {
     a: f32,
     b: f32,
     c: f32,
-    hu: f32,
-    hv: f32,
+    u0: f32,
+    u1: f32,
+    v0: f32,
+    v1: f32,
 }
 
 /// World point → (u right, v down, in receptor units; eye distance). None if
@@ -390,45 +394,59 @@ fn project(vp: &Mat4, w: u32, h: u32, p: Vec3) -> Option<(f32, f32, f32)> {
     ))
 }
 
-/// How far in front of the eye a point must sit, in units of the kernel's
-/// largest radius, for the projection around it to be linearisable. The kernel
-/// reaches `2·radii` (`kernel()` is zero past that), so a point closer than
-/// this has the near plane inside the kernel: its projected offset blows up
-/// and the covariance degenerates into a needle striping the whole image.
-pub const NEAR_FOOTPRINT_DEPTH_FACTOR: f32 = 2.0;
+/// Where the kernel stops: `kernel()` is exactly zero past `2·radii`, so that
+/// surface is the kernel's true extent and the outer edge of its footprint.
+const KERNEL_EXTENT: f32 = 2.0;
 
 /// Image-space footprint of `s` under `vp`, or `None` if it has none.
 ///
-/// The footprint is a linearisation: the covariance comes from projecting the
-/// three axis endpoints `position + axis·radius` and reading off their offsets
-/// from the projected centre. That linearisation is only valid while the whole
-/// kernel stays clear of the near plane, so two gates guard it, and both drop
-/// the entire footprint rather than one axis:
+/// The gaussian is modelled in image space by a 2×2 covariance, which is a
+/// *linearisation* of the projection around the centre. Two things keep that
+/// model from running away near the eye, where the perspective divide is at
+/// its most nonlinear:
 ///
-/// 1. **Centre.** `depth < NEAR_FOOTPRINT_DEPTH_FACTOR · max radius` — the
-///    source encloses the eye or brushes past it. It has no image-plane
-///    footprint at all.
-/// 2. **Each endpoint.** Same test on the endpoint's own depth. The centre can
-///    clear gate 1 while an endpoint does not: an off-axis kernel is magnified
-///    by the perspective divide, so its depth-axis endpoint reaches the near
-///    plane while the centre is still comfortably in front of it. Dropping only
-///    that axis would report a flat blob; the source is a needle either way.
-///    An endpoint that projects to `None` (behind the eye) is the same failure
-///    past its limit, and is dropped the same way.
+/// 1. **Central differences.** Each axis is projected on both sides,
+///    `position ± axis·r`, and the image-space half-span `(p_plus - p_minus)/2`
+///    is that axis' contribution. A one-sided difference took the near
+///    endpoint's offset raw, and as that endpoint approached the near plane
+///    its offset grew without bound — the needle that striped the image. The
+///    two sides move oppositely under the divide, so most of that cancels.
+/// 2. **A bounding box that is the kernel's own projected extent**, the hull
+///    of the six endpoints scaled out to `KERNEL_EXTENT`, rather than
+///    `centre ± 2σ`. The gaussian model is only trusted where the kernel
+///    actually lands, so a kernel whose extent projects entirely off-screen
+///    contributes nothing however wide its covariance came out. That is what
+///    removes the rock needles beside the camera, with no depth heuristic:
+///    they are simply not on screen.
+///
+/// Two cases have no footprint at all. If the eye is *inside* the kernel
+/// (`depth < max radius`) there is no outside view of it to project. If any
+/// endpoint projects to `None` it is behind the eye, so the kernel straddles
+/// the eye and its hull is not a screen-space box — then the whole footprint
+/// goes, not just that axis, which would otherwise report a flat blob.
 fn footprint(vp: &Mat4, w: u32, h: u32, s: &Source) -> Option<Footprint> {
     let (u, v, depth) = project(vp, w, h, s.position)?;
     let r = s.kernel_radii();
-    let near = NEAR_FOOTPRINT_DEPTH_FACTOR * r.max_element();
-    if depth < near { return None; }
+    if depth < r.max_element() { return None; }
     let (mut suu, mut suv, mut svv) = (0.0f32, 0.0f32, 0.0f32);
+    // The hull always contains the centre, so a source too small to span a
+    // receptor still keeps the one receptor under it.
+    let (mut u0, mut u1, mut v0, mut v1) = (u, u, v, v);
     for axis in [Vec3::X * r.x, Vec3::Y * r.y, Vec3::Z * r.z] {
-        let (pu, pv, ed) = project(vp, w, h, s.position + axis)?;
-        if ed < near { return None; }
-        let du = pu - u;
-        let dv = pv - v;
+        let (pu, pv, _) = project(vp, w, h, s.position + axis)?;
+        let (mu, mv, _) = project(vp, w, h, s.position - axis)?;
+        let du = (pu - mu) * 0.5;
+        let dv = (pv - mv) * 0.5;
         suu += du * du;
         suv += du * dv;
         svv += dv * dv;
+        for (eu, ev) in [(pu, pv), (mu, mv)] {
+            let (bu, bv) = (u + (eu - u) * KERNEL_EXTENT, v + (ev - v) * KERNEL_EXTENT);
+            u0 = u0.min(bu);
+            u1 = u1.max(bu);
+            v0 = v0.min(bv);
+            v1 = v1.max(bv);
+        }
     }
     // Floor the variance at half a receptor so distant entities keep a pipe.
     let min_var = 0.25;
@@ -440,8 +458,7 @@ fn footprint(vp: &Mat4, w: u32, h: u32, s: &Source) -> Option<Footprint> {
         a: svv / det,
         b: -suv / det,
         c: suu / det,
-        hu: 2.0 * suu.sqrt(),
-        hv: 2.0 * svv.sqrt(),
+        u0, u1, v0, v1,
     })
 }
 
@@ -630,10 +647,10 @@ impl Retina {
                 for fp in fps_chunk {
                     let before = recs.len() as u32;
                     let Some(fp) = fp else { counts.push(0); continue; };
-                    let u0 = (fp.u - fp.hu).floor().max(0.0) as i64;
-                    let u1 = (fp.u + fp.hu).ceil().min(w as f32 - 1.0) as i64;
-                    let v0 = (fp.v - fp.hv).floor().max(0.0) as i64;
-                    let v1 = (fp.v + fp.hv).ceil().min(h as f32 - 1.0) as i64;
+                    let u0 = fp.u0.floor().max(0.0) as i64;
+                    let u1 = fp.u1.ceil().min(w as f32 - 1.0) as i64;
+                    let v0 = fp.v0.floor().max(0.0) as i64;
+                    let v1 = fp.v1.ceil().min(h as f32 - 1.0) as i64;
                     if u0 > u1 || v0 > v1 { counts.push(0); continue; }
                     for rv in v0..=v1 {
                         for ru in u0..=u1 {
@@ -1311,25 +1328,24 @@ mod tests {
         assert_eq!(r.stats.pipes_total, 0);
     }
 
-    /// A centre that clears the near gate does not mean the footprint does.
     /// Entity 7540 in the demo scene — a unit kernel (GROUP_ROCK,
     /// `deposit_radii == ZERO`) 23.5 cells off the view axis at centre depth
-    /// 2.43 — passed the centre gate by 20 % and still striped all 320 columns
-    /// of the retina, because its depth-axis endpoint sits at depth 1.43 and
-    /// the perspective divide magnifies that endpoint's offset to ~530
-    /// receptors. The gate has to be applied to every projected endpoint, not
-    /// just the centre.
+    /// 2.43 — striped all 320 columns of the retina. It is nowhere near the
+    /// screen: its projected centre sits hundreds of receptors off the right
+    /// edge, and only the runaway covariance of a one-sided difference dragged
+    /// a bounding box back across the image. Bounded by its own projected
+    /// extent it contributes nothing, with no appeal to its depth.
     #[test]
-    fn an_off_axis_kernel_whose_endpoint_reaches_the_near_plane_gets_no_pipes() {
+    fn an_off_axis_kernel_beside_the_camera_gets_no_pipes() {
         let (w, h) = (141u32, 79u32);
         let vp = test_view_proj(w, h);
         // Eye at the origin looking −Z, so view depth is just −z.
         let s = src(Vec3::new(23.5, 0.0, -2.43), Vec3::ONE, 1.0);
-        // The centre clears the gate; the +Z endpoint, one radius nearer, does not.
-        let (_, _, depth) = project(&vp, w, h, s.position).expect("centre is in front of the eye");
-        assert!(depth >= NEAR_FOOTPRINT_DEPTH_FACTOR, "centre depth {} must clear the gate", depth);
-        let (_, _, ed) = project(&vp, w, h, s.position + Vec3::Z).expect("endpoint is in front of the eye");
-        assert!(ed < NEAR_FOOTPRINT_DEPTH_FACTOR, "endpoint depth {} must not clear the gate", ed);
+        // Not cut for being close: the eye is well outside this kernel.
+        let (cu, _, depth) = project(&vp, w, h, s.position).expect("centre is in front of the eye");
+        assert!(depth > s.kernel_radii().max_element(),
+            "the eye must be outside the kernel for this to test the extent bound, depth {}", depth);
+        assert!(cu > w as f32, "centre must project off the right edge, u = {}", cu);
 
         let sources = vec![s];
         let hash = SpatialHash::build(&sources);
@@ -1337,8 +1353,30 @@ mod tests {
         let mut r = Retina::new(w, h);
         r.relink(&sources, &hash, vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
         assert_eq!(r.pipes_of(0).count(), 0,
-            "off-axis near-plane source got {} pipes", r.pipes_of(0).count());
+            "off-axis source beside the camera got {} pipes", r.pipes_of(0).count());
         assert_eq!(r.stats.pipes_total, 0);
+    }
+
+    /// The counterweight to the needle cuts: a floor tile just ahead and just
+    /// below the eye, the geometry you fly over low. Its centre is 2.5 cells
+    /// out and its near endpoint 1.5, so any gate that judged an endpoint's
+    /// depth against the kernel extent would swallow the floor in front of the
+    /// camera. It has to be drawn, and drawn as a tile rather than a band.
+    #[test]
+    fn a_floor_tile_just_ahead_and_below_the_eye_is_still_drawn() {
+        let (w, h) = (141u32, 79u32);
+        let vp = test_view_proj(w, h);
+        let sources = vec![src(Vec3::new(0.0, -0.5, -2.5), Vec3::ONE, 1.0)];
+        let hash = SpatialHash::build(&sources);
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.relink(&sources, &hash, vp, Vec3::ZERO, lo, hi, ATTEN_K_DEFAULT);
+        let pipes: Vec<u32> = r.pipes_of(0).map(|(rc, _)| rc).collect();
+        assert!(!pipes.is_empty(), "the floor ahead of the eye was cut");
+        let u0 = pipes.iter().map(|rc| rc % w).min().unwrap();
+        let u1 = pipes.iter().map(|rc| rc % w).max().unwrap();
+        assert!(u1 - u0 + 1 < 100,
+            "floor tile spans {} of {} columns — a band, not a tile", u1 - u0 + 1, w);
     }
 
     /// The cut is exactly at the kernel extent: one radius further out and the
@@ -1389,10 +1427,10 @@ mod tests {
         for s in &sources {
             want_start.push(want_rec.len() as u32);
             let Some(fp) = footprint(&vp, w, h, s) else { continue; };
-            let u0 = (fp.u - fp.hu).floor().max(0.0) as i64;
-            let u1 = (fp.u + fp.hu).ceil().min(w as f32 - 1.0) as i64;
-            let v0 = (fp.v - fp.hv).floor().max(0.0) as i64;
-            let v1 = (fp.v + fp.hv).ceil().min(h as f32 - 1.0) as i64;
+            let u0 = fp.u0.floor().max(0.0) as i64;
+            let u1 = fp.u1.ceil().min(w as f32 - 1.0) as i64;
+            let v0 = fp.v0.floor().max(0.0) as i64;
+            let v1 = fp.v1.ceil().min(h as f32 - 1.0) as i64;
             if u0 > u1 || v0 > v1 { continue; }
             for rv in v0..=v1 {
                 for ru in u0..=u1 {
