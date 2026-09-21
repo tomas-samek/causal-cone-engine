@@ -30,7 +30,7 @@ pub const MAX_RETINA_DIM: u32 = 1280;
 /// Ceiling on the transient scratch images `arrive` may hold at once. Each
 /// worker chunk owns a full `n_rec × size_of::<Receptor>()` image, so without
 /// a bound the peak grows with the core count *and* the resolution.
-pub const ARRIVE_SCRATCH_BUDGET_BYTES: usize = 128 << 20;
+pub const ARRIVE_SCRATCH_BUDGET_BYTES: usize = 160 << 20;
 
 /// How many entity chunks `arrive` splits into: one per worker thread, minus
 /// however many the scratch budget cannot pay for, and never more than there
@@ -283,6 +283,20 @@ pub const Q_FRAC: u32 = 16;
 /// Fractional bits of `depth` (Σ depth·density), which runs a few hundred times
 /// larger than density: 2⁻¹⁰ keeps a single pipe inside i32 out to ±2M.
 pub const Q_DEPTH_FRAC: u32 = 10;
+/// The sharp weight is the footprint weight to this power: `wᵖ = exp(−p·e)` is
+/// the same gaussian at `1/√p` of the σ — 8, tuned by eye, is ~0.35σ. A source a few cells from the eye projects
+/// ~10 receptors wide, and averaging colour and normal over that is what
+/// smeared near geometry into fog.
+pub const SHARP_POWER: i32 = 8;
+/// How much of the broad weight the sharp one keeps. `wᵖ` alone is ≤1e-7 in the
+/// tails, below a fixed-point step — a silhouette receptor fed only by tails
+/// would have density and nothing to colour it with. With the floor it falls
+/// back to the broad average exactly there, and nowhere a core reaches.
+pub const SHARP_FLOOR: f32 = 0.01;
+/// A source hides another in the same receptor only from this many cells
+/// nearer the eye. Neighbours on one surface sit closer than a kernel radius
+/// in depth and must share the receptor, not fight over it.
+pub const FRONT_MARGIN: f32 = 1.0;
 const Q_ONE: f32 = (1u32 << Q_FRAC) as f32;
 const Q_DEPTH_ONE: f32 = (1u32 << Q_DEPTH_FRAC) as f32;
 
@@ -298,9 +312,14 @@ pub struct Receptor {
     pub color: [i64; 3],
     pub normal: [i64; 3],
     pub depth: i64,
-    /// Σ density·skin over what arrived, so `skin / density` is the
-    /// density-weighted fraction of this receptor that is creature.
+    /// Σ density·skin over what arrived, so `skin / sharp` is the fraction of
+    /// what this receptor *shows* that is creature.
     pub skin: i64,
+    /// Σ density·sharp weight — the normaliser of every channel but `density`.
+    /// Colour, normal, depth and skin arrive through the pipe's sharp weight
+    /// (see `Retina::pipe_sharp`), so dividing them by `density`, which arrives
+    /// through the broad one, would no longer give an average.
+    pub sharp: i64,
 }
 
 impl Receptor {
@@ -312,6 +331,7 @@ impl Receptor {
         }
         self.depth = self.depth.wrapping_add(p.depth as i64);
         self.skin = self.skin.wrapping_add(p.skin as i64);
+        self.sharp = self.sharp.wrapping_add(p.sharp as i64);
     }
     /// Withdraw what a pipe last delivered — the exact inverse of `add`.
     fn sub(&mut self, p: &PipeQ) {
@@ -322,6 +342,7 @@ impl Receptor {
         }
         self.depth = self.depth.wrapping_sub(p.depth as i64);
         self.skin = self.skin.wrapping_sub(p.skin as i64);
+        self.sharp = self.sharp.wrapping_sub(p.sharp as i64);
     }
     fn add_receptor(&mut self, o: &Receptor) {
         self.density = self.density.wrapping_add(o.density);
@@ -331,6 +352,7 @@ impl Receptor {
         }
         self.depth = self.depth.wrapping_add(o.depth);
         self.skin = self.skin.wrapping_add(o.skin);
+        self.sharp = self.sharp.wrapping_add(o.sharp);
     }
 
     pub fn density_f(&self) -> f32 { self.density as f32 / Q_ONE }
@@ -342,6 +364,7 @@ impl Receptor {
     }
     pub fn depth_f(&self) -> f32 { self.depth as f32 / Q_DEPTH_ONE }
     pub fn skin_f(&self) -> f32 { self.skin as f32 / Q_ONE }
+    pub fn sharp_f(&self) -> f32 { self.sharp as f32 / Q_ONE }
 }
 
 /// What an entity offers a pipe, in the field's own floats — before the
@@ -353,16 +376,23 @@ pub struct PipeState {
     pub normal: Vec3,
     pub depth: f32,
     pub skin: f32,
+    /// The density again, to be carried by the sharp weight instead of the
+    /// broad one: what the sharp channels are normalised by.
+    pub sharp: f32,
 }
 
 impl PipeState {
-    fn scaled(&self, w: f32) -> PipeState {
+    /// Through one pipe: `density` by the broad footprint weight `w`, which
+    /// draws the silhouette; everything else by the sharp weight `ws`, which
+    /// decides what the receptor shows inside it.
+    fn scaled(&self, w: f32, ws: f32) -> PipeState {
         PipeState {
             density: self.density * w,
-            color: [self.color[0] * w, self.color[1] * w, self.color[2] * w],
-            normal: self.normal * w,
-            depth: self.depth * w,
-            skin: self.skin * w,
+            color: [self.color[0] * ws, self.color[1] * ws, self.color[2] * ws],
+            normal: self.normal * ws,
+            depth: self.depth * ws,
+            skin: self.skin * ws,
+            sharp: self.sharp * ws,
         }
     }
     /// Round to the pipe's fixed point. `as i32` saturates (and sends NaN to
@@ -375,6 +405,7 @@ impl PipeState {
             normal: [q(self.normal.x), q(self.normal.y), q(self.normal.z)],
             depth: (self.depth * Q_DEPTH_ONE).round() as i32,
             skin: q(self.skin),
+            sharp: q(self.sharp),
         }
     }
 }
@@ -389,6 +420,7 @@ pub struct PipeQ {
     pub normal: [i32; 3],
     pub depth: i32,
     pub skin: i32,
+    pub sharp: i32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -403,6 +435,7 @@ pub struct RetinaStats {
     pub relink_footprint_ms: f32,
     pub relink_tau_ms: f32,
     pub relink_pipes_ms: f32,
+    pub relink_front_ms: f32,
     pub hash_build_ms: f32,
 }
 
@@ -579,6 +612,15 @@ pub fn eye_from_view_proj(view_proj: Mat4) -> Vec3 {
     h.truncate() / h.w
 }
 
+/// The pipes regrouped by receptor, each receptor's run ordered front to back.
+#[derive(Default)]
+struct FrontScratch {
+    start: Vec<u32>,
+    /// (pipe, source depth, delivered density) — one slot, because the counting
+    /// sort lands each of them at random and one cache miss is cheaper than three.
+    slots: Vec<(u32, f32, f32)>,
+}
+
 pub struct Retina {
     pub width: u32,
     pub height: u32,
@@ -588,6 +630,11 @@ pub struct Retina {
     pipe_count: Vec<u32>,
     pipe_receptor: Vec<u32>,
     pipe_weight: Vec<f32>,
+    /// What the pipe carries everything but density with: the footprint weight
+    /// sharpened (`SHARP_POWER`, `SHARP_FLOOR`) and dimmed by the density in
+    /// front of the source *in this receptor* (`link_front`). Fixed between
+    /// relinks like `pipe_weight`, so arrival stays a plain reversible sum.
+    pipe_sharp: Vec<f32>,
     pipe_last: Vec<PipeQ>,
     /// τ toward the eye, per entity (1.0 for entities without pipes).
     entity_trans: Vec<f32>,
@@ -604,6 +651,8 @@ pub struct Retina {
     /// (receptors, weights, per-entity counts). One entry per worker chunk, not
     /// per entity — 17k relink-time allocations is a cost of its own.
     pipe_scratch: Vec<(Vec<u32>, Vec<f32>, Vec<u32>)>,
+    /// `link_front`'s receptor → pipes table, kept for its capacity.
+    front_scratch: FrontScratch,
     pub stats: RetinaStats,
     /// Set when any delta arrived since the renderer last uploaded.
     pub dirty: bool,
@@ -619,6 +668,7 @@ impl Retina {
             pipe_count: Vec::new(),
             pipe_receptor: Vec::new(),
             pipe_weight: Vec::new(),
+            pipe_sharp: Vec::new(),
             pipe_last: Vec::new(),
             entity_trans: Vec::new(),
             entity_depth: Vec::new(),
@@ -626,6 +676,7 @@ impl Retina {
             last_view_proj: None,
             hash: SpatialHash::default(),
             pipe_scratch: Vec::new(),
+            front_scratch: FrontScratch::default(),
             stats: RetinaStats::default(),
             dirty: true,
         }
@@ -646,6 +697,16 @@ impl Retina {
             (self.pipe_start[i] as usize, self.pipe_count[i] as usize)
         } else { (0, 0) };
         (start..start + count).map(move |k| (self.pipe_receptor[k], self.pipe_weight[k]))
+    }
+
+    /// Test/diagnostic API: the sharp weights of entity `i`'s pipes, in the
+    /// same order as `pipes_of`.
+    #[allow(dead_code)]
+    pub fn sharp_of(&self, i: usize) -> impl Iterator<Item = f32> + '_ {
+        let (start, count) = if i < self.pipe_start.len() {
+            (self.pipe_start[i] as usize, self.pipe_count[i] as usize)
+        } else { (0, 0) };
+        self.pipe_sharp[start..start + count].iter().copied()
     }
 
     /// Test/diagnostic API.
@@ -799,11 +860,12 @@ impl Retina {
         }
         debug_assert_eq!(i, n, "chunked pipe counts did not cover every entity");
         debug_assert_eq!(base as usize, total);
-        // Reuse the allocation: at ~577k pipes this buffer is ~18 MB, and
+        // Reuse the allocation: at ~577k pipes this buffer is ~23 MB, and
         // handing it back to the allocator every relink is not free.
         self.pipe_last.clear();
         self.pipe_last.resize(total, PipeQ::default());
         let t_pipes = t0.elapsed();
+
 
         // 5. τ toward the eye — only for entities that actually got pipes
         // (parallel). Measured at ~8.5 ms of a ~36 ms relink on the demo
@@ -824,7 +886,13 @@ impl Retina {
         }).collect();
         let t_tau = t0.elapsed();
 
-        // 6. Bookkeeping.
+        // 6. Sharp weights: what each pipe carries colour, normal, depth and
+        // skin with. After τ, because a source hides others only as far as it
+        // is seen itself.
+        self.link_front(sources);
+        let t_front = t0.elapsed();
+
+        // 7. Bookkeeping.
         self.last_view_proj = Some(view_proj);
         let linked: Vec<f32> = (0..n).filter(|&i| self.pipe_count[i] > 0).map(|i| self.entity_trans[i]).collect();
         self.stats.relinks += 1;
@@ -834,17 +902,115 @@ impl Retina {
         self.stats.relink_footprint_ms = ms(t_fps - t_reset);
         self.stats.relink_pipes_ms = ms(t_pipes - t_fps);
         self.stats.relink_tau_ms = ms(t_tau - t_pipes);
+        self.stats.relink_front_ms = ms(t_front - t_tau);
         // `tick` builds the hash; a direct `relink` was handed one, so the
         // number it last recorded says nothing about this call.
         self.stats.hash_build_ms = 0.0;
         self.stats.relink_ms = ms(t0.elapsed());
         log::debug!(
-            "relink {:.2} ms = reset {:.2} + footprints {:.2} + pipes {:.2} + τ {:.2} + bookkeeping {:.2} ({} entities, {} pipes; hash build is `tick`'s, not counted here)",
+            "relink {:.2} ms = reset {:.2} + footprints {:.2} + pipes {:.2} + τ {:.2} + front {:.2} + bookkeeping {:.2} ({} entities, {} pipes; hash build is `tick`'s, not counted here)",
             self.stats.relink_ms, ms(t_reset), self.stats.relink_footprint_ms,
-            self.stats.relink_pipes_ms, self.stats.relink_tau_ms,
-            self.stats.relink_ms - ms(t_tau), n, self.stats.pipes_total,
+            self.stats.relink_pipes_ms, self.stats.relink_tau_ms, self.stats.relink_front_ms,
+            self.stats.relink_ms - ms(t_front), n, self.stats.pipes_total,
         );
         self.dirty = true;
+    }
+
+    /// Fill `pipe_sharp`. Two things happen to the footprint weight `w`:
+    ///
+    /// - it is **sharpened** to `wᵖ + SHARP_FLOOR·w`, so a receptor shows the
+    ///   sources whose cores cover it rather than the average of every tail
+    ///   that reaches it;
+    /// - it is **dimmed by what stands in front of the source in that
+    ///   receptor**: `max(0, 1 − D/RETINA_ISO)`, `D` the density the receptor's
+    ///   other pipes deliver from at least `FRONT_MARGIN` nearer the eye. That
+    ///   is the display rule read front to back: a receptor is drawn when its
+    ///   density reaches `RETINA_ISO`, so what it *shows* is the sources that
+    ///   make up the first `RETINA_ISO` of it, nearest first. Anything behind
+    ///   a full iso of density is behind a surface and gets exactly zero.
+    ///
+    ///   The measure has to be the delivered density (`τ·density·w`), the same
+    ///   quantity the silhouette is cut from, and not the source's opacity.
+    ///   Opacity is a 3D attenuation figure and for the dino's skeleton it is
+    ///   800: the last sliver of such a kernel, far outside the silhouette it
+    ///   draws, still hid everything behind it — a cell-wide halo around the
+    ///   body in which the rock behind vanished, as if light bent around the
+    ///   dino. And a source the eye cannot see (τ = 0) delivers nothing, so it
+    ///   hides nothing; with opacity it punched black holes in the tail.
+    ///
+    /// This is the front-to-back compositing the sum cannot do on its own — but
+    /// done here, on the weights, where it costs the sum nothing: weights are
+    /// constants between relinks, so arrival is still delta-only and exact.
+    /// The price is that `D` is the density *as of the relink*; lighting that
+    /// drifts under a motionless scene moves it only at the next one.
+    ///
+    /// `entity_trans` is a different question (is the *source* visible from
+    /// the eye, along one 3D segment); this one is per receptor.
+    ///
+    /// Density is untouched, so silhouettes are exactly what they were.
+    fn link_front(&mut self, sources: &[Source]) {
+        let n_rec = self.receptors.len();
+        let total = self.pipe_receptor.len();
+        let fs = &mut self.front_scratch;
+
+        // Receptor → pipes, by counting sort. Entities are visited nearest
+        // first, so every receptor's run comes out ordered front to back
+        // without sorting any of them. Ties break on the index: deterministic.
+        let mut order: Vec<u32> = (0..self.pipe_count.len() as u32)
+            .filter(|&i| self.pipe_count[i as usize] > 0).collect();
+        order.sort_unstable_by(|&a, &b| {
+            self.entity_depth[a as usize].total_cmp(&self.entity_depth[b as usize]).then(a.cmp(&b))
+        });
+        fs.start.clear();
+        fs.start.resize(n_rec + 1, 0);
+        for &rc in &self.pipe_receptor { fs.start[rc as usize + 1] += 1; }
+        for r in 0..n_rec { fs.start[r + 1] += fs.start[r]; }
+        let mut cursor: Vec<u32> = fs.start[..n_rec].to_vec();
+        fs.slots.clear();
+        fs.slots.resize(total, (0, 0.0, 0.0));
+        for &i in &order {
+            let i = i as usize;
+            // What `contribution` will offer: the density this source delivers.
+            let delivered = sources[i].density * self.entity_trans[i];
+            let (start, count) = (self.pipe_start[i] as usize, self.pipe_count[i] as usize);
+            for k in start..start + count {
+                let slot = &mut cursor[self.pipe_receptor[k] as usize];
+                let j = *slot as usize;
+                *slot += 1;
+                fs.slots[j] = (k as u32, self.entity_depth[i], delivered * self.pipe_weight[k]);
+            }
+        }
+
+        // Front to back through each receptor's run. `depth − FRONT_MARGIN`
+        // rises with the run, so the density in front is a running sum behind
+        // a second cursor. Receptors are independent: parallel over blocks of
+        // them, each block returning its stretch of the table.
+        let block = n_rec.div_ceil(rayon::current_num_threads().max(1) * 4).max(1);
+        let (start, slots) = (&fs.start, &fs.slots);
+        let dim: Vec<Vec<f32>> = (0..n_rec.div_ceil(block)).into_par_iter().map(|b| {
+            let (r0, r1) = (b * block, ((b + 1) * block).min(n_rec));
+            let mut out = Vec::with_capacity((start[r1] - start[r0]) as usize);
+            for r in r0..r1 {
+                let (j0, j1) = (start[r] as usize, start[r + 1] as usize);
+                let (mut behind, mut in_front) = (j0, 0.0f32);
+                for j in j0..j1 {
+                    while slots[behind].1 < slots[j].1 - FRONT_MARGIN {
+                        in_front += slots[behind].2;
+                        behind += 1;
+                    }
+                    out.push((1.0 - in_front / RETINA_ISO).max(0.0));
+                }
+            }
+            out
+        }).collect();
+
+        self.pipe_sharp.clear();
+        self.pipe_sharp.resize(total, 0.0);
+        for (j, d) in dim.iter().flatten().enumerate() {
+            let k = fs.slots[j].0 as usize;
+            let w = self.pipe_weight[k];
+            self.pipe_sharp[k] = (w.powi(SHARP_POWER) + SHARP_FLOOR * w) * d;
+        }
     }
 
     /// What entity `i` offers its pipes this tick (before the footprint
@@ -861,6 +1027,7 @@ impl Retina {
             // Density-weighted, exactly like `depth`: the receptor sums it and
             // the renderer divides by density to get a fraction back.
             skin: if s.skin { d } else { 0.0 },
+            sharp: d,
         }
     }
 
@@ -890,6 +1057,7 @@ impl Retina {
         let pipe_start = &self.pipe_start;
         let pipe_receptor = &self.pipe_receptor;
         let pipe_weight = &self.pipe_weight;
+        let pipe_sharp = &self.pipe_sharp;
 
         // One contiguous entity range per chunk — one chunk per worker thread,
         // fewer when a full scratch image each would blow ARRIVE_SCRATCH_BUDGET_BYTES.
@@ -906,7 +1074,7 @@ impl Retina {
                     let start = pipe_start[i] as usize;
                     for (off, l) in last.iter_mut().enumerate() {
                         let k = start + off;
-                        let new = contribs[i].scaled(pipe_weight[k]).quantized();
+                        let new = contribs[i].scaled(pipe_weight[k], pipe_sharp[k]).quantized();
                         if new != *l {
                             let acc = scratch.get_or_insert_with(|| vec![Receptor::default(); n_rec]);
                             let rec = &mut acc[pipe_receptor[k] as usize];
@@ -965,8 +1133,8 @@ impl Retina {
         let mut out = vec![Receptor::default(); self.receptors.len()];
         for i in 0..sources.len().min(self.pipe_count.len()) {
             let c = self.contribution(i, &sources[i]);
-            for (rc, w) in self.pipes_of(i) {
-                out[rc as usize].add(&c.scaled(w).quantized());
+            for ((rc, w), ws) in self.pipes_of(i).zip(self.sharp_of(i)) {
+                out[rc as usize].add(&c.scaled(w, ws).quantized());
             }
         }
         out
@@ -1675,9 +1843,9 @@ mod tests {
         assert_eq!(k, want_rec.len(), "pipes_of did not cover the whole array");
     }
 
-    /// `skin` is a density-weighted sum like every other receptor channel, so
-    /// `skin / density` is the fraction of what arrived at this receptor that
-    /// came from a creature. Where a dino overlaps the floor the renderer needs
+    /// `skin` is a density-weighted sum through the sharp weights, like every
+    /// receptor channel but density, so `skin / sharp` is the fraction of what
+    /// this receptor shows that came from a creature. Where a dino overlaps the floor the renderer needs
     /// that fraction — not a colour guess — to decide who gets scales.
     #[test]
     fn skin_fraction_is_the_density_weighted_share_of_creature_sources() {
@@ -1697,17 +1865,19 @@ mod tests {
         r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
         assert!((r.transmittance(0) - 1.0).abs() < 1e-6 && (r.transmittance(1) - 1.0).abs() < 1e-6);
 
-        // Centre receptor: both reach it, with different weights.
+        // Centre receptor: both reach it, with different weights. Same depth,
+        // so neither stands in front of the other.
         let centre = 17 * w + 31;
-        let weight = |i: usize| r.pipes_of(i).find(|&(rc, _)| rc == centre).map(|(_, x)| x);
+        let weight = |i: usize| r.pipes_of(i).zip(r.sharp_of(i))
+            .find(|&((rc, _), _)| rc == centre).map(|(_, x)| x);
         let (wc, ws) = (weight(0).expect("creature misses the centre"), weight(1).expect("scenery misses the centre"));
-        assert!(wc > 0.1 && ws > 0.1 && (wc - ws).abs() > 1e-3,
+        assert!(wc > 1e-3 && ws > 1e-3 && (wc - ws).abs() > 1e-3,
             "the two sources must overlap with unequal weight: {} {}", wc, ws);
         let rec = r.receptors[centre as usize];
         let want = 3.0 * wc / (3.0 * wc + ws);
         // Two rounded pipes: the fraction is good to a fixed-point step.
-        assert!((rec.skin_f() / rec.density_f() - want).abs() < 1e-4,
-            "skin fraction {} want {}", rec.skin_f() / rec.density_f(), want);
+        assert!((rec.skin_f() / rec.sharp_f() - want).abs() < 1e-4,
+            "skin fraction {} want {}", rec.skin_f() / rec.sharp_f(), want);
 
         // A receptor only the creature reaches is all skin, and one only the
         // scenery reaches is none of it.
@@ -1717,8 +1887,8 @@ mod tests {
                 .expect("no receptor exclusive to this source")
         };
         let pure = r.receptors[only(0, 1) as usize];
-        assert!(pure.density > 0 && pure.skin == pure.density,
-            "creature-only receptor is not all skin: {}/{}", pure.skin, pure.density);
+        assert!(pure.density > 0 && pure.sharp > 0 && pure.skin == pure.sharp,
+            "creature-only receptor is not all skin: {}/{}", pure.skin, pure.sharp);
         let bare = r.receptors[only(1, 0) as usize];
         assert!(bare.density > 0 && bare.skin == 0,
             "scenery-only receptor picked up skin: {}", bare.skin);
@@ -1891,12 +2061,186 @@ mod tests {
         assert_receptors_match(&r, &sources);
     }
 
+    /// Alone in its receptors a source is dimmed by nothing, and its sharp
+    /// weight is the footprint weight at half the σ plus the tail floor.
+    #[test]
+    fn sharp_weight_is_the_footprint_weight_at_half_sigma() {
+        let (w, h) = (63u32, 35u32);
+        let sources = vec![src(Vec3::new(0.0, 0.0, -10.0), Vec3::splat(2.0), 1.0)];
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.tick(&sources, test_view_proj(w, h), lo, hi, false, ATTEN_K_DEFAULT);
+        assert!(r.pipes_of(0).count() > 20);
+        for ((_, wt), ws) in r.pipes_of(0).zip(r.sharp_of(0)) {
+            assert_eq!(ws, wt.powi(SHARP_POWER) + SHARP_FLOOR * wt);
+        }
+        // Half the σ: where the broad weight is e⁻¹ the sharp one is ~e⁻⁴.
+        let e1 = (-1.0f32).exp();
+        let ((_, wt), ws) = r.pipes_of(0).zip(r.sharp_of(0))
+            .min_by(|a, b| ((a.0).1 - e1).abs().total_cmp(&((b.0).1 - e1).abs())).unwrap();
+        assert!(ws < 0.1 * wt, "sharp weight {} is not sharper than {}", ws, wt);
+    }
+
+    /// Two sources on one line of sight: what the receptor *shows* is the near
+    /// one. A full iso of density in front is a surface, and what is behind a
+    /// surface gets a sharp weight of exactly zero; less than an iso in front
+    /// dims in proportion.
+    #[test]
+    fn a_receptor_shows_the_nearest_source_not_the_average() {
+        let (w, h) = (63u32, 35u32);
+        let vp = test_view_proj(w, h);
+        // Opacity 0: τ = 1 for both, so this is the front pass and nothing else.
+        let mut near = src(Vec3::new(0.0, 0.0, -10.0), Vec3::splat(1.0), 0.0);
+        near.density = 8.0;
+        near.color = [8.0, 0.0, 0.0];
+        // Twice the near one's projected size, so it also has receptors to itself.
+        let mut far = src(Vec3::new(0.0, 0.0, -20.0), Vec3::splat(4.0), 0.0);
+        far.density = 8.0;
+        far.color = [0.0, 0.0, 8.0];
+        let mut sources = vec![near, far];
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        assert!(r.transmittance(1) > 0.999);
+
+        let centre = 17 * w + 31;
+        let at = |r: &Retina, i: usize| r.pipes_of(i).zip(r.sharp_of(i))
+            .find(|&((rc, _), _)| rc == centre).map(|((_, wt), ws)| (wt, ws)).expect("misses the centre");
+        let ((wn, sn), (wf, sf)) = (at(&r, 0), at(&r, 1));
+        assert_eq!(sn, wn.powi(SHARP_POWER) + SHARP_FLOOR * wn, "nothing is in front of the near source");
+        assert!(8.0 * wn > RETINA_ISO);
+        assert_eq!(sf, 0.0, "the far source is behind a surface");
+
+        let rec = r.receptors[centre as usize];
+        let c = rec.color_f();
+        assert!(c[0] > 0.0 && c[2] == 0.0, "centre receptor is not showing the near source: {:?}", c);
+        assert!((rec.depth_f() / rec.sharp_f() - 10.0).abs() < 0.01, "depth {}", rec.depth_f() / rec.sharp_f());
+        // Density is still simply both of them.
+        let want_d = 8.0 * wn + 8.0 * wf;
+        assert!((rec.density_f() - want_d).abs() < 1e-3, "density {} want {}", rec.density_f(), want_d);
+        // Where the near source's footprint ends, the far one is all there is.
+        let beside = r.pipes_of(1).zip(r.sharp_of(1))
+            .find(|&((rc, _), _)| r.pipes_of(0).all(|(x, _)| x != rc)).expect("far source has no receptor of its own");
+        assert_eq!(beside.1, (beside.0).1.powi(SHARP_POWER) + SHARP_FLOOR * (beside.0).1);
+
+        // Less than an iso in front is not a surface: it dims in proportion.
+        sources[0].density = 0.2 * RETINA_ISO;
+        let mut r2 = Retina::new(w, h);
+        r2.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        let ((wn2, _), (wf2, sf2)) = (at(&r2, 0), at(&r2, 1));
+        let want = (wf2.powi(SHARP_POWER) + SHARP_FLOOR * wf2) * (1.0 - 0.2 * wn2);
+        assert!((sf2 - want).abs() <= 1e-5 * want, "far sharp weight {} want {}", sf2, want);
+    }
+
+    /// The halo: a kernel's last sliver delivers far less than an iso — it is
+    /// outside the silhouette the source draws — so it must not hide what is
+    /// behind it, however opaque the source is to 3D segments.
+    #[test]
+    fn a_kernel_tail_outside_its_own_silhouette_hides_nothing() {
+        let (w, h) = (63u32, 35u32);
+        // Wide, very opaque, off to the side; its tail crosses the centre.
+        let mut ball = src(Vec3::new(7.6, 0.0, -20.0), Vec3::splat(4.0), 800.0);
+        ball.density = 1.0;
+        let mut behind = src(Vec3::new(0.0, 0.0, -40.0), Vec3::splat(1.0), 0.0);
+        behind.density = 5.0;
+        // Bury `behind` so the ball's 3D tail is under its τ threshold.
+        let mut bury = src(Vec3::new(0.0, 0.0, -40.0), Vec3::splat(1.0), 1.0e6);
+        bury.drawable = false;
+        let sources = vec![ball, behind, bury];
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.tick(&sources, test_view_proj(w, h), lo, hi, false, ATTEN_K_DEFAULT);
+        assert!(r.transmittance(1) > 0.99, "τ {}", r.transmittance(1));
+
+        let centre = 17 * w + 31;
+        let at = |i: usize| r.pipes_of(i).zip(r.sharp_of(i))
+            .find(|&((rc, _), _)| rc == centre).map(|((_, wt), ws)| (wt, ws));
+        let (wb, _) = at(0).expect("the ball's tail must reach the centre");
+        assert!(wb > 0.0 && wb * 1.0 < 0.2 * RETINA_ISO, "want a faint tail, got w = {}", wb);
+        let (wc, sc) = at(1).expect("misses the centre");
+        let base = wc.powi(SHARP_POWER) + SHARP_FLOOR * wc;
+        assert!(sc > 0.8 * base, "a tail delivering {} hid what is behind it: {} of {}", wb, sc, base);
+    }
+
+    /// A source the eye cannot see (τ = 0) delivers nothing, so it must hide
+    /// nothing either — or the receptors on its flank, where whatever blocks
+    /// its centre is not in front, have density and no colour: black holes.
+    #[test]
+    fn an_unseen_source_does_not_black_out_what_is_behind_it() {
+        let (w, h) = (63u32, 35u32);
+        // A: wide, off-axis, its flank over the centre receptor.
+        let a = src(Vec3::new(3.0, 0.0, -20.0), Vec3::splat(4.0), 20.0);
+        // B: small and dense, on A's centre→eye segment, clear of the z axis.
+        let b = src(Vec3::new(1.5, 0.0, -10.0), Vec3::splat(0.4), 50.0);
+        // C: on the axis behind A's flank; D buries it (undrawn), so C's own
+        // surroundings set its τ threshold and A's flank does not dim it.
+        let c = src(Vec3::new(0.0, 0.0, -30.0), Vec3::splat(1.0), 5.0);
+        let mut d = src(Vec3::new(0.0, 0.0, -30.0), Vec3::splat(1.0), 1000.0);
+        d.drawable = false;
+        let sources = vec![a, b, c, d];
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.tick(&sources, test_view_proj(w, h), lo, hi, false, ATTEN_K_DEFAULT);
+        assert!(r.transmittance(0) < 1e-6, "A should be unseen: τ {}", r.transmittance(0));
+        assert!(r.transmittance(2) > 0.99, "C should be seen: τ {}", r.transmittance(2));
+
+        let centre = 17 * w + 31;
+        let at = |i: usize| r.pipes_of(i).zip(r.sharp_of(i))
+            .find(|&((rc, _), _)| rc == centre).map(|((_, wt), ws)| (wt, ws));
+        assert!(at(0).expect("A's flank misses the centre").0 > 0.3);
+        assert!(at(1).is_none(), "B must not reach the centre receptor");
+        let (wc, sc) = at(2).expect("C misses the centre");
+        let base = wc.powi(SHARP_POWER) + SHARP_FLOOR * wc;
+        assert!((sc - base).abs() < 1e-4 * base, "C was dimmed by an unseen source: {} of {}", sc, base);
+        let rec = r.receptors[centre as usize];
+        assert!(rec.density_f() >= RETINA_ISO && rec.sharp_f() > 0.5 * rec.density_f(),
+            "centre receptor is a hole: density {} sharp {}", rec.density_f(), rec.sharp_f());
+    }
+
+    /// Neighbours on one surface differ in depth by less than FRONT_MARGIN and
+    /// must not dim each other — or every surface would show only its nearest
+    /// entity per receptor.
+    #[test]
+    fn sources_within_the_front_margin_do_not_hide_each_other() {
+        let (w, h) = (63u32, 35u32);
+        let a = src(Vec3::new(-0.3, 0.0, -10.0), Vec3::splat(1.0), 8.0);
+        let b = src(Vec3::new(0.3, 0.0, -10.0 - 0.9 * FRONT_MARGIN), Vec3::splat(1.0), 8.0);
+        let sources = vec![a, b];
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.tick(&sources, test_view_proj(w, h), lo, hi, false, ATTEN_K_DEFAULT);
+        for i in 0..2 {
+            assert!(r.pipes_of(i).count() > 0);
+            for ((_, wt), ws) in r.pipes_of(i).zip(r.sharp_of(i)) {
+                assert_eq!(ws, wt.powi(SHARP_POWER) + SHARP_FLOOR * wt, "source {} was dimmed", i);
+            }
+        }
+    }
+
+    /// The tail floor: a receptor reached only by gaussian tails still has a
+    /// sharp sum to normalise by, so it is coloured rather than black.
+    #[test]
+    fn every_receptor_with_density_has_something_to_show() {
+        let (w, h) = (63u32, 35u32);
+        let sources = scene();
+        let (lo, hi) = (Vec3::new(-10.0, -10.0, -25.0), Vec3::new(10.0, 10.0, -5.0));
+        let mut r = Retina::new(w, h);
+        r.tick(&sources, test_view_proj(w, h), lo, hi, false, ATTEN_K_DEFAULT);
+        let lit = r.receptors.iter().filter(|x| x.density_f() >= RETINA_ISO).count();
+        assert!(lit > 50, "scene too thin: {}", lit);
+        for (i, x) in r.receptors.iter().enumerate() {
+            if x.density_f() >= 0.1 * RETINA_ISO {
+                assert!(x.sharp_f() > 1e-4, "receptor {} has density {} but sharp {}", i, x.density_f(), x.sharp_f());
+            }
+        }
+    }
+
     #[test]
     fn arrive_scratch_stays_inside_the_memory_budget() {
         let bytes = std::mem::size_of::<Receptor>();
-        assert_eq!(bytes, 72, "Receptor changed size — the scratch budget math below assumes it");
+        assert_eq!(bytes, 80, "Receptor changed size — the scratch budget math below assumes it");
         // A 1280×720 retina (the MAX_RETINA_DIM aspect) is 921_600 i64
-        // receptors ≈ 63 MiB of scratch each; 128 MiB buys two.
+        // receptors ≈ 70 MiB of scratch each; 160 MiB buys two.
         let n_rec = 1280 * 720;
         let affordable = ARRIVE_SCRATCH_BUDGET_BYTES / (n_rec * bytes);
         assert_eq!(affordable, 2);

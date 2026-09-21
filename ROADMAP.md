@@ -68,7 +68,7 @@
 - Procedural reptile skin: two-frequency Voronoi scales with normal perturbation, fbm mottling, dorsal stripe, warm belly tint, and a waxy specular sheen.
 
 ## v0.8: Receptor retina (the grid is gone) ✅
-- Receptor retina (`retina.rs`): the observer is a persistent `W×H` array of receptors on the image plane, each the running sum of what entities delivered along entity→receptor pipes. Sums, never averages — the renderer divides by density on upload.
+- Receptor retina (`retina.rs`): the observer is a persistent `W×H` array of receptors on the image plane, each the running sum of what entities delivered along entity→receptor pipes. Sums, never averages — the renderer normalizes on upload. (Since 2026-09-21 every pipe has two weights: density through the broad footprint, colour/normal/depth/skin through a sharpened, front-to-back-dimmed one normalized by its own `sharp` sum — near geometry stopped being a blur of every tail that reached it.)
 - Delta pipes: each pipe remembers what it last sent and transmits only `new − last`. A settled scene sends almost nothing; the sum stays exactly reversible, so a relink can subtract every pipe and land on zero. (Since 2026-09-21 pipes are fixed-point integers — i32 Q16 pipes into i64 receptors — so "exactly" is bit for bit and the old `DELTA_EPS` debounce is gone.)
 - Relink on movement only: pipes are rebuilt when the scene AABB's projected corners shift ≥ ½ receptor, the cross-links refresh, or a tuning key fires — not per frame.
 - Occlusion as transmittance: `segment_transmittance` integrates `exp(−k·∫max(0, ρ−threshold))` through the gaussian density along a segment. Used both per entity toward the eye and per radiation edge (`edge_atten`). Replaced the old binary line-of-sight test.

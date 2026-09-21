@@ -384,7 +384,10 @@ impl Renderer {
                 // back into floats.
                 let (density, color, normal) = (r.density_f(), r.color_f(), r.normal_f());
                 let d = density.clamp(0.0, 60000.0);
-                let inv = if density > 1e-6 { 1.0 / density } else { 0.0 };
+                // Everything but density arrived through the sharp weights, so
+                // that sum is what turns them back into averages.
+                let sharp = r.sharp_f();
+                let inv = if sharp > 1e-6 { 1.0 / sharp } else { 0.0 };
                 let nl = normal.length();
                 let nrm = if nl > 1e-6 { normal / nl } else { glam::Vec3::Y };
                 dc_buf[o] = f(d);
