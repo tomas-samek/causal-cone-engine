@@ -28,13 +28,20 @@ Observer --reads--> Receptor            (no march; the pixel is already there)
 
 ### Receptor (`retina.rs`)
 ```rust
-struct Receptor { density: f32, color: [f32; 3], normal: Vec3, depth: f32 }
+struct Receptor { density: i64, color: [i64; 3], normal: [i64; 3], depth: i64, skin: i64 }
+struct PipeQ    { density: i32, color: [i32; 3], normal: [i32; 3], depth: i32, skin: i32 }
 ```
-`W×H` of them. They **sum, never average**; the renderer divides color and depth
-by density on upload, so the shader reads them already normalized. Because each
-pipe remembers what it last sent (`pipe_last`), the sum is exactly reversible:
-relinking subtracts every pipe's last contribution and lands the array on zero
-before rebuilding.
+`W×H` of them, in fixed point: `Q_FRAC` = 16 fractional bits (one step ≈ 1.5e-5,
+under the f16 step of the upload), `Q_DEPTH_FRAC` = 10 for `depth` (Σ depth·density,
+which runs far larger). They **sum, never average**; the renderer converts back
+to floats (`density_f()` …) and divides color and depth by density on upload, so
+the shader reads them already normalized. A pipe's float contribution is rounded
+once, to a `PipeQ`, and each pipe remembers the `PipeQ` it last sent
+(`pipe_last`), so the sum is reversible **bit for bit**: relinking subtracts
+every pipe's last contribution and lands the array on exactly zero before
+rebuilding. Pipes are i32 (one source through a weight ≤ 1, and the array
+`arrive` rewrites every tick); receptors are i64 because they sum many pipes.
+The adds wrap, so even an overflow would come back out exactly.
 
 ### Source (`retina.rs`)
 One entity's contribution as the retina sees it, rebuilt each tick and index-
@@ -107,7 +114,7 @@ the "causal cone": chains that don't feed a visible pixel are skipped.
 | **Phase 2 — push** | Each active, non-debounced entity rewrites its outgoing edge deposits = own emission + pass-through of incoming, weighted by `edge_gamma × distance_factor × edge_atten`, with optional directional bias for vacuum relays. Weights are then **renormalized** to sum to 1 — see the shadow note below. Parallelized with `rayon` (each entity owns a disjoint edge range). |
 | **Advance entities** | The walker group (dino) translates rigidly by `speed × time_lapse` and paces ±6 cells along Z; other entities move by velocity (and bounce off `FIELD_SIZE`). Each solid becomes a `Source` with its animated position, boosted density/color, and `drawable` flag, and the geometry AABB is recomputed. |
 | **Relink** (conditional) | If the cross-links refreshed, a tuning key fired, the AABB's projected corners moved ≥ `RELINK_SHIFT` (0.1 receptor), or **any linked source's projected center** moved that far from where it sat when it was linked, the retina drops every pipe (subtracting what it last sent, landing on exactly zero), re-projects every drawable source's gaussian footprint into image space, and recomputes `τ` toward the eye. The second trigger is what animates the picture: pipes are fixed between relinks, so a source that moves under a motionless camera is a still image until the next one — the walking dino shifts ~0.17 receptors per tick, so it relinks every tick. Note that a relink **resends every pipe**; deltas-only is what holds *between* relinks, not across one. |
-| **Phase 3′ — arrive** | Every pipe sends `new − last`, and only if that delta exceeds `DELTA_EPS`. A settled scene sends nothing. Parallel over entities in contiguous chunks — one per worker thread, fewer when a full-image scratch each would exceed `ARRIVE_SCRATCH_BUDGET_BYTES` (64 MB). Each chunk allocates its scratch lazily, on its first delta, and the scratches are merged into the receptors by disjoint receptor range. |
+| **Phase 3′ — arrive** | Every pipe quantises its contribution to fixed point and sends `new − last` only if the integers differ — no epsilon. A settled scene sends nothing. Parallel over entities in contiguous chunks — one per worker thread, fewer when a full-image scratch each would exceed `ARRIVE_SCRATCH_BUDGET_BYTES` (128 MiB). Each chunk allocates its scratch lazily, on its first delta, and the scratches are merged into the receptors by disjoint receptor range. |
 
 Two asymmetries in **Advance entities** are deliberate: `oscillation_phase`
 advances for *every* solid, in frustum or not, so skin texture doesn't jump when

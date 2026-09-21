@@ -14,7 +14,6 @@ use crate::field::cutoff_window;
 pub const RETINA_W: u32 = 320;
 pub const RETINA_H: u32 = 180;
 pub const RETINA_ISO: f32 = 0.3;
-pub const DELTA_EPS: f32 = 1e-4;
 /// Projected motion, in receptors, that forces a relink — of the scene box's
 /// corners or of any linked source's center. A tenth of a receptor: below it
 /// the pipes are still where the picture wants them.
@@ -31,7 +30,7 @@ pub const MAX_RETINA_DIM: u32 = 1280;
 /// Ceiling on the transient scratch images `arrive` may hold at once. Each
 /// worker chunk owns a full `n_rec × size_of::<Receptor>()` image, so without
 /// a bound the peak grows with the core count *and* the resolution.
-pub const ARRIVE_SCRATCH_BUDGET_BYTES: usize = 64 << 20;
+pub const ARRIVE_SCRATCH_BUDGET_BYTES: usize = 128 << 20;
 
 /// How many entity chunks `arrive` splits into: one per worker thread, minus
 /// however many the scratch budget cannot pay for, and never more than there
@@ -278,53 +277,75 @@ pub fn segment_transmittance(
     (-k * integral).exp()
 }
 
-/// Persistent state of one image-plane cell. Sums, never averages: the
-/// renderer divides by density at upload. Never decays; only deltas touch it.
+/// Fractional bits of every fixed-point channel but depth: one step is
+/// 2⁻¹⁶ ≈ 1.5e-5, well under the f16 step the upload rounds to anyway.
+pub const Q_FRAC: u32 = 16;
+/// Fractional bits of `depth` (Σ depth·density), which runs a few hundred times
+/// larger than density: 2⁻¹⁰ keeps a single pipe inside i32 out to ±2M.
+pub const Q_DEPTH_FRAC: u32 = 10;
+const Q_ONE: f32 = (1u32 << Q_FRAC) as f32;
+const Q_DEPTH_ONE: f32 = (1u32 << Q_DEPTH_FRAC) as f32;
+
+/// Persistent state of one image-plane cell, in fixed point. Sums, never
+/// averages: the renderer divides by density at upload. Never decays; only
+/// deltas touch it. Integers so that a withdrawal undoes a delivery exactly —
+/// the receptors are the sum of `pipe_last` bit for bit, not within a
+/// tolerance. i64 because a receptor sums many i32 pipes; the adds wrap, so
+/// even an overflow would come back out exactly.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Receptor {
-    pub density: f32,
-    pub color: [f32; 3],
-    pub normal: Vec3,
-    pub depth: f32,
+    pub density: i64,
+    pub color: [i64; 3],
+    pub normal: [i64; 3],
+    pub depth: i64,
     /// Σ density·skin over what arrived, so `skin / density` is the
     /// density-weighted fraction of this receptor that is creature.
-    pub skin: f32,
+    pub skin: i64,
 }
 
 impl Receptor {
-    fn add(&mut self, p: &PipeState) {
-        self.density += p.density;
-        self.color[0] += p.color[0];
-        self.color[1] += p.color[1];
-        self.color[2] += p.color[2];
-        self.normal += p.normal;
-        self.depth += p.depth;
-        self.skin += p.skin;
+    fn add(&mut self, p: &PipeQ) {
+        self.density = self.density.wrapping_add(p.density as i64);
+        for c in 0..3 {
+            self.color[c] = self.color[c].wrapping_add(p.color[c] as i64);
+            self.normal[c] = self.normal[c].wrapping_add(p.normal[c] as i64);
+        }
+        self.depth = self.depth.wrapping_add(p.depth as i64);
+        self.skin = self.skin.wrapping_add(p.skin as i64);
     }
-    /// Withdraw what a pipe last delivered. Only `relink`'s debug-build check
-    /// that the receptors really are the sum of the pipes uses it.
-    #[cfg(debug_assertions)]
-    fn sub(&mut self, p: &PipeState) {
-        self.density -= p.density;
-        self.color[0] -= p.color[0];
-        self.color[1] -= p.color[1];
-        self.color[2] -= p.color[2];
-        self.normal -= p.normal;
-        self.depth -= p.depth;
-        self.skin -= p.skin;
+    /// Withdraw what a pipe last delivered — the exact inverse of `add`.
+    fn sub(&mut self, p: &PipeQ) {
+        self.density = self.density.wrapping_sub(p.density as i64);
+        for c in 0..3 {
+            self.color[c] = self.color[c].wrapping_sub(p.color[c] as i64);
+            self.normal[c] = self.normal[c].wrapping_sub(p.normal[c] as i64);
+        }
+        self.depth = self.depth.wrapping_sub(p.depth as i64);
+        self.skin = self.skin.wrapping_sub(p.skin as i64);
     }
     fn add_receptor(&mut self, o: &Receptor) {
-        self.density += o.density;
-        self.color[0] += o.color[0];
-        self.color[1] += o.color[1];
-        self.color[2] += o.color[2];
-        self.normal += o.normal;
-        self.depth += o.depth;
-        self.skin += o.skin;
+        self.density = self.density.wrapping_add(o.density);
+        for c in 0..3 {
+            self.color[c] = self.color[c].wrapping_add(o.color[c]);
+            self.normal[c] = self.normal[c].wrapping_add(o.normal[c]);
+        }
+        self.depth = self.depth.wrapping_add(o.depth);
+        self.skin = self.skin.wrapping_add(o.skin);
     }
+
+    pub fn density_f(&self) -> f32 { self.density as f32 / Q_ONE }
+    pub fn color_f(&self) -> [f32; 3] {
+        [self.color[0] as f32 / Q_ONE, self.color[1] as f32 / Q_ONE, self.color[2] as f32 / Q_ONE]
+    }
+    pub fn normal_f(&self) -> Vec3 {
+        Vec3::new(self.normal[0] as f32, self.normal[1] as f32, self.normal[2] as f32) / Q_ONE
+    }
+    pub fn depth_f(&self) -> f32 { self.depth as f32 / Q_DEPTH_ONE }
+    pub fn skin_f(&self) -> f32 { self.skin as f32 / Q_ONE }
 }
 
-/// What a pipe last delivered — the delta baseline. Same shape as a receptor.
+/// What an entity offers a pipe, in the field's own floats — before the
+/// footprint weight and before quantisation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PipeState {
     pub density: f32,
@@ -344,22 +365,30 @@ impl PipeState {
             skin: self.skin * w,
         }
     }
-    fn minus(&self, o: &PipeState) -> PipeState {
-        PipeState {
-            density: self.density - o.density,
-            color: [self.color[0] - o.color[0], self.color[1] - o.color[1], self.color[2] - o.color[2]],
-            normal: self.normal - o.normal,
-            depth: self.depth - o.depth,
-            skin: self.skin - o.skin,
+    /// Round to the pipe's fixed point. `as i32` saturates (and sends NaN to
+    /// zero), so whatever comes out is a value a later withdrawal can undo.
+    fn quantized(&self) -> PipeQ {
+        let q = |x: f32| (x * Q_ONE).round() as i32;
+        PipeQ {
+            density: q(self.density),
+            color: [q(self.color[0]), q(self.color[1]), q(self.color[2])],
+            normal: [q(self.normal.x), q(self.normal.y), q(self.normal.z)],
+            depth: (self.depth * Q_DEPTH_ONE).round() as i32,
+            skin: q(self.skin),
         }
     }
-    fn max_abs(&self) -> f32 {
-        self.density.abs()
-            .max(self.color[0].abs()).max(self.color[1].abs()).max(self.color[2].abs())
-            .max(self.normal.abs().max_element())
-            .max(self.depth.abs())
-            .max(self.skin.abs())
-    }
+}
+
+/// What a pipe last delivered — the delta baseline. Same shape as a receptor,
+/// at half the width: one source through one weight ≤ 1 fits i32, and
+/// `pipe_last` is the array `arrive` rewrites every tick.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PipeQ {
+    pub density: i32,
+    pub color: [i32; 3],
+    pub normal: [i32; 3],
+    pub depth: i32,
+    pub skin: i32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -559,7 +588,7 @@ pub struct Retina {
     pipe_count: Vec<u32>,
     pipe_receptor: Vec<u32>,
     pipe_weight: Vec<f32>,
-    pipe_last: Vec<PipeState>,
+    pipe_last: Vec<PipeQ>,
     /// τ toward the eye, per entity (1.0 for entities without pipes).
     entity_trans: Vec<f32>,
     /// Eye distance per entity at the last relink.
@@ -689,7 +718,7 @@ impl Retina {
             for (k, &rc) in self.pipe_receptor.iter().enumerate() {
                 self.receptors[rc as usize].sub(&self.pipe_last[k]);
             }
-            debug_assert!(self.receptors.iter().all(|r| r.density.abs() < 1e-2),
+            debug_assert!(self.receptors.iter().all(|r| *r == Receptor::default()),
                 "receptors not zero after dropping all pipes");
         }
         for r in &mut self.receptors { *r = Receptor::default(); }
@@ -773,7 +802,7 @@ impl Retina {
         // Reuse the allocation: at ~577k pipes this buffer is ~18 MB, and
         // handing it back to the allocator every relink is not free.
         self.pipe_last.clear();
-        self.pipe_last.resize(total, PipeState::default());
+        self.pipe_last.resize(total, PipeQ::default());
         let t_pipes = t0.elapsed();
 
         // 5. τ toward the eye — only for entities that actually got pipes
@@ -835,7 +864,7 @@ impl Retina {
         }
     }
 
-    /// Phase 3′: every pipe sends `new − last` if it exceeds DELTA_EPS.
+    /// Phase 3′: every pipe whose quantised value changed sends `new − last`.
     /// Parallel over entities; receptors are shared by many entities, so a
     /// chunk of entities accumulates into a scratch image of its own. The
     /// chunking is by worker thread, not by rayon's adaptive splitting: a
@@ -850,8 +879,8 @@ impl Retina {
         // Contributions first (needs &self), then the per-entity mutable views
         // of pipe_last (contiguous, ascending) — direct field borrows, no unsafe.
         let contribs: Vec<PipeState> = (0..n).map(|i| self.contribution(i, &sources[i])).collect();
-        let mut slices: Vec<&mut [PipeState]> = Vec::with_capacity(n);
-        let mut rest: &mut [PipeState] = &mut self.pipe_last;
+        let mut slices: Vec<&mut [PipeQ]> = Vec::with_capacity(n);
+        let mut rest: &mut [PipeQ] = &mut self.pipe_last;
         for i in 0..n {
             let (head, tail) = rest.split_at_mut(self.pipe_count[i] as usize);
             slices.push(head);
@@ -877,11 +906,12 @@ impl Retina {
                     let start = pipe_start[i] as usize;
                     for (off, l) in last.iter_mut().enumerate() {
                         let k = start + off;
-                        let new = contribs[i].scaled(pipe_weight[k]);
-                        let delta = new.minus(l);
-                        if delta.max_abs() > DELTA_EPS {
+                        let new = contribs[i].scaled(pipe_weight[k]).quantized();
+                        if new != *l {
                             let acc = scratch.get_or_insert_with(|| vec![Receptor::default(); n_rec]);
-                            acc[pipe_receptor[k] as usize].add(&delta);
+                            let rec = &mut acc[pipe_receptor[k] as usize];
+                            rec.sub(l);
+                            rec.add(&new);
                             *l = new;
                             sent += 1;
                         }
@@ -929,22 +959,22 @@ impl Retina {
     }
 
     /// Reference image: Σ over pipes of contribution·weight, from scratch.
-    /// The incremental receptors must equal this (up to DELTA_EPS per pipe).
+    /// The incremental receptors must equal this exactly.
     #[allow(dead_code)] // test/diagnostic API — release builds skip the self-check
     pub fn direct_sum(&self, sources: &[Source]) -> Vec<Receptor> {
         let mut out = vec![Receptor::default(); self.receptors.len()];
         for i in 0..sources.len().min(self.pipe_count.len()) {
             let c = self.contribution(i, &sources[i]);
             for (rc, w) in self.pipes_of(i) {
-                out[rc as usize].add(&c.scaled(w));
+                out[rc as usize].add(&c.scaled(w).quantized());
             }
         }
         out
     }
 
     pub fn log_stats(&self, sources: &[Source]) {
-        let above = self.receptors.iter().filter(|r| r.density >= RETINA_ISO).count();
-        let max_d = self.receptors.iter().map(|r| r.density).fold(0.0f32, f32::max);
+        let above = self.receptors.iter().filter(|r| r.density_f() >= RETINA_ISO).count();
+        let max_d = self.receptors.iter().map(|r| r.density_f()).fold(0.0f32, f32::max);
         log::info!(
             "Retina {}x{}: {} receptors ≥ iso ({:.1}%), max density {:.2}; pipes {} total / {} sent last tick; mean τ {:.3}; {} relinks (last {:.2} ms)",
             self.width, self.height, above,
@@ -960,21 +990,13 @@ impl Retina {
 
         // The incremental image is only ever as good as the claim that it
         // equals the sum of the pipes. Debug builds check it against the
-        // from-scratch reference whenever the diagnostics key is pressed;
-        // anything past a pipe's worth of DELTA_EPS means deltas have drifted.
+        // from-scratch reference whenever the diagnostics key is pressed.
+        // Fixed point makes the two the same integers: any mismatch is a bug.
         #[cfg(debug_assertions)]
         {
             let want = self.direct_sum(sources);
-            let dev = self.receptors.iter().zip(&want)
-                .map(|(got, want)| {
-                    (got.density - want.density).abs()
-                        .max((0..3).map(|c| (got.color[c] - want.color[c]).abs()).fold(0.0, f32::max))
-                        .max((got.normal - want.normal).abs().max_element())
-                        .max((got.depth - want.depth).abs())
-                        .max((got.skin - want.skin).abs())
-                })
-                .fold(0.0f32, f32::max);
-            log::info!("Retina self-check: max |receptor − direct_sum| = {:.2e}", dev);
+            let off = self.receptors.iter().zip(&want).filter(|(got, want)| got != want).count();
+            log::info!("Retina self-check: {} receptors differ from direct_sum", off);
         }
         #[cfg(not(debug_assertions))]
         let _ = sources;
@@ -1683,8 +1705,9 @@ mod tests {
             "the two sources must overlap with unequal weight: {} {}", wc, ws);
         let rec = r.receptors[centre as usize];
         let want = 3.0 * wc / (3.0 * wc + ws);
-        assert!((rec.skin / rec.density - want).abs() < 1e-5,
-            "skin fraction {} want {}", rec.skin / rec.density, want);
+        // Two rounded pipes: the fraction is good to a fixed-point step.
+        assert!((rec.skin_f() / rec.density_f() - want).abs() < 1e-4,
+            "skin fraction {} want {}", rec.skin_f() / rec.density_f(), want);
 
         // A receptor only the creature reaches is all skin, and one only the
         // scenery reaches is none of it.
@@ -1694,10 +1717,10 @@ mod tests {
                 .expect("no receptor exclusive to this source")
         };
         let pure = r.receptors[only(0, 1) as usize];
-        assert!(pure.density > 1e-3 && (pure.skin / pure.density - 1.0).abs() < 1e-5,
+        assert!(pure.density > 0 && pure.skin == pure.density,
             "creature-only receptor is not all skin: {}/{}", pure.skin, pure.density);
         let bare = r.receptors[only(1, 0) as usize];
-        assert!(bare.density > 1e-3 && bare.skin.abs() < 1e-6,
+        assert!(bare.density > 0 && bare.skin == 0,
             "scenery-only receptor picked up skin: {}", bare.skin);
     }
 
@@ -1773,17 +1796,37 @@ mod tests {
         ]
     }
 
-    fn assert_receptors_match(r: &Retina, sources: &[Source], tol: f32) {
+    /// Bit-for-bit, not within a tolerance: pipes carry fixed-point integers,
+    /// so the incremental image and the from-scratch one are the same sums.
+    fn assert_receptors_match(r: &Retina, sources: &[Source]) {
         let want = r.direct_sum(sources);
         for (i, (got, want)) in r.receptors.iter().zip(&want).enumerate() {
-            assert!((got.density - want.density).abs() < tol, "receptor {} density {} vs {}", i, got.density, want.density);
-            for c in 0..3 {
-                assert!((got.color[c] - want.color[c]).abs() < tol, "receptor {} color[{}]", i, c);
-            }
-            assert!((got.normal - want.normal).length() < tol, "receptor {} normal", i);
-            assert!((got.depth - want.depth).abs() < tol * 30.0, "receptor {} depth", i);
-            assert!((got.skin - want.skin).abs() < tol, "receptor {} skin {} vs {}", i, got.skin, want.skin);
+            assert_eq!(got, want, "receptor {}", i);
         }
+    }
+
+    /// Withdrawing what every pipe last delivered must land on exactly zero,
+    /// however many deltas each pipe has sent since it was linked.
+    #[test]
+    fn dropping_every_pipe_lands_on_exactly_zero() {
+        let vp = test_view_proj(63, 35);
+        let (lo, hi) = (Vec3::new(-10.0, -10.0, -25.0), Vec3::new(10.0, 10.0, -5.0));
+        let mut sources = scene();
+        let mut r = Retina::new(63, 35);
+        let mut seed = 11u64;
+        for _ in 0..20 {
+            for s in &mut sources {
+                s.density = 1.0 + 40.0 * lcg(&mut seed);
+                s.color = [lcg(&mut seed), lcg(&mut seed), lcg(&mut seed)];
+            }
+            r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        }
+        for k in 0..r.pipe_receptor.len() {
+            let last = r.pipe_last[k];
+            r.receptors[r.pipe_receptor[k] as usize].sub(&last);
+        }
+        assert!(r.receptors.iter().all(|x| *x == Receptor::default()),
+            "receptors are not the exact sum of what the pipes delivered");
     }
 
     #[test]
@@ -1799,7 +1842,7 @@ mod tests {
                 s.color = [lcg(&mut seed), lcg(&mut seed), lcg(&mut seed)];
             }
             r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
-            assert_receptors_match(&r, &sources, 1e-2);
+            assert_receptors_match(&r, &sources);
         }
         assert_eq!(r.stats.relinks, 1, "static view must link exactly once");
         // Smoke the diagnostics path, including the debug-only self-check that
@@ -1833,7 +1876,7 @@ mod tests {
         r.tick(&sources, vp_b, lo, hi, false, ATTEN_K_DEFAULT);
         assert_eq!(r.stats.relinks, 2);
         assert_ne!(before, r.receptors, "view moved but the image did not");
-        assert_receptors_match(&r, &sources, 1e-2);
+        assert_receptors_match(&r, &sources);
     }
 
     #[test]
@@ -1845,15 +1888,15 @@ mod tests {
         r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
         sources[0].drawable = false; // culled between relinks (e.g. trie depth)
         r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
-        assert_receptors_match(&r, &sources, 1e-2);
+        assert_receptors_match(&r, &sources);
     }
 
     #[test]
     fn arrive_scratch_stays_inside_the_memory_budget() {
         let bytes = std::mem::size_of::<Receptor>();
-        assert_eq!(bytes, 36, "Receptor changed size — the scratch budget math below assumes it");
-        // A 1280×720 retina (the new MAX_RETINA_DIM aspect) is 921_600
-        // receptors ≈ 33 MB of scratch each; 64 MB buys two.
+        assert_eq!(bytes, 72, "Receptor changed size — the scratch budget math below assumes it");
+        // A 1280×720 retina (the MAX_RETINA_DIM aspect) is 921_600 i64
+        // receptors ≈ 63 MiB of scratch each; 128 MiB buys two.
         let n_rec = 1280 * 720;
         let affordable = ARRIVE_SCRATCH_BUDGET_BYTES / (n_rec * bytes);
         assert_eq!(affordable, 2);
@@ -1881,7 +1924,7 @@ mod tests {
         let mean = |w: u32, h: u32| {
             let mut r = Retina::new(w, h);
             r.tick(&sources, test_view_proj(w, h), lo, hi, false, ATTEN_K_DEFAULT);
-            r.receptors.iter().map(|x| x.density).sum::<f32>() / (w * h) as f32
+            r.receptors.iter().map(|x| x.density_f()).sum::<f32>() / (w * h) as f32
         };
         let (coarse, fine) = (mean(63, 35), mean(126, 70));
         assert!((coarse - fine).abs() < 0.2 * fine, "coarse {} vs fine {}", coarse, fine);

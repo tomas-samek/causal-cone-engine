@@ -2090,10 +2090,12 @@ mod tests {
             field.tick(vp);
         }
         let r = &field.retina;
-        let above = r.receptors.iter().filter(|x| x.density >= crate::retina::RETINA_ISO).count();
+        let above = r.receptors.iter().filter(|x| x.density_f() >= crate::retina::RETINA_ISO).count();
         assert!(above > 500, "only {} receptors above iso — dino not on the retina", above);
-        assert!(r.receptors.iter().all(|x| x.density.is_finite() && x.color.iter().all(|c| c.is_finite())),
-            "non-finite receptor");
+        // Receptors are integers, so a NaN would be quantised away rather than
+        // seen there: catch it where it would enter, at the sources.
+        assert!(field.sources.iter().all(|s| s.density.is_finite() && s.color.iter().all(|c| c.is_finite())),
+            "non-finite source");
         // Walker-group sources are drawable and linked
         let linked_walkers = field.entities.iter().enumerate()
             .filter(|(i, e)| e.is_walker && r.pipes_of(*i).count() > 0).count();

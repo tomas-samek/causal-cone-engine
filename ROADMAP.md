@@ -69,7 +69,7 @@
 
 ## v0.8: Receptor retina (the grid is gone) ✅
 - Receptor retina (`retina.rs`): the observer is a persistent `W×H` array of receptors on the image plane, each the running sum of what entities delivered along entity→receptor pipes. Sums, never averages — the renderer divides by density on upload.
-- Delta pipes: each pipe remembers what it last sent and transmits only `new − last` above `DELTA_EPS`. A settled scene sends almost nothing; the sum stays exactly reversible, so a relink can subtract every pipe and land on zero.
+- Delta pipes: each pipe remembers what it last sent and transmits only `new − last`. A settled scene sends almost nothing; the sum stays exactly reversible, so a relink can subtract every pipe and land on zero. (Since 2026-09-21 pipes are fixed-point integers — i32 Q16 pipes into i64 receptors — so "exactly" is bit for bit and the old `DELTA_EPS` debounce is gone.)
 - Relink on movement only: pipes are rebuilt when the scene AABB's projected corners shift ≥ ½ receptor, the cross-links refresh, or a tuning key fires — not per frame.
 - Occlusion as transmittance: `segment_transmittance` integrates `exp(−k·∫max(0, ρ−threshold))` through the gaussian density along a segment. Used both per entity toward the eye and per radiation edge (`edge_atten`). Replaced the old binary line-of-sight test.
 - Display shader (`shaders/retina.wgsl`): threshold at `RETINA_ISO`, shade with the arrived normal, composite over the procedural sky — no ray march, no 3D texture.

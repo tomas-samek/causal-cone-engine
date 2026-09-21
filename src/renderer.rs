@@ -380,18 +380,21 @@ impl Renderer {
             for (i, r) in self.diff_field.retina.receptors.iter().enumerate() {
                 let (x, y) = ((i % rw as usize), (i / rw as usize));
                 let o = y * stride + x * 4;
-                let d = r.density.clamp(0.0, 60000.0);
-                let inv = if r.density > 1e-6 { 1.0 / r.density } else { 0.0 };
-                let nl = r.normal.length();
-                let nrm = if nl > 1e-6 { r.normal / nl } else { glam::Vec3::Y };
+                // Receptors are fixed point; this is the one place they turn
+                // back into floats.
+                let (density, color, normal) = (r.density_f(), r.color_f(), r.normal_f());
+                let d = density.clamp(0.0, 60000.0);
+                let inv = if density > 1e-6 { 1.0 / density } else { 0.0 };
+                let nl = normal.length();
+                let nrm = if nl > 1e-6 { normal / nl } else { glam::Vec3::Y };
                 dc_buf[o] = f(d);
-                dc_buf[o + 1] = f((r.color[0] * inv).min(60000.0));
-                dc_buf[o + 2] = f((r.color[1] * inv).min(60000.0));
-                dc_buf[o + 3] = f((r.color[2] * inv).min(60000.0));
+                dc_buf[o + 1] = f((color[0] * inv).min(60000.0));
+                dc_buf[o + 2] = f((color[1] * inv).min(60000.0));
+                dc_buf[o + 3] = f((color[2] * inv).min(60000.0));
                 nd_buf[o] = f(nrm.x);
                 nd_buf[o + 1] = f(nrm.y);
                 nd_buf[o + 2] = f(nrm.z);
-                nd_buf[o + 3] = f((r.depth * inv).min(60000.0));
+                nd_buf[o + 3] = f((r.depth_f() * inv).min(60000.0));
                 // The creature flag rides in its own texture rather than in the
                 // sign of nd.w. The sampler is Linear, and across a dino/floor
                 // boundary an interpolated ±depth passes through zero — |nd.w|
@@ -399,7 +402,7 @@ impl Renderer {
                 // fringing every silhouette with noise. A fraction in [0, 1]
                 // interpolates to a fraction, and the shader thresholds it.
                 self.skin_buf[y * skin_stride + x] =
-                    ((r.skin * inv).clamp(0.0, 1.0) * 255.0).round() as u8;
+                    ((r.skin_f() * inv).clamp(0.0, 1.0) * 255.0).round() as u8;
             }
             for (tex, buf) in [(&self.retina_dc, &*dc_buf), (&self.retina_nd, &*nd_buf)] {
                 self.queue.write_texture(
