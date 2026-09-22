@@ -107,7 +107,14 @@ pub struct Entity {
     pub oscillation_freq: f32,
     /// Max oscillation offset in voxels
     pub oscillation_amplitude: f32,
-    /// Density-weighted average direction of incoming light (normalized after delivery)
+    /// Density-weighted mean direction of incoming light: Σ dir·density over
+    /// the incoming edges, divided by Σ density. Its *length* is the
+    /// anisotropy of what arrived — 1 when it all came from one side, 0 when
+    /// it cancelled — and the directional bias in Phase 2 scales with it.
+    /// It used to be normalised, and a relay lit evenly from opposite sides
+    /// then steered its whole output by whichever side led by a rounding
+    /// error, flipping as the balance shifted: a frozen scene never settled,
+    /// its lighting circling a period-4 limit cycle of ~0.05 %.
     pub incoming_dir: glam::Vec3,
     /// Debounce: previous incoming density for change detection
     pub prev_incoming_density: f32,
@@ -1640,7 +1647,7 @@ impl DiffField {
             let entity = &mut self.entities[i];
             let new_density = self.deliveries[i].density;
             entity.incoming = self.deliveries[i];
-            entity.incoming_dir = self.delivery_dirs[i].normalize_or_zero();
+            entity.incoming_dir = if new_density > 1e-6 { self.delivery_dirs[i] / new_density } else { glam::Vec3::ZERO };
 
             // Debounce: detect if incoming has changed
             let diff = (new_density - entity.prev_incoming_density).abs();
@@ -1768,7 +1775,10 @@ impl DiffField {
                 std::slice::from_raw_parts_mut(ptr.add(start), count)
             };
 
-            let has_dir = entity.is_vacuum && entity.incoming_dir.length_squared() > 0.01;
+            // `incoming_dir` carries its anisotropy as its length (see the
+            // field), so the bias fades out continuously as the incoming
+            // light becomes balanced; only an exact zero is skipped.
+            let has_dir = entity.is_vacuum && entity.incoming_dir.length_squared() > 1e-12;
             let mut total_weight: f32 = 0.0;
             for (local_k, dep) in deposits.iter_mut().enumerate() {
                 let k = start + local_k;
