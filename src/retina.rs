@@ -662,6 +662,33 @@ fn footprint(vp: &Mat4, w: u32, h: u32, s: &Source) -> Option<Footprint> {
     })
 }
 
+/// Where a source's segment toward the eye starts: its *near surface*, the
+/// point of the kernel ellipsoid `position + radii·d` nearest the eye, not the
+/// centre. A point kernel moves one cell; a dino metaball moves by its radius,
+/// 4–8 cells, which takes the segment out of the ball's own volume — and out
+/// of the sibling balls it overlaps. Measured from the centre, the belly's one
+/// line of sight ran through the body or a leg for whole ranges of view
+/// angle, τ fell to zero for the entire 7-cell ball, and the tail showed
+/// through the crescent it used to cover: a dark ring that came and went with
+/// the camera.
+pub fn tau_origin(s: &Source, eye: Vec3) -> Vec3 {
+    let r = s.kernel_radii();
+    // Unit vector toward the eye in the ellipsoid's own (sphere) frame.
+    let d = ((eye - s.position) / r).normalize_or_zero();
+    s.position + d * r
+}
+
+/// τ of source `i` toward the eye. Relative threshold: an entity is not
+/// occluded by what it is already buried in. ρ_self is the density of *other*
+/// occluders at the segment's origin — for a receptor on the dino's shell that
+/// is its own skeleton, 4–8 deep. Only density above it (the body behind, the
+/// floor under) can dim the entity.
+pub fn tau_toward(sources: &[Source], hash: &SpatialHash, i: usize, eye: Vec3, k: f32, aabb: Option<(Vec3, Vec3)>) -> f32 {
+    let from = tau_origin(&sources[i], eye);
+    let rho_self = hash.density_at(sources, from, &[i]);
+    segment_transmittance(sources, hash, from, eye, &[i], k, rho_self.max(ATTEN_THRESHOLD), aabb)
+}
+
 /// Observer position from the view-projection: the camera center maps to
 /// clip (0,0,c,0) (w = 0), so pull that direction back and divide.
 pub fn eye_from_view_proj(view_proj: Mat4) -> Vec3 {
@@ -946,16 +973,7 @@ impl Retina {
         let pipe_count = &self.pipe_count;
         let aabb = Some((aabb_min, aabb_max));
         self.entity_trans = (0..sources.len()).into_par_iter().map(|i| {
-            if pipe_count[i] > 0 {
-                // Relative threshold: an entity is not occluded by what it is
-                // already buried in. ρ_self is the density of *other* occluders
-                // at the entity's own position — for a receptor on the dino's
-                // shell that is its own skeleton, 4–8 deep. Only density above
-                // it (the body behind, the floor under) can dim the entity.
-                let rho_self = hash.density_at(sources, sources[i].position, &[i]);
-                let threshold = rho_self.max(ATTEN_THRESHOLD);
-                segment_transmittance(sources, hash, sources[i].position, eye, &[i], atten_k, threshold, aabb)
-            } else { 1.0 }
+            if pipe_count[i] > 0 { tau_toward(sources, hash, i, eye, atten_k, aabb) } else { 1.0 }
         }).collect();
     }
 
@@ -1685,6 +1703,34 @@ mod tests {
     /// *above* what already surrounds it can occlude it.
     fn rel_threshold(sources: &[Source], hash: &SpatialHash, i: usize) -> f32 {
         hash.density_at(sources, sources[i].position, &[i]).max(ATTEN_THRESHOLD)
+    }
+
+    /// A metaball's segment starts on its near surface. A sibling ball B sits
+    /// *inside* A's volume, on the line from A's centre to the eye — the dino's
+    /// skeleton is exactly such overlapping balls — so that line runs through
+    /// B's core while A's near surface is past it, in the clear: A must see
+    /// the eye. Measured from the centre it did not, and every view angle
+    /// where some sibling crossed that one line blacked out the whole ball.
+    #[test]
+    fn a_metaball_sees_the_eye_from_its_near_surface_not_its_centre() {
+        let a = src(Vec3::new(0.0, 0.0, -20.0), Vec3::splat(6.0), 800.0);
+        let b = src(Vec3::new(1.5, 0.0, -17.4), Vec3::splat(1.5), 800.0);
+        let sources = vec![a, b];
+        let hash = SpatialHash::build(&sources);
+        let eye = Vec3::new(14.0, 0.0, 4.0);
+        // Diagnosis first: the centre's line is blocked, the surface's is not.
+        let thr_c = rel_threshold(&sources, &hash, 0);
+        let from_c = segment_transmittance(&sources, &hash, sources[0].position, eye, &[0], ATTEN_K_DEFAULT, thr_c, None);
+        assert!(from_c < 0.05, "test geometry: the centre's line should run through B, τ={}", from_c);
+        let origin = tau_origin(&sources[0], eye);
+        assert!(((origin - sources[0].position).length() - 6.0).abs() < 1e-3, "origin is not on the surface: {:?}", origin);
+        assert!(hash.density_at(&sources, origin, &[0]) < 1.0, "the near surface is inside B");
+        let t = tau_toward(&sources, &hash, 0, eye, ATTEN_K_DEFAULT, None);
+        assert!(t > 0.9, "ball A occluded by a sibling its own line of sight clears: τ={}", t);
+        // A point kernel's origin moves one cell toward the eye and no more.
+        let p = src(Vec3::new(0.0, 0.0, -30.0), Vec3::ZERO, 1.0);
+        let o = tau_origin(&p, eye);
+        assert!(((o - p.position).length() - 1.0).abs() < 1e-5 && (o - p.position).dot(eye - p.position) > 0.0);
     }
 
     /// The dino's receptor shell sits inside its own skeleton metaballs, so

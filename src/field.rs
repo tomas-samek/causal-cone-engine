@@ -2163,12 +2163,23 @@ mod tests {
         field.freeze_animation = true;
         // 25 ticks, not 10: now that the dino is no longer occluded by itself
         // its skin actually carries light, so the lighting has ~100 more
-        // contributing entities to converge. It reaches 0.6% by tick 20 and
-        // stays there; 10 ticks catches it mid-descent at ~1.6%.
+        // contributing entities to converge. It settles by tick 25; 10 ticks
+        // catches it mid-descent.
+        //
+        // Measured in *sources*, which is what `arrive` now pays for: the
+        // floor is ~19 of ~17k, the big skeleton metaballs, whose lit density
+        // never quite stops twitching. Each of those carries hundreds of
+        // pipes, so the pipe count settles near 1% — it was 0.6% only while
+        // most of them had τ = 0 by the centre-segment accident and sent
+        // nothing at all.
         for _ in 0..25 { field.tick(vp); }
         let s = field.retina.stats;
-        assert!(s.pipes_sent * 100 < s.pipes_total,
-            "frozen scene still sends {} of {} pipes", s.pipes_sent, s.pipes_total);
+        let linked = field.retina.stats.pipes_total; // pipes, for the message
+        let n_sources = field.sources.len();
+        assert!(s.sources_arrived * 200 < n_sources,
+            "frozen scene still has {} of {} sources sending", s.sources_arrived, n_sources);
+        assert!(s.pipes_sent * 50 < linked,
+            "frozen scene still sends {} of {} pipes", s.pipes_sent, linked);
     }
 
     /// The floor is a 1.5-cell lattice and the rock a 0.8-cell one: each gets
