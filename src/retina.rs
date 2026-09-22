@@ -699,9 +699,6 @@ pub struct Retina {
     /// (receptors, weights, per-entity (count, receptor rect)). One entry per worker chunk, not
     /// per entity — 17k relink-time allocations is a cost of its own.
     pipe_scratch: Vec<(Vec<u32>, Vec<f32>, Vec<(u32, [u32; 4])>)>,
-    /// `link_front`'s per-receptor running densities (from every source, and
-    /// from the static ones alone), kept for their capacity.
-    front_scratch: (Vec<f32>, Vec<f32>),
     /// Entity indices in the order their runs sit in the pipe arrays: the
     /// static sources first (`static_entities` of them, `static_pipes` pipes),
     /// then the movers. A partial relink cuts the arrays at that seam.
@@ -744,7 +741,6 @@ impl Retina {
             last_view_proj: None,
             hash: SpatialHash::default(),
             pipe_scratch: Vec::new(),
-            front_scratch: (Vec::new(), Vec::new()),
             layout: Vec::new(),
             static_entities: 0,
             static_pipes: 0,
@@ -1229,67 +1225,119 @@ impl Retina {
         order.sort_unstable_by(|&a, &b| {
             self.entity_depth[a as usize].total_cmp(&self.entity_depth[b as usize]).then(a.cmp(&b))
         });
-
-        // One sweep, front to back, over *sources* — no per-receptor table.
-        // `in_front[rc]` holds the density delivered to receptor `rc` by every
-        // source at least FRONT_MARGIN nearer than the one being weighed;
-        // `depth − FRONT_MARGIN` rises along the sweep, so a second cursor
-        // trails behind and pours sources in as they fall that far back. Every
-        // pipe is touched twice, in its own entity's contiguous run, and the
-        // accumulators are one float per receptor: this is memory-sequential,
-        // where regrouping the pipes by receptor was a scatter of all of them.
         let partial = within.is_some();
-        let n_rec = self.receptors.len();
-        let (in_front, in_front_static) = (&mut self.front_scratch.0, &mut self.front_scratch.1);
-        in_front.clear();
-        in_front.resize(n_rec, 0.0);
-        in_front_static.clear();
-        in_front_static.resize(if partial { 0 } else { n_rec }, 0.0);
         if !partial {
             self.pipe_sharp.clear();
             self.pipe_sharp.resize(self.pipe_receptor.len(), 0.0);
         }
-        let dirty = &self.dirty_mask;
-        let mut behind = 0usize;
-        for &i in &order {
+        if order.is_empty() { return; }
+
+        // The sweep is per receptor, and receptors do not talk to each other:
+        // cut the image into horizontal bands and sweep them in parallel. A
+        // footprint's pipes are row-major, so the part of a source's run that
+        // falls in one band is contiguous — `cuts` holds, per swept source,
+        // where each band's stretch of its run begins.
+        let (w, h) = (self.width as usize, self.height as usize);
+        let bands = rayon::current_num_threads().clamp(1, h);
+        let band_rows = h.div_ceil(bands);
+        let bands = h.div_ceil(band_rows);
+        let (pipe_start, pipe_count, pipe_receptor) = (&self.pipe_start, &self.pipe_count, &self.pipe_receptor);
+        let cuts: Vec<u32> = order.par_iter().flat_map_iter(|&i| {
+            let start = pipe_start[i as usize] as usize;
+            let run = &pipe_receptor[start..start + pipe_count[i as usize] as usize];
+            (0..=bands).map(move |b| (start + run.partition_point(|&rc| (rc as usize) < b * band_rows * w)) as u32)
+        }).collect();
+
+        // Hand every band its own stretches of `pipe_sharp`. They interleave
+        // in memory (source-major, band-minor), so walk the array once in
+        // layout order and deal the pieces out — plain `split_at_mut`.
+        let mut place = vec![u32::MAX; self.pipe_count.len()];
+        for (o, &i) in order.iter().enumerate() { place[i as usize] = o as u32; }
+        let mut dealt: Vec<Vec<&mut [f32]>> = (0..bands)
+            .map(|_| { let mut v = Vec::with_capacity(order.len()); v.resize_with(order.len(), Default::default); v })
+            .collect();
+        let mut rest: &mut [f32] = &mut self.pipe_sharp;
+        for &i in &self.layout {
             let i = i as usize;
-            while self.entity_depth[order[behind] as usize] < self.entity_depth[i] - FRONT_MARGIN {
-                let j = order[behind] as usize;
-                behind += 1;
-                // A hidden source only adds to receptors already past
-                // HIDDEN_AT isos: it changes no weight, and it will have no
-                // pipes to be poured from at the next partial sweep.
-                if self.hidden[j] { continue; }
-                // What `contribution` will offer: the density j delivers.
-                let delivered = sources[j].density * self.entity_trans[j];
-                let (start, count) = (self.pipe_start[j] as usize, self.pipe_count[j] as usize);
-                let is_static = self.linked_static[j];
-                for k in start..start + count {
-                    let rc = self.pipe_receptor[k] as usize;
-                    if partial && !dirty[rc] { continue; }
-                    let d = delivered * self.pipe_weight[k];
-                    in_front[rc] += d;
-                    if is_static && !partial { in_front_static[rc] += d; }
+            let (mut run, tail) = std::mem::take(&mut rest).split_at_mut(pipe_count[i] as usize);
+            rest = tail;
+            let o = place[i];
+            if o == u32::MAX { continue; }
+            let c = &cuts[o as usize * (bands + 1)..(o as usize + 1) * (bands + 1)];
+            for b in 0..bands {
+                let (piece, more) = run.split_at_mut((c[b + 1] - c[b]) as usize);
+                run = more;
+                dealt[b][o as usize] = piece;
+            }
+        }
+
+        // One sweep per band, front to back, over *sources* — no per-receptor
+        // table. `in_front[rc]` holds the density delivered to receptor `rc` by
+        // every source at least FRONT_MARGIN nearer than the one being weighed;
+        // `depth − FRONT_MARGIN` rises along the sweep, so a second cursor
+        // trails behind and pours sources in as they fall that far back. Every
+        // pipe is touched twice, in its own entity's contiguous run, and the
+        // accumulators are one float per receptor of the band.
+        //
+        // A source that turns out hidden is poured like any other: it only
+        // reaches receptors already past HIDDEN_AT isos, where more density
+        // changes neither a weight nor anyone's hiddenness — which is also why
+        // the bands need not know each other's verdicts mid-sweep.
+        let (entity_depth, entity_trans, linked_static, pipe_weight, dirty) =
+            (&self.entity_depth, &self.entity_trans, &self.linked_static, &self.pipe_weight, &self.dirty_mask);
+        let (order, cuts) = (&order, &cuts);
+        let verdicts: Vec<Vec<(bool, bool)>> = dealt.par_iter_mut().enumerate().map(|(b, sharp)| {
+            let base = b * band_rows * w;
+            let len = (band_rows * w).min(w * h - base);
+            let mut in_front = vec![0.0f32; len];
+            let mut in_front_static = vec![0.0f32; if partial { 0 } else { len }];
+            // (exposed, changed) per swept source, as far as this band sees.
+            let mut verdict = vec![(false, false); order.len()];
+            let run_of = |o: usize| (cuts[o * (bands + 1) + b] as usize, cuts[o * (bands + 1) + b + 1] as usize);
+            let mut behind = 0usize;
+            for (o, &i) in order.iter().enumerate() {
+                let i = i as usize;
+                while entity_depth[order[behind] as usize] < entity_depth[i] - FRONT_MARGIN {
+                    let j = order[behind] as usize;
+                    let (k0, k1) = run_of(behind);
+                    behind += 1;
+                    // What `contribution` will offer: the density j delivers.
+                    let delivered = sources[j].density * entity_trans[j];
+                    let is_static = linked_static[j];
+                    for k in k0..k1 {
+                        let rc = pipe_receptor[k] as usize;
+                        if partial && !dirty[rc] { continue; }
+                        let d = delivered * pipe_weight[k];
+                        in_front[rc - base] += d;
+                        if is_static && !partial { in_front_static[rc - base] += d; }
+                    }
                 }
+                let p = sources[i].sharp_power.clamp(1, SHARP_POWER_MAX);
+                let is_static = linked_static[i];
+                let (k0, k1) = run_of(o);
+                let (mut exposed, mut changed) = (false, false);
+                for (k, out) in (k0..k1).zip(sharp[o].iter_mut()) {
+                    let rc = pipe_receptor[k] as usize;
+                    if partial && !dirty[rc] { exposed = true; continue; }
+                    let new = (1.0 - in_front[rc - base] / RETINA_ISO).max(0.0) * sharp_base(pipe_weight[k], p);
+                    changed |= new != *out;
+                    *out = new;
+                    let cover = if is_static && !partial { in_front_static[rc - base] } else { in_front[rc - base] };
+                    exposed |= cover < HIDDEN_AT * RETINA_ISO;
+                }
+                verdict[o] = (exposed, changed);
             }
-            let p = sources[i].sharp_power.clamp(1, SHARP_POWER_MAX);
-            let (start, count) = (self.pipe_start[i] as usize, self.pipe_count[i] as usize);
-            let is_static = self.linked_static[i];
-            let mut exposed = false;
-            let mut changed = false;
-            for k in start..start + count {
-                let rc = self.pipe_receptor[k] as usize;
-                if partial && !dirty[rc] { exposed = true; continue; }
-                let sharp = (1.0 - in_front[rc] / RETINA_ISO).max(0.0) * sharp_base(self.pipe_weight[k], p);
-                changed |= sharp != self.pipe_sharp[k];
-                self.pipe_sharp[k] = sharp;
-                let cover = if is_static && !partial { in_front_static[rc] } else { in_front[rc] };
-                exposed |= cover < HIDDEN_AT * RETINA_ISO;
-            }
-            if partial {
+            verdict
+        }).collect();
+
+        for (o, &i) in order.iter().enumerate() {
+            let i = i as usize;
+            let exposed = verdicts.iter().any(|v| v[o].0);
+            let changed = verdicts.iter().any(|v| v[o].1);
+            if partial && self.linked_static[i] {
                 // The static scene is never relinked here, so it is never
                 // hidden here either; the movers are judged afresh.
-                if is_static { self.weights_dirty[i] |= changed; } else { self.hidden[i] = !exposed; }
+                self.weights_dirty[i] |= changed;
             } else {
                 self.hidden[i] = !exposed;
             }
