@@ -660,6 +660,7 @@ impl DiffField {
             is_static: Self::is_static_entity(e),
             skin: false, // τ only — nothing here is ever drawn
             sharp_power: crate::retina::SHARP_POWER_MAX,
+            shrink_min: 1.0,
         }).collect()
     }
 
@@ -1864,7 +1865,7 @@ impl DiffField {
         self.sources.resize(n, Source {
             position: glam::Vec3::ZERO, radii: glam::Vec3::ZERO, normal: glam::Vec3::Y,
             opacity: 0.0, density: 0.0, color: [0.0; 3], drawable: false, occluder: false,
-            is_static: true, skin: false, sharp_power: crate::retina::SHARP_POWER_MAX,
+            is_static: true, skin: false, sharp_power: crate::retina::SHARP_POWER_MAX, shrink_min: 1.0,
         });
 
         let mut aabb_min = glam::Vec3::splat(FIELD_SIZE as f32);
@@ -1954,6 +1955,10 @@ impl DiffField {
             let total_b = (entity_color[2] * mag + entity.incoming.b * absorbed * entity_color[2] + entity.reemit_b) * color_boost;
             let total_d = (mag + entity.incoming.density * absorbed) * density_boost;
 
+            let lattice_radius = if use_gaussian {
+                let r = entity.deposit_radii;
+                (r.x + r.y + r.z) / 3.0
+            } else { 1.0 };
             self.sources[ent_idx] = Source {
                 position: deposit_pos,
                 radii: entity.deposit_radii,
@@ -1967,11 +1972,8 @@ impl DiffField {
                 // Every walker group is dino — body, limbs, eyes, mouth. The
                 // shader reads this back as "give it reptile scales".
                 skin: entity.is_walker,
-                sharp_power: {
-                    let r = entity.deposit_radii;
-                    let radius = if use_gaussian { (r.x + r.y + r.z) / 3.0 } else { 1.0 };
-                    crate::retina::sharp_power_for(radius, entity.neighbor_spacing)
-                },
+                sharp_power: crate::retina::sharp_power_for(lattice_radius, entity.neighbor_spacing),
+                shrink_min: crate::retina::shrink_min_for(lattice_radius, entity.neighbor_spacing),
             };
         }
         self.aabb_min = aabb_min.max(glam::Vec3::ZERO);

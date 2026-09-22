@@ -56,6 +56,11 @@ pub struct Source {
     /// Power of this source's sharp weight, from how far apart its lattice is
     /// (`sharp_power_for`).
     pub sharp_power: i32,
+    /// How far this source's footprint may shrink when it is near the eye
+    /// (`shrink_min_for`): 1.0 never. A member of a lattice may draw with a
+    /// kernel down to ~0.6× its spacing and still read as a continuous
+    /// surface; a metaball's kernel is its shape and must not.
+    pub shrink_min: f32,
 }
 
 impl Source {
@@ -292,6 +297,29 @@ pub fn sharp_base(w: f32, p: i32) -> f32 {
     w.powi(p) + SHARP_FLOOR * w
 }
 
+/// Projected σ, in receptors, above which a near source's footprint is
+/// shrunk (`footprint`). Below it a source is at most ~110 pipes; above it a
+/// lattice member's pipes are mostly overlap — ~20 entities cover every point
+/// of the rock's 1-cell kernels on their 0.8-cell lattice, and up close each
+/// splat is thousands of receptors wide.
+pub const SHRINK_SIGMA: f32 = 3.0;
+/// Kernel radius, as a fraction of the lattice spacing, at which a lattice of
+/// gaussians still sums to a continuous surface: σ_eff = r/√2, and the ripple
+/// of a lattice of spacing `a` is ~2·exp(−2π²σ_eff²/a²) — 4 % at 0.6, 17 % at
+/// 0.4.
+pub const SHRINK_RADIUS_PER_SPACING: f32 = 0.6;
+
+/// `Source::shrink_min` for a kernel of mean radius `radius` in a lattice of
+/// `spacing`: the factor that brings the radius down to
+/// `SHRINK_RADIUS_PER_SPACING · spacing`, never above 1. A kernel larger than
+/// 1.5× its spacing is not a lattice member drawn by its neighbours but a
+/// shape of its own (the dino's metaballs), and one with no neighbour has
+/// nothing to fill in for it: neither shrinks.
+pub fn shrink_min_for(radius: f32, spacing: f32) -> f32 {
+    if spacing <= 0.0 || radius <= 0.0 || radius > 1.5 * spacing { return 1.0; }
+    (SHRINK_RADIUS_PER_SPACING * spacing / radius).min(1.0)
+}
+
 /// The sharp power a lattice of kernels of mean radius `radius`, `spacing`
 /// apart, can carry and still read as a continuous surface: halfway between
 /// neighbours `e = (spacing/2r)²`, so `p·e ≤ SHARP_GAP`. A whole number, so
@@ -492,6 +520,8 @@ struct Footprint {
     u: f32,
     v: f32,
     depth: f32,
+    /// Kernel radius factor this footprint was cut at (≤ 1): see `footprint`.
+    shrink: f32,
     a: f32,
     b: f32,
     c: f32,
@@ -610,6 +640,18 @@ fn footprint(vp: &Mat4, w: u32, h: u32, s: &Source) -> Option<Footprint> {
     let r = s.kernel_radii();
     if depth < r.max_element() { return None; }
 
+    // Near the eye a lattice member's splat is mostly overlap with its
+    // neighbours'. Shrink the kernel so the projected σ comes down to
+    // SHRINK_SIGMA — as far as the lattice allows (`shrink_min`) — and let
+    // `contribution` scale what it delivers by 1/shrink², which is what the
+    // footprint's area lost: the sum over the lattice interior is what it was,
+    // and pipes fall with the square. Smooth in depth, so the near silhouette
+    // draws in gradually as the eye approaches rather than popping; beyond
+    // SHRINK_SIGMA nothing changes at all.
+    let sigma = projected_sigma(vp, w, h, s.position, r)?;
+    let shrink = if sigma > SHRINK_SIGMA { (SHRINK_SIGMA / sigma).max(s.shrink_min).min(1.0) } else { 1.0 };
+    let r = r * shrink;
+
     // Extent box: exact silhouette of the ellipsoid position ± 2r. `den` is
     // the clip-w row; `num` is clip-x for u and clip-y for v. v runs down the
     // screen, so its range is the y range mirrored.
@@ -619,16 +661,7 @@ fn footprint(vp: &Mat4, w: u32, h: u32, s: &Source) -> Option<Footprint> {
     let (eu0, eu1) = ((gx0 * 0.5 + 0.5) * w as f32, (gx1 * 0.5 + 0.5) * w as f32);
     let (ev0, ev1) = ((0.5 - gy1 * 0.5) * h as f32, (0.5 - gy0 * 0.5) * h as f32);
 
-    let (mut suu, mut suv, mut svv) = (0.0f32, 0.0f32, 0.0f32);
-    for axis in [Vec3::X * r.x, Vec3::Y * r.y, Vec3::Z * r.z] {
-        let (pu, pv, _) = project(vp, w, h, s.position + axis)?;
-        let (mu, mv, _) = project(vp, w, h, s.position - axis)?;
-        let du = (pu - mu) * 0.5;
-        let dv = (pv - mv) * 0.5;
-        suu += du * du;
-        suv += du * dv;
-        svv += dv * dv;
-    }
+    let (mut suu, mut suv, mut svv) = projected_covariance(vp, w, h, s.position, r)?;
     // Floor the variance at half a receptor so distant entities keep a pipe.
     let min_var = 0.25;
     suu = suu.max(min_var);
@@ -637,7 +670,7 @@ fn footprint(vp: &Mat4, w: u32, h: u32, s: &Source) -> Option<Footprint> {
     // 2σ box ∩ extent box.
     let (hu, hv) = (2.0 * suu.sqrt(), 2.0 * svv.sqrt());
     Some(Footprint {
-        u, v, depth,
+        u, v, depth, shrink,
         a: svv / det,
         b: -suv / det,
         c: suu / det,
@@ -673,6 +706,28 @@ pub fn tau_toward(sources: &[Source], hash: &SpatialHash, i: usize, eye: Vec3, k
     let from = tau_origin(&sources[i], eye);
     let rho_self = hash.density_at(sources, from, &[i]);
     segment_transmittance(sources, hash, from, eye, &[i], k, rho_self.max(ATTEN_THRESHOLD), aabb)
+}
+
+/// Image-space covariance (s_uu, s_uv, s_vv) of a kernel of radii `r` at `p`,
+/// by central differences along its axes (see `footprint`).
+fn projected_covariance(vp: &Mat4, w: u32, h: u32, p: Vec3, r: Vec3) -> Option<(f32, f32, f32)> {
+    let (mut suu, mut suv, mut svv) = (0.0f32, 0.0f32, 0.0f32);
+    for axis in [Vec3::X * r.x, Vec3::Y * r.y, Vec3::Z * r.z] {
+        let (pu, pv, _) = project(vp, w, h, p + axis)?;
+        let (mu, mv, _) = project(vp, w, h, p - axis)?;
+        let du = (pu - mu) * 0.5;
+        let dv = (pv - mv) * 0.5;
+        suu += du * du;
+        suv += du * dv;
+        svv += dv * dv;
+    }
+    Some((suu, suv, svv))
+}
+
+/// The larger of a kernel's projected σ along u and v, in receptors.
+fn projected_sigma(vp: &Mat4, w: u32, h: u32, p: Vec3, r: Vec3) -> Option<f32> {
+    let (suu, _, svv) = projected_covariance(vp, w, h, p, r)?;
+    Some(suu.max(svv).sqrt())
 }
 
 /// Observer position from the view-projection: the camera center maps to
@@ -732,6 +787,9 @@ pub struct Retina {
     entity_trans: Vec<f32>,
     /// Eye distance per entity at the last relink.
     entity_depth: Vec<f32>,
+    /// 1/shrink² per entity: what `contribution` scales by to give back the
+    /// footprint area a near source lost to shrinking.
+    entity_gain: Vec<f32>,
     /// Projected center (u, v) per entity at the last relink, NaN for the
     /// entities that had no footprint. The baseline `needs_relink` compares
     /// against to catch a source that moves under a motionless camera.
@@ -794,6 +852,7 @@ impl Retina {
             pipe_last: Vec::new(),
             entity_trans: Vec::new(),
             entity_depth: Vec::new(),
+            entity_gain: Vec::new(),
             last_centers: Vec::new(),
             last_view_proj: None,
             hash: SpatialHash::default(),
@@ -938,6 +997,7 @@ impl Retina {
             .collect();
         for (&i, f) in ents.iter().zip(&fps) {
             self.entity_depth[i as usize] = f.as_ref().map(|f| f.depth).unwrap_or(0.0);
+            self.entity_gain[i as usize] = f.as_ref().map(|f| 1.0 / (f.shrink * f.shrink)).unwrap_or(1.0);
             self.last_centers[i as usize] = f.as_ref().map(|f| (f.u, f.v)).unwrap_or((f32::NAN, f32::NAN));
         }
         let t_fps = t0.elapsed().as_secs_f32() * 1000.0;
@@ -1156,6 +1216,7 @@ impl Retina {
         self.layout.extend((0..n as u32).filter(|&i| !sources[i as usize].is_static));
         self.linked_static = sources.iter().map(|s| s.is_static).collect();
         self.entity_depth = vec![0.0; n];
+        self.entity_gain = vec![1.0; n];
         self.last_centers = vec![(f32::NAN, f32::NAN); n];
         for v in [&mut self.pipe_start, &mut self.pipe_count] { v.clear(); v.resize(n, 0); }
         self.pipe_rect.clear();
@@ -1371,8 +1432,8 @@ impl Retina {
         // reaches receptors already past HIDDEN_AT isos, where more density
         // changes neither a weight nor anyone's hiddenness — which is also why
         // the bands need not know each other's verdicts mid-sweep.
-        let (entity_depth, entity_trans, linked_static, pipe_weight, dirty) =
-            (&self.entity_depth, &self.entity_trans, &self.linked_static, &self.pipe_weight, &self.dirty_mask);
+        let (entity_depth, entity_trans, entity_gain, linked_static, pipe_weight, dirty) =
+            (&self.entity_depth, &self.entity_trans, &self.entity_gain, &self.linked_static, &self.pipe_weight, &self.dirty_mask);
         let (order, band_start, band_off, pipe_start) = (&order, &self.band_start, &self.band_off, &self.pipe_start);
         let mut dealt = dealt;
         let verdicts: Vec<Vec<(bool, bool)>> = dealt.par_iter_mut().enumerate().map(|(b, sharp)| {
@@ -1395,7 +1456,7 @@ impl Retina {
                     let (k0, k1) = run_of(behind);
                     behind += 1;
                     // What `contribution` will offer: the density j delivers.
-                    let delivered = sources[j].density * entity_trans[j];
+                    let delivered = sources[j].density * entity_trans[j] * entity_gain[j];
                     let is_static = linked_static[j];
                     for k in k0..k1 {
                         let rc = pipe_receptor[k] as usize;
@@ -1449,10 +1510,13 @@ impl Retina {
     fn contribution(&self, i: usize, s: &Source) -> PipeState {
         if !s.drawable { return PipeState::default(); }
         let snap = |x: f32| (x * Q_ONE).round() / Q_ONE;
-        let d = s.density * self.entity_trans[i];
+        // τ, and the area a shrunk footprint gave up (`entity_gain`). Every
+        // channel carries it, so the ratios the renderer reads are untouched.
+        let t = self.entity_trans[i] * self.entity_gain[i];
+        let d = s.density * t;
         PipeState {
             density: snap(d),
-            color: [snap(s.color[0] * self.entity_trans[i]), snap(s.color[1] * self.entity_trans[i]), snap(s.color[2] * self.entity_trans[i])],
+            color: [snap(s.color[0] * t), snap(s.color[1] * t), snap(s.color[2] * t)],
             normal: Vec3::new(snap(s.normal.x * d), snap(s.normal.y * d), snap(s.normal.z * d)),
             depth: (self.entity_depth[i] * d * Q_DEPTH_ONE).round() / Q_DEPTH_ONE,
             // Density-weighted, exactly like `depth`: the receptor sums it and
@@ -1647,6 +1711,7 @@ mod tests {
             is_static: false,
             skin: false,
             sharp_power: SHARP_POWER_MAX,
+            shrink_min: 1.0,
         }
     }
 
@@ -2538,6 +2603,121 @@ mod tests {
         sources[0].drawable = false; // culled between relinks (e.g. trie depth)
         r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
         assert_receptors_match(&r, &sources);
+    }
+
+    #[test]
+    fn shrink_min_follows_the_lattice_and_spares_shapes() {
+        assert!((shrink_min_for(1.0, 0.8) - 0.48).abs() < 1e-6, "the rock");
+        assert!((shrink_min_for(1.0, 1.5) - 0.9).abs() < 1e-6, "the floor");
+        assert!((shrink_min_for(1.0, 1.0) - 0.6).abs() < 1e-6, "the dino shell");
+        assert_eq!(shrink_min_for(6.0, 0.5), 1.0, "a metaball is a shape, not a lattice member");
+        assert_eq!(shrink_min_for(1.0, 0.0), 1.0, "no neighbour to fill in");
+        assert_eq!(shrink_min_for(1.0, 5.0), 1.0, "never grows");
+    }
+
+    /// Near the eye a lattice member's footprint shrinks toward SHRINK_SIGMA,
+    /// no further than its `shrink_min`, and what it delivers grows by the
+    /// area it lost. Far away nothing changes.
+    #[test]
+    fn near_lattice_sources_shrink_their_footprint_and_scale_up() {
+        let (w, h) = (63u32, 35u32);
+        let vp = test_view_proj(w, h);
+        // Unshrunk σ of a unit kernel at depth d is ~ (w/2)/d receptors: 31/d.
+        let mut near = src(Vec3::new(0.0, 0.0, -2.5), Vec3::ONE, 0.0); // σ ≈ 12
+        near.shrink_min = 0.5;
+        near.density = 1.0;
+        let mut far = src(Vec3::new(0.0, 0.0, -20.0), Vec3::ONE, 0.0); // σ ≈ 1.5
+        far.shrink_min = 0.5;
+        far.density = 1.0;
+        let mut rigid = src(Vec3::new(0.0, 0.0, -2.5), Vec3::ONE, 0.0);
+        rigid.shrink_min = 1.0;
+        rigid.density = 1.0;
+
+        let fp = |s: &Source| footprint(&vp, w, h, s).expect("in view");
+        let (fn_, ff, fr) = (fp(&near), fp(&far), fp(&rigid));
+        assert_eq!(ff.shrink, 1.0, "far source shrank");
+        assert_eq!(fr.shrink, 1.0, "a shape shrank");
+        assert!((fn_.shrink - 0.5).abs() < 1e-6, "near source should sit on its shrink_min: {}", fn_.shrink);
+        // Its footprint is the rigid one's at half the σ.
+        assert!((fn_.a / fr.a - 4.0).abs() < 0.2, "a ratio {}", fn_.a / fr.a);
+
+        // In a retina: the shrunk source has far fewer pipes, ~1/4, and
+        // delivers 4× per pipe, so the total it delivers is about the same.
+        for (s, want_gain) in [(rigid, 1.0f32), (near, 4.0)] {
+            let sources = vec![s];
+            let (lo, hi) = box_of(&sources);
+            let mut r = Retina::new(w, h);
+            r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+            let gain = r.entity_gain[0];
+            assert!((gain - want_gain).abs() < 1e-3, "gain {}", gain);
+            let c = r.contribution(0, &sources[0]);
+            assert!((c.density - want_gain).abs() < 1e-3);
+            let total: f32 = r.pipes_of(0).map(|(_, wt)| wt * c.density).sum();
+            let n = r.pipes_of(0).count();
+            if want_gain > 1.0 {
+                assert!(n > 20 && n < 400, "shrunk source has {} pipes", n);
+                assert!((total - RIGID_TOTAL.with(|t| t.get())).abs() < 0.15 * total, "delivered {} vs {}", total, RIGID_TOTAL.with(|t| t.get()));
+            } else {
+                assert!(n > 500, "rigid source has only {} pipes", n);
+                RIGID_TOTAL.with(|t| t.set(total));
+            }
+        }
+    }
+    thread_local! { static RIGID_TOTAL: std::cell::Cell<f32> = std::cell::Cell::new(0.0); }
+
+    /// A near lattice keeps its interior density when its members shrink: the
+    /// receptors under the middle of a plane of unit kernels 0.8 apart read
+    /// about the same with shrinking as without, from a quarter of the pipes.
+    #[test]
+    fn a_shrunk_lattice_sums_to_the_same_surface_from_fewer_pipes() {
+        let (w, h) = (63u32, 35u32);
+        let vp = test_view_proj(w, h);
+        let mut lattice = Vec::new();
+        for ix in -8..=8 { for iy in -8..=8 {
+            // Depth 4: a unit kernel projects to σ ≈ 4.4 receptors here, so
+            // it shrinks to ~0.68. (Nearer, the *unshrunk* footprint is the
+            // one that is off: a kernel spanning a third of its own depth is
+            // inflated by the perspective divide, and 1/shrink² — exact for
+            // the linearised footprint — no longer matches it.)
+            let mut s = src(Vec3::new(ix as f32 * 0.8, iy as f32 * 0.8, -4.0), Vec3::ONE, 0.0);
+            s.density = 1.0;
+            lattice.push(s);
+        }}
+        let run = |shrink_min: f32| {
+            let sources: Vec<Source> = lattice.iter().map(|s| Source { shrink_min, ..*s }).collect();
+            let (lo, hi) = box_of(&sources);
+            let mut r = Retina::new(w, h);
+            r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+            let centre = |du: i32, dv: i32| r.receptors[((17 + dv) * w as i32 + 31 + du) as usize].density_f();
+            let mid: Vec<f32> = (-3..=3).flat_map(|du| (-3..=3).map(move |dv| (du, dv))).map(|(du, dv)| centre(du, dv)).collect();
+            (r.stats.pipes_total, mid)
+        };
+        let (pipes_full, mid_full) = run(1.0);
+        let (pipes_shrunk, mid_shrunk) = run(0.48);
+        assert!(pipes_shrunk * 2 < pipes_full, "pipes {} vs {}", pipes_shrunk, pipes_full);
+        // The analytic interior density: one unshrunk kernel's mass over the
+        // image area of one lattice cell. Both lattices sit *above* it — an
+        // off-axis kernel this close is inflated by the perspective divide
+        // along its depth axis, and the surplus spills inward — the unshrunk
+        // one by ~17 %, the shrunk one, whose kernels are shorter in depth, by
+        // ~5 %. Shrinking loses no density; if anything it is the truer of
+        // the two.
+        let alone = vec![Source { shrink_min: 1.0, ..lattice[lattice.len() / 2] }];
+        let (lo, hi) = box_of(&alone);
+        let mut r1 = Retina::new(w, h);
+        r1.tick(&alone, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        let mass: f32 = r1.pipes_of(0).map(|(_, wt)| wt).sum();
+        let (u0, v0, _) = project(&vp, w, h, Vec3::new(0.0, 0.0, -4.0)).unwrap();
+        let (u1, v1, _) = project(&vp, w, h, Vec3::new(0.8, 0.8, -4.0)).unwrap();
+        let ideal = mass / ((u1 - u0) * (v0 - v1)).abs();
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        let (mf, ms) = (mean(&mid_full), mean(&mid_shrunk));
+        assert!(mf > ideal && mf < 1.25 * ideal, "unshrunk interior {} vs ideal {}", mf, ideal);
+        assert!((ms - ideal).abs() < 0.1 * ideal, "shrunk interior {} vs ideal {}", ms, ideal);
+        // ...and the shrunk surface is still smooth: the ripple across the
+        // interior stays within a few percent.
+        let ripple = mid_shrunk.iter().fold(0.0f32, |m, &x| m.max((x - ms).abs())) / ms;
+        assert!(ripple < 0.08, "ripple {:.3}", ripple);
     }
 
     /// Alone in its receptors a source is dimmed by nothing, and its sharp
