@@ -27,20 +27,6 @@ pub const ATTEN_K_DEFAULT: f32 = 0.5;
 pub const ATTEN_TAU_CUTOFF: f32 = 20.0;
 pub const MIN_RETINA_DIM: u32 = 20;
 pub const MAX_RETINA_DIM: u32 = 1280;
-/// Ceiling on the transient scratch images `arrive` may hold at once. Each
-/// worker chunk owns a full `n_rec × size_of::<Receptor>()` image, so without
-/// a bound the peak grows with the core count *and* the resolution.
-pub const ARRIVE_SCRATCH_BUDGET_BYTES: usize = 160 << 20;
-
-/// How many entity chunks `arrive` splits into: one per worker thread, minus
-/// however many the scratch budget cannot pay for, and never more than there
-/// are entities. Pure so the bound is testable without a retina.
-pub fn arrive_chunks(n_entities: usize, n_rec: usize, threads: usize) -> usize {
-    let per_scratch = n_rec * std::mem::size_of::<Receptor>();
-    let affordable = if per_scratch == 0 { threads } else { ARRIVE_SCRATCH_BUDGET_BYTES / per_scratch };
-    threads.max(1).min(affordable.max(1)).min(n_entities.max(1))
-}
-
 /// One entity's contribution as the retina sees it. Index-aligned with
 /// `DiffField::entities` so pipes and edges can name entities by index.
 #[derive(Clone, Copy, Debug)]
@@ -696,6 +682,37 @@ pub fn eye_from_view_proj(view_proj: Mat4) -> Vec3 {
     h.truncate() / h.w
 }
 
+/// Hand every band its own stretches of one per-pipe array, for the entities
+/// in `chosen` (in that order): `out[b][o]` is entity `chosen[o]`'s pipes in
+/// band `b`. The stretches interleave in memory (entity-major, band-minor), so
+/// walk the array once in layout order and deal the pieces out with
+/// `split_at_mut` — every piece is a distinct slice, no unsafe.
+fn deal<'a, T>(arr: &'a mut [T], layout: &[u32], pipe_count: &[u32], band_off: &[u32], bands: usize, chosen: &[u32])
+    -> Vec<Vec<&'a mut [T]>>
+{
+    let mut place = vec![u32::MAX; pipe_count.len()];
+    for (o, &i) in chosen.iter().enumerate() { place[i as usize] = o as u32; }
+    let mut out: Vec<Vec<&mut [T]>> = (0..bands)
+        .map(|_| { let mut v = Vec::with_capacity(chosen.len()); v.resize_with(chosen.len(), Default::default); v })
+        .collect();
+    let mut rest: &mut [T] = arr;
+    for &i in layout {
+        let i = i as usize;
+        let (mut run, tail) = std::mem::take(&mut rest).split_at_mut(pipe_count[i] as usize);
+        rest = tail;
+        let o = place[i];
+        if o == u32::MAX { continue; }
+        let c = &band_off[i * (bands + 1)..(i + 1) * (bands + 1)];
+        for b in 0..bands {
+            let (piece, more) = run.split_at_mut((c[b + 1] - c[b]) as usize);
+            run = more;
+            out[b][o as usize] = piece;
+        }
+    }
+    debug_assert!(rest.is_empty(), "pipe runs do not tile the array");
+    out
+}
+
 pub struct Retina {
     pub width: u32,
     pub height: u32,
@@ -745,6 +762,19 @@ pub struct Retina {
     last_contrib: Vec<PipeState>,
     /// Partial relink scratch: the receptors the movers left or entered.
     dirty_mask: Vec<bool>,
+    /// Receptor bands — whole rows, balanced by pipe count at the last full
+    /// relink — that `link_front` and `arrive` parallelise over: receptors do
+    /// not talk to each other, so each band is one thread's own. `band_start`
+    /// is the first receptor of each band plus the end; `band_off` is, per
+    /// entity, where each band's stretch of its (row-major, hence
+    /// band-contiguous) run begins, relative to the run: `bands + 1` offsets
+    /// an entity, valid across `compact_hidden`.
+    band_start: Vec<u32>,
+    band_off: Vec<u32>,
+    /// Set by a full relink, cleared by `arrive`: every receptor is zero and
+    /// `pipe_last` is stale, to be treated as zero rather than zero-filled —
+    /// 54 MB of memset at 1.5 M pipes, overwritten the same tick.
+    fresh: bool,
     pub stats: RetinaStats,
     /// Set when any delta arrived since the renderer last uploaded.
     pub dirty: bool,
@@ -777,6 +807,9 @@ impl Retina {
             weights_dirty: Vec::new(),
             last_contrib: Vec::new(),
             dirty_mask: Vec::new(),
+            band_start: Vec::new(),
+            band_off: Vec::new(),
+            fresh: false,
             stats: RetinaStats::default(),
             dirty: true,
         }
@@ -977,6 +1010,67 @@ impl Retina {
         }).collect();
     }
 
+    /// Cut the image into bands of whole rows, as many as twice the worker
+    /// threads, balanced by pipe count: a near rock fills the lower rows, and
+    /// equal row counts left a few bands with most of the work.
+    fn cut_bands(&mut self) {
+        let (w, h) = (self.width as usize, self.height as usize);
+        // Row histogram, a chunk per thread and summed: one serial pass over
+        // 1.5 M pipes was 4.5 ms.
+        let chunk = self.pipe_receptor.len().div_ceil(rayon::current_num_threads().max(1)).max(1);
+        let per_row: Vec<usize> = self.pipe_receptor.par_chunks(chunk)
+            .map(|c| { let mut rows = vec![0usize; h]; for &rc in c { rows[rc as usize / w] += 1; } rows })
+            .reduce(|| vec![0usize; h], |mut a, b| { for (x, y) in a.iter_mut().zip(&b) { *x += y; } a });
+        let total = self.pipe_receptor.len();
+        let want = (rayon::current_num_threads() * 2).clamp(1, h);
+        self.band_start.clear();
+        self.band_start.push(0);
+        let mut acc = 0usize;
+        for (row, &n) in per_row.iter().enumerate() {
+            acc += n;
+            let bands_so_far = self.band_start.len(); // boundaries placed, including 0
+            if bands_so_far < want && acc * want >= total * bands_so_far && row + 1 < h {
+                self.band_start.push(((row + 1) * w) as u32);
+            }
+        }
+        self.band_start.push((h * w) as u32);
+    }
+
+    fn bands(&self) -> usize { self.band_start.len() - 1 }
+
+    /// `band_off` for `ents`: one `partition_point` per entity and band.
+    fn cut_offsets(&mut self, ents: &[u32]) {
+        let nb = self.bands();
+        let stride = nb + 1;
+        if self.band_off.len() != self.pipe_count.len() * stride {
+            self.band_off.clear();
+            self.band_off.resize(self.pipe_count.len() * stride, 0);
+        }
+        let (pipe_start, pipe_count, pipe_receptor, band_start) =
+            (&self.pipe_start, &self.pipe_count, &self.pipe_receptor, &self.band_start);
+        // Sized up front: collecting an unsized parallel iterator goes
+        // through a list of vectors and a concatenation, and cost as much as
+        // the searches themselves.
+        let mut offs = vec![0u32; ents.len() * stride];
+        offs.par_chunks_mut(stride).zip(ents.par_iter()).for_each(|(out, &i)| {
+            let start = pipe_start[i as usize] as usize;
+            let run = &pipe_receptor[start..start + pipe_count[i as usize] as usize];
+            for b in 0..=nb { out[b] = run.partition_point(|&rc| rc < band_start[b]) as u32; }
+        });
+        for (e, &i) in ents.iter().enumerate() {
+            let i = i as usize;
+            self.band_off[i * stride..(i + 1) * stride].copy_from_slice(&offs[e * stride..(e + 1) * stride]);
+        }
+    }
+
+    /// Entity `i`'s stretch of band `b`, as absolute pipe indices.
+    #[inline]
+    fn band_run(&self, i: usize, b: usize) -> (usize, usize) {
+        let stride = self.bands() + 1;
+        let start = self.pipe_start[i] as usize;
+        (start + self.band_off[i * stride + b] as usize, start + self.band_off[i * stride + b + 1] as usize)
+    }
+
     /// Close the gaps hidden sources leave in the pipe arrays, from layout
     /// position `from` on (everything before it is already tight). Order is
     /// preserved; a hidden source ends up with no pipes.
@@ -1042,7 +1136,7 @@ impl Retina {
         //    below writes regardless. So only debug builds pay for the scatter;
         //    they pay it to check that invariant, which is the whole point.
         #[cfg(debug_assertions)]
-        {
+        if !self.fresh {
             for (k, &rc) in self.pipe_receptor.iter().enumerate() {
                 self.receptors[rc as usize].sub(&self.pipe_last[k]);
             }
@@ -1071,9 +1165,11 @@ impl Retina {
         self.pipe_receptor.clear();
         self.pipe_weight.clear();
 
-        // 3–4. Footprints and pipes.
+        // 3–4. Footprints and pipes, then the bands they are dealt into.
         let layout = std::mem::take(&mut self.layout);
         let (t_fps, t_pipes) = self.append_pipes(sources, &layout, &view_proj);
+        self.cut_bands();
+        self.cut_offsets(&layout);
         self.layout = layout;
 
         // 5. τ toward the eye. Measured at ~8.5 ms of a ~36 ms relink on the
@@ -1091,10 +1187,12 @@ impl Retina {
         self.static_pipes = self.layout.get(self.static_entities)
             .map(|&i| self.pipe_start[i as usize] as usize)
             .unwrap_or(self.pipe_receptor.len());
-        // Reuse the allocation: at ~577k pipes this buffer is ~23 MB, and
-        // handing it back to the allocator every relink is not free.
-        self.pipe_last.clear();
+        // Every pipe is new and every receptor zero: `arrive` will read
+        // `pipe_last` as zero, so only its length matters. Reuse the
+        // allocation — at 1.5 M pipes this is 54 MB, and both a fresh
+        // allocation and a zero-fill cost real milliseconds.
         self.pipe_last.resize(self.pipe_receptor.len(), PipeQ::default());
+        self.fresh = true;
         let t_front = ms(t.elapsed());
 
         // 7. Bookkeeping. Every pipe is new: nothing may be skipped.
@@ -1119,6 +1217,7 @@ impl Retina {
         let t0 = std::time::Instant::now();
         let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
         let view_proj = self.last_view_proj.expect("partial relink before any full one");
+        debug_assert!(!self.fresh, "partial relink before the full one's pipes arrived");
         let w = self.width;
 
         // 1. Withdraw the movers, exactly, and cut the arrays at the seam.
@@ -1148,6 +1247,7 @@ impl Retina {
 
         // 2. Link them where they are now.
         let (t_fps, t_pipes) = self.append_pipes(sources, &movers, &view_proj);
+        self.cut_offsets(&movers);
         self.pipe_sharp.resize(self.pipe_receptor.len(), 0.0);
         for &i in &movers {
             if self.pipe_count[i as usize] > 0 { grow(&mut bbox, self.pipe_rect[i as usize]); }
@@ -1251,43 +1351,13 @@ impl Retina {
         if order.is_empty() { return; }
 
         // The sweep is per receptor, and receptors do not talk to each other:
-        // cut the image into horizontal bands and sweep them in parallel. A
-        // footprint's pipes are row-major, so the part of a source's run that
-        // falls in one band is contiguous — `cuts` holds, per swept source,
-        // where each band's stretch of its run begins.
-        let (w, h) = (self.width as usize, self.height as usize);
-        let bands = rayon::current_num_threads().clamp(1, h);
-        let band_rows = h.div_ceil(bands);
-        let bands = h.div_ceil(band_rows);
-        let (pipe_start, pipe_count, pipe_receptor) = (&self.pipe_start, &self.pipe_count, &self.pipe_receptor);
-        let cuts: Vec<u32> = order.par_iter().flat_map_iter(|&i| {
-            let start = pipe_start[i as usize] as usize;
-            let run = &pipe_receptor[start..start + pipe_count[i as usize] as usize];
-            (0..=bands).map(move |b| (start + run.partition_point(|&rc| (rc as usize) < b * band_rows * w)) as u32)
-        }).collect();
-
-        // Hand every band its own stretches of `pipe_sharp`. They interleave
-        // in memory (source-major, band-minor), so walk the array once in
-        // layout order and deal the pieces out — plain `split_at_mut`.
-        let mut place = vec![u32::MAX; self.pipe_count.len()];
-        for (o, &i) in order.iter().enumerate() { place[i as usize] = o as u32; }
-        let mut dealt: Vec<Vec<&mut [f32]>> = (0..bands)
-            .map(|_| { let mut v = Vec::with_capacity(order.len()); v.resize_with(order.len(), Default::default); v })
-            .collect();
-        let mut rest: &mut [f32] = &mut self.pipe_sharp;
-        for &i in &self.layout {
-            let i = i as usize;
-            let (mut run, tail) = std::mem::take(&mut rest).split_at_mut(pipe_count[i] as usize);
-            rest = tail;
-            let o = place[i];
-            if o == u32::MAX { continue; }
-            let c = &cuts[o as usize * (bands + 1)..(o as usize + 1) * (bands + 1)];
-            for b in 0..bands {
-                let (piece, more) = run.split_at_mut((c[b + 1] - c[b]) as usize);
-                run = more;
-                dealt[b][o as usize] = piece;
-            }
-        }
+        // one sweep per band (`cut_bands`), in parallel. Hand every band its
+        // own stretches of `pipe_sharp`: they interleave in memory
+        // (source-major, band-minor), so walk the array once in layout order
+        // and deal the pieces out — plain `split_at_mut`.
+        let bands = self.bands();
+        let dealt = deal(&mut self.pipe_sharp, &self.layout, &self.pipe_count, &self.band_off, bands, &order);
+        let pipe_receptor = &self.pipe_receptor;
 
         // One sweep per band, front to back, over *sources* — no per-receptor
         // table. `in_front[rc]` holds the density delivered to receptor `rc` by
@@ -1303,15 +1373,20 @@ impl Retina {
         // the bands need not know each other's verdicts mid-sweep.
         let (entity_depth, entity_trans, linked_static, pipe_weight, dirty) =
             (&self.entity_depth, &self.entity_trans, &self.linked_static, &self.pipe_weight, &self.dirty_mask);
-        let (order, cuts) = (&order, &cuts);
+        let (order, band_start, band_off, pipe_start) = (&order, &self.band_start, &self.band_off, &self.pipe_start);
+        let mut dealt = dealt;
         let verdicts: Vec<Vec<(bool, bool)>> = dealt.par_iter_mut().enumerate().map(|(b, sharp)| {
-            let base = b * band_rows * w;
-            let len = (band_rows * w).min(w * h - base);
+            let base = band_start[b] as usize;
+            let len = band_start[b + 1] as usize - base;
             let mut in_front = vec![0.0f32; len];
             let mut in_front_static = vec![0.0f32; if partial { 0 } else { len }];
             // (exposed, changed) per swept source, as far as this band sees.
             let mut verdict = vec![(false, false); order.len()];
-            let run_of = |o: usize| (cuts[o * (bands + 1) + b] as usize, cuts[o * (bands + 1) + b + 1] as usize);
+            let run_of = |o: usize| {
+                let (i, st) = (order[o] as usize, bands + 1);
+                let start = pipe_start[i] as usize;
+                (start + band_off[i * st + b] as usize, start + band_off[i * st + b + 1] as usize)
+            };
             let mut behind = 0usize;
             for (o, &i) in order.iter().enumerate() {
                 let i = i as usize;
@@ -1392,86 +1467,75 @@ impl Retina {
     /// what they were, has nothing to send and is skipped whole — so a settled
     /// scene costs its entity count, not its pipe count.
     ///
-    /// Parallel over entities; receptors are shared by many entities, so a
-    /// chunk of entities accumulates into a scratch image of its own. The
-    /// chunking is by worker thread, not by rayon's adaptive splitting: a
-    /// scratch image is the size of the retina, so the number of them (and of
-    /// full-image adds at the end) must not grow with the entity count — and
-    /// `arrive_chunks` caps it again so the peak does not grow with the
-    /// resolution × core count product either.
+    /// Parallel over receptor bands, each thread writing straight into its own
+    /// band of receptors — the deltas of a receptor are then applied in one
+    /// place, in layout order, with no scratch image and no merge. (The
+    /// previous design gave each thread a full-image scratch and merged them:
+    /// nothing to allocate when a chunk had no deltas, but after a full relink
+    /// *every* pipe sends, and 22 threads allocating, zeroing and merging
+    /// 4.6 MB each was two thirds of the phase.)
     pub fn arrive(&mut self, sources: &[Source]) -> usize {
-        let n_rec = self.receptors.len();
         let n = sources.len().min(self.pipe_count.len());
         debug_assert_eq!(n, self.layout.len());
 
-        // Contributions first (needs &self), then the per-entity mutable views
-        // of pipe_last (contiguous, in layout order) — direct field borrows, no
-        // unsafe. Only sources with something to say get a view.
+        // Contributions first (needs &self); then which sources have
+        // something to say. After a full relink that is all of them, and
+        // `pipe_last` is stale: read it as zero.
+        let fresh = std::mem::take(&mut self.fresh);
         let contribs: Vec<PipeState> = (0..n).map(|i| self.contribution(i, &sources[i])).collect();
-        let mut work: Vec<(usize, &mut [PipeQ])> = Vec::new();
-        let mut rest: &mut [PipeQ] = &mut self.pipe_last;
-        for &i in &self.layout {
-            let i = i as usize;
-            let (head, tail) = rest.split_at_mut(self.pipe_count[i] as usize);
-            rest = tail;
-            if !head.is_empty() && (self.weights_dirty[i] || contribs[i] != self.last_contrib[i]) {
-                work.push((i, head));
-            }
-        }
-        debug_assert!(rest.is_empty(), "pipe runs do not tile pipe_last");
-        self.stats.sources_arrived = work.len();
-
-        let pipe_start = &self.pipe_start;
-        let pipe_receptor = &self.pipe_receptor;
-        let pipe_weight = &self.pipe_weight;
-        let pipe_sharp = &self.pipe_sharp;
-
-        // One contiguous run of the work list per chunk — one chunk per worker
-        // thread, fewer when a full scratch image each would blow
-        // ARRIVE_SCRATCH_BUDGET_BYTES. The scratch image is allocated on the
-        // chunk's first delta, so a settled scene allocates nothing and adds
-        // nothing.
-        let m = work.len();
-        let chunk_len = m.div_ceil(arrive_chunks(m, n_rec, rayon::current_num_threads())).max(1);
-        let parts: Vec<(Option<Vec<Receptor>>, usize)> = work.par_chunks_mut(chunk_len)
-            .map(|chunk| {
-                let mut scratch: Option<Vec<Receptor>> = None;
-                let mut sent = 0usize;
-                for (i, last) in chunk.iter_mut() {
-                    let i = *i;
-                    let start = pipe_start[i] as usize;
-                    for (off, l) in last.iter_mut().enumerate() {
-                        let k = start + off;
-                        let new = contribs[i].scaled(pipe_weight[k], pipe_sharp[k]).quantized();
-                        if new != *l {
-                            let acc = scratch.get_or_insert_with(|| vec![Receptor::default(); n_rec]);
-                            let rec = &mut acc[pipe_receptor[k] as usize];
-                            rec.sub(l);
-                            rec.add(&new);
-                            *l = new;
-                            sent += 1;
-                        }
-                    }
-                }
-                (scratch, sent)
+        let work: Vec<u32> = self.layout.iter().copied()
+            .filter(|&i| {
+                let i = i as usize;
+                self.pipe_count[i] > 0 && (self.weights_dirty[i] || contribs[i] != self.last_contrib[i])
             })
             .collect();
-
-        // Merge the ≤k scratches into the image, split by receptor range so
-        // every thread owns disjoint receptors — the adds are the same, and in
-        // the same order per receptor, as adding the scratches one by one.
-        let sent: usize = parts.iter().map(|(_, s)| *s).sum();
-        let scratches: Vec<&[Receptor]> = parts.iter().filter_map(|(s, _)| s.as_deref()).collect();
-        if !scratches.is_empty() {
-            let rec_chunk = n_rec.div_ceil(rayon::current_num_threads().max(1)).max(1);
-            self.receptors.par_chunks_mut(rec_chunk).enumerate().for_each(|(c, dst)| {
-                let (base, len) = (c * rec_chunk, dst.len());
-                for s in &scratches {
-                    for (r, x) in dst.iter_mut().zip(&s[base..base + len]) { r.add_receptor(x); }
-                }
-            });
+        self.stats.sources_arrived = work.len();
+        if work.is_empty() {
+            self.last_contrib = contribs;
+            self.stats.pipes_sent = 0;
+            return 0;
         }
-        self.last_contrib = contribs;
+
+        // Deal every band its stretches of `pipe_last` and its receptors.
+        let bands = self.bands();
+        let dealt = deal(&mut self.pipe_last, &self.layout, &self.pipe_count, &self.band_off, bands, &work);
+        let mut rec_bands: Vec<&mut [Receptor]> = Vec::with_capacity(bands);
+        let mut rest: &mut [Receptor] = &mut self.receptors;
+        for b in 0..bands {
+            let len = (self.band_start[b + 1] - self.band_start[b]) as usize;
+            let (head, tail) = rest.split_at_mut(len);
+            rec_bands.push(head);
+            rest = tail;
+        }
+
+        let (pipe_start, pipe_receptor, pipe_weight, pipe_sharp, band_start, band_off) =
+            (&self.pipe_start, &self.pipe_receptor, &self.pipe_weight, &self.pipe_sharp, &self.band_start, &self.band_off);
+        let (work, contribs) = (&work, &contribs);
+        let mut dealt = dealt;
+        let sent: usize = dealt.par_iter_mut().zip(rec_bands.par_iter_mut()).enumerate().map(|(b, (last, rec))| {
+            let base = band_start[b] as usize;
+            let mut sent = 0usize;
+            for (o, &i) in work.iter().enumerate() {
+                let i = i as usize;
+                let k0 = pipe_start[i] as usize + band_off[i * (bands + 1) + b] as usize;
+                for (k, l) in (k0..).zip(last[o].iter_mut()) {
+                    let new = contribs[i].scaled(pipe_weight[k], pipe_sharp[k]).quantized();
+                    let old = if fresh { PipeQ::default() } else { *l };
+                    if new != old {
+                        let r = &mut rec[pipe_receptor[k] as usize - base];
+                        r.sub(&old);
+                        r.add(&new);
+                        *l = new;
+                        sent += 1;
+                    } else if fresh {
+                        *l = new;
+                    }
+                }
+            }
+            sent
+        }).sum();
+
+        self.last_contrib = contribs.clone();
         for d in &mut self.weights_dirty { *d = false; }
         if sent > 0 { self.dirty = true; }
         self.stats.pipes_sent = sent;
@@ -2837,29 +2901,52 @@ mod tests {
         assert_receptors_match(&r, &sources);
     }
 
+    /// The bands `link_front` and `arrive` parallelise over tile the image in
+    /// whole rows, hold roughly equal pipe counts, and every entity's band
+    /// offsets tile its run — so dealing the per-pipe arrays out by band
+    /// covers every pipe exactly once, and no thread's receptors overlap.
     #[test]
-    fn arrive_scratch_stays_inside_the_memory_budget() {
-        let bytes = std::mem::size_of::<Receptor>();
-        assert_eq!(bytes, 80, "Receptor changed size — the scratch budget math below assumes it");
-        // A 1280×720 retina (the MAX_RETINA_DIM aspect) is 921_600 i64
-        // receptors ≈ 70 MiB of scratch each; 160 MiB buys two.
-        let n_rec = 1280 * 720;
-        let affordable = ARRIVE_SCRATCH_BUDGET_BYTES / (n_rec * bytes);
-        assert_eq!(affordable, 2);
-        for threads in [1, 2, 4, 22, 128] {
-            let c = arrive_chunks(50_000, n_rec, threads);
-            assert!(c <= affordable, "{} chunks at {} threads exceeds {}", c, threads, affordable);
-            assert!(c >= 1);
+    fn bands_tile_the_image_and_every_run() {
+        let (w, h) = (63u32, 35u32);
+        let sources = scene();
+        let (lo, hi) = (Vec3::new(-10.0, -10.0, -25.0), Vec3::new(10.0, 10.0, -5.0));
+        let mut r = Retina::new(w, h);
+        r.tick(&sources, test_view_proj(w, h), lo, hi, false, ATTEN_K_DEFAULT);
+        let nb = r.bands();
+        assert!(nb >= 1 && nb <= 2 * rayon::current_num_threads());
+        assert_eq!(r.band_start[0], 0);
+        assert_eq!(*r.band_start.last().unwrap(), w * h);
+        for b in 0..nb {
+            assert!(r.band_start[b] < r.band_start[b + 1], "empty or reversed band {}", b);
+            assert_eq!(r.band_start[b] % w, 0, "band {} does not start on a row", b);
         }
-        // A retina small enough that every worker can afford a scratch gets
-        // one chunk per thread — the bound must not cost parallelism.
-        assert_eq!(arrive_chunks(50_000, (RETINA_W * RETINA_H) as usize, 22), 22);
-        // Never more chunks than entities, and never zero.
-        assert_eq!(arrive_chunks(3, 64, 22), 3);
-        assert_eq!(arrive_chunks(0, 64, 22), 1);
-        // Even a retina too big for a single scratch still gets one chunk.
-        assert_eq!(arrive_chunks(50_000, ARRIVE_SCRATCH_BUDGET_BYTES, 22), 1);
-        // The clamp that keeps it reachable at all.
+        let mut counted = 0usize;
+        for i in 0..sources.len() {
+            let (start, count) = (r.pipe_start[i] as usize, r.pipe_count[i] as usize);
+            assert_eq!(r.band_run(i, 0).0, start);
+            assert_eq!(r.band_run(i, nb - 1).1, start + count);
+            for b in 0..nb {
+                let (k0, k1) = r.band_run(i, b);
+                assert!(k0 <= k1);
+                if b > 0 { assert_eq!(k0, r.band_run(i, b - 1).1, "entity {} band {} does not abut", i, b); }
+                for k in k0..k1 {
+                    let rc = r.pipe_receptor[k];
+                    assert!(rc >= r.band_start[b] && rc < r.band_start[b + 1], "entity {} pipe {} is not in band {}", i, k, b);
+                }
+                counted += k1 - k0;
+            }
+        }
+        assert_eq!(counted, r.pipe_receptor.len());
+        // Balanced: with pipes spread over many rows, no band holds more than
+        // twice its share plus one row's worth.
+        let per_band: Vec<usize> = (0..nb).map(|b| r.pipe_receptor.iter()
+            .filter(|&&rc| rc >= r.band_start[b] && rc < r.band_start[b + 1]).count()).collect();
+        let share = r.pipe_receptor.len() / nb;
+        let row_max = (0..h).map(|row| r.pipe_receptor.iter().filter(|&&rc| rc / w == row).count()).max().unwrap();
+        for (b, &n) in per_band.iter().enumerate() {
+            assert!(n <= 2 * share + row_max, "band {} holds {} of {} pipes ({} bands)", b, n, r.pipe_receptor.len(), nb);
+        }
+        // The retina's ceiling still holds.
         assert_eq!(MAX_RETINA_DIM, 1280);
     }
 
