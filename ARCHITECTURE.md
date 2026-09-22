@@ -41,7 +41,13 @@ Every pipe has **two weights**. `density` travels through the broad footprint
 weight `w` and draws the silhouette. Everything else — and `sharp`, the density
 again, which normalizes it — travels through the *sharp* weight
 `(wᵖ + SHARP_FLOOR·w) · max(0, 1 − D/RETINA_ISO)`:
-- `wᵖ` (`SHARP_POWER`) is the same gaussian at a fraction of the σ. A source a
+- `wᵖ` is the same gaussian at `1/√p` of the σ, and `p` is **per source**
+  (`Source::sharp_power`, from `sharp_power_for`): as sharp as the source's
+  lattice can carry. Halfway to its nearest neighbour (`Entity::neighbor_spacing`,
+  found once at build) the sharp kernel must still weigh `exp(−SHARP_GAP)`, so
+  `p = SHARP_GAP·(2r/spacing)²`, rounded, in `1..=SHARP_POWER_MAX`. The rock
+  (0.8-cell lattice) gets 8, the floor (1.5) gets 2 — one global power either
+  blurred the rock or broke the floor into dots. A source a
   few cells from the eye projects ~10 receptors wide; averaging colour and
   normal over all of that is what blurred near geometry. `SHARP_FLOOR` (1%)
   keeps the broad average as the fallback where only tails reach, so a
@@ -138,7 +144,7 @@ the "causal cone": chains that don't feed a visible pixel are skipped.
 | **Consumption** | Each body entity's incoming is tokenized and run through `cascade_process` (consume / reject / seed / promote). |
 | **Phase 2 — push** | Each active, non-debounced entity rewrites its outgoing edge deposits = own emission + pass-through of incoming, weighted by `edge_gamma × distance_factor × edge_atten`, with optional directional bias for vacuum relays. Weights are then **renormalized** to sum to 1 — see the shadow note below. Parallelized with `rayon` (each entity owns a disjoint edge range). |
 | **Advance entities** | The walker group (dino) translates rigidly by `speed × time_lapse` and paces ±6 cells along Z; other entities move by velocity (and bounce off `FIELD_SIZE`). Each solid becomes a `Source` with its animated position, boosted density/color, and `drawable` flag, and the geometry AABB is recomputed. |
-| **Relink** (conditional) | If the cross-links refreshed, a tuning key fired, the AABB's projected corners moved ≥ `RELINK_SHIFT` (0.1 receptor), or **any linked source's projected center** moved that far from where it sat when it was linked, the retina drops every pipe (subtracting what it last sent, landing on exactly zero), re-projects every drawable source's gaussian footprint into image space, recomputes `τ` toward the eye, and regroups the pipes by receptor front to back to set their sharp weights (`link_front`). The second trigger is what animates the picture: pipes are fixed between relinks, so a source that moves under a motionless camera is a still image until the next one — the walking dino shifts ~0.17 receptors per tick, so it relinks every tick. Note that a relink **resends every pipe**; deltas-only is what holds *between* relinks, not across one. |
+| **Relink** (conditional) | If the cross-links refreshed, a tuning key fired, the AABB's projected corners moved ≥ `RELINK_SHIFT` (0.1 receptor), or **any linked source's projected center** moved that far from where it sat when it was linked, the retina drops every pipe (subtracting what it last sent, landing on exactly zero), re-projects every drawable source's gaussian footprint into image space, recomputes `τ` toward the eye, and sweeps the sources front to back, keeping a running per-receptor density, to set the pipes' sharp weights (`link_front`). The second trigger is what animates the picture: pipes are fixed between relinks, so a source that moves under a motionless camera is a still image until the next one — the walking dino shifts ~0.17 receptors per tick, so it relinks every tick. Note that a relink **resends every pipe**; deltas-only is what holds *between* relinks, not across one. |
 | **Phase 3′ — arrive** | Every pipe quantises its contribution to fixed point and sends `new − last` only if the integers differ — no epsilon. A settled scene sends nothing. Parallel over entities in contiguous chunks — one per worker thread, fewer when a full-image scratch each would exceed `ARRIVE_SCRATCH_BUDGET_BYTES` (160 MiB). Each chunk allocates its scratch lazily, on its first delta, and the scratches are merged into the receptors by disjoint receptor range. |
 
 Two asymmetries in **Advance entities** are deliberate: `oscillation_phase`

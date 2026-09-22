@@ -97,6 +97,10 @@ pub struct Entity {
     pub group: u16,
     /// Outward-pointing surface normal (for skin texture oscillation)
     pub surface_normal: glam::Vec3,
+    /// Distance to the nearest solid of the same lattice (walker or world),
+    /// 0.0 if none is within `SPACING_SEARCH`. Decides how sharp the retina
+    /// may draw this entity: see `retina::sharp_power_for`.
+    pub neighbor_spacing: f32,
     /// Current oscillation phase (radians)
     pub oscillation_phase: f32,
     /// Oscillation frequency (radians per tick)
@@ -140,6 +144,7 @@ impl Entity {
             incoming: EdgeDeposit::default(),
             group: GROUP_NONE,
             surface_normal: glam::Vec3::ZERO,
+            neighbor_spacing: 0.0,
             oscillation_phase: 0.0,
             oscillation_freq: 0.0,
             oscillation_amplitude: 0.0,
@@ -351,6 +356,7 @@ impl DiffField {
 
         let connect_dist = (sp * 5.0).min(3.5);
         let radiation_dist = (sp * 15.0).min(10.0);
+        field.compute_neighbor_spacing();
         field.build_connections(connect_dist);
         // Set before build_radiation_links: compute_edge_atten reads
         // link_connect_dist to tell connection edges from radiation edges.
@@ -462,6 +468,42 @@ impl DiffField {
             map.entry(key).or_default().push(i);
         }
         map
+    }
+
+    /// How far `compute_neighbor_spacing` looks. Past this an entity is on its
+    /// own as far as the retina's sharpening is concerned.
+    const SPACING_SEARCH: f32 = 3.0;
+
+    /// `Entity::neighbor_spacing` for every solid: the distance to the nearest
+    /// other solid, heat included — the interior is part of the lattice the
+    /// surface was cut from. Walker and world are kept apart: the dino walks,
+    /// and a floor tile's sharpness must not depend on where a foot happened
+    /// to stand at build time.
+    ///
+    /// Its own search rather than the connection edges: those stop strictly
+    /// short of `connect_dist`, which is exactly the floor's 1.5-cell pitch,
+    /// so the floor has no connection neighbours at all.
+    fn compute_neighbor_spacing(&mut self) {
+        let cell = Self::SPACING_SEARCH;
+        let positions: Vec<glam::Vec3> = self.entities.iter().map(|e| e.position).collect();
+        let grid = Self::spatial_hash(&positions, cell);
+        let spacing: Vec<f32> = (0..self.entities.len()).into_par_iter().map(|i| {
+            let e = &self.entities[i];
+            if e.is_vacuum { return 0.0; }
+            let pos = positions[i];
+            let (cx, cy, cz) = ((pos.x / cell).floor() as i32, (pos.y / cell).floor() as i32, (pos.z / cell).floor() as i32);
+            let mut nearest = f32::MAX;
+            for dz in -1..=1_i32 { for dy in -1..=1_i32 { for dx in -1..=1_i32 {
+                let Some(bucket) = grid.get(&(cx + dx, cy + dy, cz + dz)) else { continue; };
+                for &j in bucket {
+                    let o = &self.entities[j];
+                    if j == i || o.is_vacuum || o.is_walker != e.is_walker { continue; }
+                    nearest = nearest.min(pos.distance(positions[j]));
+                }
+            }}}
+            if nearest <= cell { nearest } else { 0.0 }
+        }).collect();
+        for (e, sp) in self.entities.iter_mut().zip(spacing) { e.neighbor_spacing = sp; }
     }
 
     /// Build connection edges and detect heat via spatial hash.
@@ -617,6 +659,7 @@ impl DiffField {
             occluder: !e.is_heat && !e.is_vacuum,
             is_static: Self::is_static_entity(e),
             skin: false, // τ only — nothing here is ever drawn
+            sharp_power: crate::retina::SHARP_POWER_MAX,
         }).collect()
     }
 
@@ -1815,7 +1858,7 @@ impl DiffField {
         self.sources.resize(n, Source {
             position: glam::Vec3::ZERO, radii: glam::Vec3::ZERO, normal: glam::Vec3::Y,
             opacity: 0.0, density: 0.0, color: [0.0; 3], drawable: false, occluder: false,
-            is_static: true, skin: false,
+            is_static: true, skin: false, sharp_power: crate::retina::SHARP_POWER_MAX,
         });
 
         let mut aabb_min = glam::Vec3::splat(FIELD_SIZE as f32);
@@ -1918,6 +1961,11 @@ impl DiffField {
                 // Every walker group is dino — body, limbs, eyes, mouth. The
                 // shader reads this back as "give it reptile scales".
                 skin: entity.is_walker,
+                sharp_power: {
+                    let r = entity.deposit_radii;
+                    let radius = if use_gaussian { (r.x + r.y + r.z) / 3.0 } else { 1.0 };
+                    crate::retina::sharp_power_for(radius, entity.neighbor_spacing)
+                },
             };
         }
         self.aabb_min = aabb_min.max(glam::Vec3::ZERO);
@@ -2114,6 +2162,24 @@ mod tests {
         let s = field.retina.stats;
         assert!(s.pipes_sent * 100 < s.pipes_total,
             "frozen scene still sends {} of {} pipes", s.pipes_sent, s.pipes_total);
+    }
+
+    /// The floor is a 1.5-cell lattice and the rock a 0.8-cell one: each gets
+    /// the sharp power its own spacing can carry, not one global number.
+    #[test]
+    #[ignore] // builds the full demo scene (slow) — run: cargo test --release -- --ignored
+    fn sharp_power_follows_each_lattice() {
+        let mut field = DiffField::new();
+        field.tick(test_view_proj());
+        let powers = |group: u16| -> Vec<i32> {
+            field.entities.iter().zip(&field.sources)
+                .filter(|(e, _)| e.group == group && !e.is_heat && !e.is_vacuum)
+                .map(|(_, s)| s.sharp_power).collect()
+        };
+        let (floor, rock) = (powers(GROUP_FLOOR), powers(GROUP_ROCK));
+        assert!(floor.len() > 1000 && rock.len() > 1000);
+        assert!(floor.iter().all(|&p| p == 2), "floor powers {:?}", &floor[..8]);
+        assert!(rock.iter().all(|&p| p == 8), "rock powers {:?}", &rock[..8]);
     }
 
     /// The dino is made of a receptor shell buried in its own skeleton

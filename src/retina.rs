@@ -67,6 +67,9 @@ pub struct Source {
     /// real flag because the colour heuristic it replaced ("green enough")
     /// started matching the lit floor.
     pub skin: bool,
+    /// Power of this source's sharp weight, from how far apart its lattice is
+    /// (`sharp_power_for`).
+    pub sharp_power: i32,
 }
 
 impl Source {
@@ -283,11 +286,36 @@ pub const Q_FRAC: u32 = 16;
 /// Fractional bits of `depth` (Σ depth·density), which runs a few hundred times
 /// larger than density: 2⁻¹⁰ keeps a single pipe inside i32 out to ±2M.
 pub const Q_DEPTH_FRAC: u32 = 10;
-/// The sharp weight is the footprint weight to this power: `wᵖ = exp(−p·e)` is
-/// the same gaussian at `1/√p` of the σ — 8, tuned by eye, is ~0.35σ. A source a few cells from the eye projects
-/// ~10 receptors wide, and averaging colour and normal over that is what
-/// smeared near geometry into fog.
-pub const SHARP_POWER: i32 = 8;
+/// Ceiling of a source's sharp power. The sharp weight is the footprint weight
+/// to a power: `wᵖ = exp(−p·e)` is the same gaussian at `1/√p` of the σ — 8,
+/// tuned by eye on the rock, is ~0.35σ. A source a few cells from the eye
+/// projects ~10 receptors wide, and averaging colour and normal over that is
+/// what smeared near geometry into fog.
+pub const SHARP_POWER_MAX: i32 = 8;
+/// What the sharp kernel must still weigh halfway to the source's nearest
+/// neighbour, as an exponent: `wᵖ ≥ exp(−SHARP_GAP)` there. One global power
+/// cannot serve every lattice — 8 resolves the rock (spacing 0.8) and turns the
+/// floor (spacing 1.5) into dots with the broad average showing between them.
+/// 1.25 is what power 8 gives the rock, so the rock keeps the look it was
+/// tuned to and everything sparser gets as much as its spacing can carry.
+pub const SHARP_GAP: f32 = 1.25;
+
+/// The footprint weight sharpened to power `p`, tail floor included — before
+/// the front-to-back dimming.
+pub fn sharp_base(w: f32, p: i32) -> f32 {
+    w.powi(p) + SHARP_FLOOR * w
+}
+
+/// The sharp power a lattice of kernels of mean radius `radius`, `spacing`
+/// apart, can carry and still read as a continuous surface: halfway between
+/// neighbours `e = (spacing/2r)²`, so `p·e ≤ SHARP_GAP`. A whole number, so
+/// the per-pipe power stays a `powi`. No neighbour (`spacing ≤ 0`) means no
+/// gap to bridge.
+pub fn sharp_power_for(radius: f32, spacing: f32) -> i32 {
+    if spacing <= 0.0 || radius <= 0.0 { return SHARP_POWER_MAX; }
+    let half_gap = spacing / (2.0 * radius);
+    ((SHARP_GAP / (half_gap * half_gap)).round() as i32).clamp(1, SHARP_POWER_MAX)
+}
 /// How much of the broad weight the sharp one keeps. `wᵖ` alone is ≤1e-7 in the
 /// tails, below a fixed-point step — a silhouette receptor fed only by tails
 /// would have density and nothing to colour it with. With the floor it falls
@@ -612,15 +640,6 @@ pub fn eye_from_view_proj(view_proj: Mat4) -> Vec3 {
     h.truncate() / h.w
 }
 
-/// The pipes regrouped by receptor, each receptor's run ordered front to back.
-#[derive(Default)]
-struct FrontScratch {
-    start: Vec<u32>,
-    /// (pipe, source depth, delivered density) — one slot, because the counting
-    /// sort lands each of them at random and one cache miss is cheaper than three.
-    slots: Vec<(u32, f32, f32)>,
-}
-
 pub struct Retina {
     pub width: u32,
     pub height: u32,
@@ -631,7 +650,7 @@ pub struct Retina {
     pipe_receptor: Vec<u32>,
     pipe_weight: Vec<f32>,
     /// What the pipe carries everything but density with: the footprint weight
-    /// sharpened (`SHARP_POWER`, `SHARP_FLOOR`) and dimmed by the density in
+    /// sharpened (`Source::sharp_power`, `SHARP_FLOOR`) and dimmed by the density in
     /// front of the source *in this receptor* (`link_front`). Fixed between
     /// relinks like `pipe_weight`, so arrival stays a plain reversible sum.
     pipe_sharp: Vec<f32>,
@@ -651,8 +670,8 @@ pub struct Retina {
     /// (receptors, weights, per-entity counts). One entry per worker chunk, not
     /// per entity — 17k relink-time allocations is a cost of its own.
     pipe_scratch: Vec<(Vec<u32>, Vec<f32>, Vec<u32>)>,
-    /// `link_front`'s receptor → pipes table, kept for its capacity.
-    front_scratch: FrontScratch,
+    /// `link_front`'s per-receptor running density, kept for its capacity.
+    front_scratch: Vec<f32>,
     pub stats: RetinaStats,
     /// Set when any delta arrived since the renderer last uploaded.
     pub dirty: bool,
@@ -676,7 +695,7 @@ impl Retina {
             last_view_proj: None,
             hash: SpatialHash::default(),
             pipe_scratch: Vec::new(),
-            front_scratch: FrontScratch::default(),
+            front_scratch: Vec::new(),
             stats: RetinaStats::default(),
             dirty: true,
         }
@@ -918,9 +937,10 @@ impl Retina {
 
     /// Fill `pipe_sharp`. Two things happen to the footprint weight `w`:
     ///
-    /// - it is **sharpened** to `wᵖ + SHARP_FLOOR·w`, so a receptor shows the
-    ///   sources whose cores cover it rather than the average of every tail
-    ///   that reaches it;
+    /// - it is **sharpened** to `wᵖ + SHARP_FLOOR·w`, `p` the source's own
+    ///   `sharp_power`, so a receptor shows the sources whose cores cover it
+    ///   rather than the average of every tail that reaches it — as sharp as
+    ///   the source's lattice can carry without showing its gaps;
     /// - it is **dimmed by what stands in front of the source in that
     ///   receptor**: `max(0, 1 − D/RETINA_ISO)`, `D` the density the receptor's
     ///   other pipes deliver from at least `FRONT_MARGIN` nearer the eye. That
@@ -949,67 +969,48 @@ impl Retina {
     ///
     /// Density is untouched, so silhouettes are exactly what they were.
     fn link_front(&mut self, sources: &[Source]) {
-        let n_rec = self.receptors.len();
-        let total = self.pipe_receptor.len();
-        let fs = &mut self.front_scratch;
-
-        // Receptor → pipes, by counting sort. Entities are visited nearest
-        // first, so every receptor's run comes out ordered front to back
-        // without sorting any of them. Ties break on the index: deterministic.
+        // Sources nearest first; ties break on the index, so the order — and
+        // with it every float sum below — is deterministic.
         let mut order: Vec<u32> = (0..self.pipe_count.len() as u32)
             .filter(|&i| self.pipe_count[i as usize] > 0).collect();
         order.sort_unstable_by(|&a, &b| {
             self.entity_depth[a as usize].total_cmp(&self.entity_depth[b as usize]).then(a.cmp(&b))
         });
-        fs.start.clear();
-        fs.start.resize(n_rec + 1, 0);
-        for &rc in &self.pipe_receptor { fs.start[rc as usize + 1] += 1; }
-        for r in 0..n_rec { fs.start[r + 1] += fs.start[r]; }
-        let mut cursor: Vec<u32> = fs.start[..n_rec].to_vec();
-        fs.slots.clear();
-        fs.slots.resize(total, (0, 0.0, 0.0));
+
+        // One sweep, front to back, over *sources* — no per-receptor table.
+        // `in_front[rc]` holds the density delivered to receptor `rc` by every
+        // source at least FRONT_MARGIN nearer than the one being weighed;
+        // `depth − FRONT_MARGIN` rises along the sweep, so a second cursor
+        // trails behind and pours sources in as they fall that far back. Every
+        // pipe is touched twice, in its own entity's contiguous run, and the
+        // accumulator is one float per receptor: this is memory-sequential,
+        // where regrouping the pipes by receptor was a scatter of all of them
+        // — the largest phase of a relink once a near object ran the pipe
+        // count into the millions.
+        let in_front = &mut self.front_scratch;
+        in_front.clear();
+        in_front.resize(self.receptors.len(), 0.0);
+        self.pipe_sharp.clear();
+        self.pipe_sharp.resize(self.pipe_receptor.len(), 0.0);
+        let mut behind = 0usize;
         for &i in &order {
             let i = i as usize;
-            // What `contribution` will offer: the density this source delivers.
-            let delivered = sources[i].density * self.entity_trans[i];
+            while self.entity_depth[order[behind] as usize] < self.entity_depth[i] - FRONT_MARGIN {
+                let j = order[behind] as usize;
+                // What `contribution` will offer: the density j delivers.
+                let delivered = sources[j].density * self.entity_trans[j];
+                let (start, count) = (self.pipe_start[j] as usize, self.pipe_count[j] as usize);
+                for k in start..start + count {
+                    in_front[self.pipe_receptor[k] as usize] += delivered * self.pipe_weight[k];
+                }
+                behind += 1;
+            }
+            let p = sources[i].sharp_power.clamp(1, SHARP_POWER_MAX);
             let (start, count) = (self.pipe_start[i] as usize, self.pipe_count[i] as usize);
             for k in start..start + count {
-                let slot = &mut cursor[self.pipe_receptor[k] as usize];
-                let j = *slot as usize;
-                *slot += 1;
-                fs.slots[j] = (k as u32, self.entity_depth[i], delivered * self.pipe_weight[k]);
+                let dim = (1.0 - in_front[self.pipe_receptor[k] as usize] / RETINA_ISO).max(0.0);
+                self.pipe_sharp[k] = dim * sharp_base(self.pipe_weight[k], p);
             }
-        }
-
-        // Front to back through each receptor's run. `depth − FRONT_MARGIN`
-        // rises with the run, so the density in front is a running sum behind
-        // a second cursor. Receptors are independent: parallel over blocks of
-        // them, each block returning its stretch of the table.
-        let block = n_rec.div_ceil(rayon::current_num_threads().max(1) * 4).max(1);
-        let (start, slots) = (&fs.start, &fs.slots);
-        let dim: Vec<Vec<f32>> = (0..n_rec.div_ceil(block)).into_par_iter().map(|b| {
-            let (r0, r1) = (b * block, ((b + 1) * block).min(n_rec));
-            let mut out = Vec::with_capacity((start[r1] - start[r0]) as usize);
-            for r in r0..r1 {
-                let (j0, j1) = (start[r] as usize, start[r + 1] as usize);
-                let (mut behind, mut in_front) = (j0, 0.0f32);
-                for j in j0..j1 {
-                    while slots[behind].1 < slots[j].1 - FRONT_MARGIN {
-                        in_front += slots[behind].2;
-                        behind += 1;
-                    }
-                    out.push((1.0 - in_front / RETINA_ISO).max(0.0));
-                }
-            }
-            out
-        }).collect();
-
-        self.pipe_sharp.clear();
-        self.pipe_sharp.resize(total, 0.0);
-        for (j, d) in dim.iter().flatten().enumerate() {
-            let k = fs.slots[j].0 as usize;
-            let w = self.pipe_weight[k];
-            self.pipe_sharp[k] = (w.powi(SHARP_POWER) + SHARP_FLOOR * w) * d;
         }
     }
 
@@ -1187,6 +1188,13 @@ mod tests {
         (lo, hi)
     }
 
+    /// `sharp_base` with the power hidden from the optimiser: folded into a
+    /// constant, `powi` multiplies in a different order and lands an ULP away
+    /// from what the retina computed with a per-source power.
+    fn base(w: f32, p: i32) -> f32 {
+        sharp_base(w, std::hint::black_box(p))
+    }
+
     fn src(pos: Vec3, radii: Vec3, opacity: f32) -> Source {
         Source {
             position: pos,
@@ -1199,6 +1207,7 @@ mod tests {
             occluder: true,
             is_static: false,
             skin: false,
+            sharp_power: SHARP_POWER_MAX,
         }
     }
 
@@ -2072,13 +2081,51 @@ mod tests {
         r.tick(&sources, test_view_proj(w, h), lo, hi, false, ATTEN_K_DEFAULT);
         assert!(r.pipes_of(0).count() > 20);
         for ((_, wt), ws) in r.pipes_of(0).zip(r.sharp_of(0)) {
-            assert_eq!(ws, wt.powi(SHARP_POWER) + SHARP_FLOOR * wt);
+            assert_eq!(ws, base(wt, SHARP_POWER_MAX));
         }
         // Half the σ: where the broad weight is e⁻¹ the sharp one is ~e⁻⁴.
         let e1 = (-1.0f32).exp();
         let ((_, wt), ws) = r.pipes_of(0).zip(r.sharp_of(0))
             .min_by(|a, b| ((a.0).1 - e1).abs().total_cmp(&((b.0).1 - e1).abs())).unwrap();
         assert!(ws < 0.1 * wt, "sharp weight {} is not sharper than {}", ws, wt);
+    }
+
+    /// The power follows the lattice: halfway to the nearest neighbour the sharp
+    /// kernel still weighs exp(−SHARP_GAP), whatever the spacing.
+    #[test]
+    fn sharp_power_is_what_the_spacing_can_carry() {
+        assert_eq!(sharp_power_for(1.0, 0.8), 8, "the rock keeps the power it was tuned at");
+        assert_eq!(sharp_power_for(1.0, 1.5), 2, "the floor must not break into dots");
+        assert_eq!(sharp_power_for(1.0, 1.0), 5);
+        assert_eq!(sharp_power_for(1.0, 10.0), 1, "never broader than the footprint itself");
+        assert_eq!(sharp_power_for(4.0, 1.0), SHARP_POWER_MAX);
+        assert_eq!(sharp_power_for(1.0, 0.0), SHARP_POWER_MAX, "no neighbour, no gap");
+        for (r, sp) in [(1.0f32, 0.8f32), (1.0, 1.5), (1.0, 1.0), (2.0, 2.5)] {
+            let p = sharp_power_for(r, sp) as f32;
+            let e = (sp / (2.0 * r)).powi(2);
+            // Rounded to a whole power, so within half a step of the target.
+            assert!((p * e - SHARP_GAP).abs() <= 0.5 * e + 1e-6, "r {} spacing {}: p·e = {}", r, sp, p * e);
+        }
+    }
+
+    /// Each source's pipes use its own power.
+    #[test]
+    fn each_source_is_sharpened_by_its_own_power() {
+        let (w, h) = (63u32, 35u32);
+        let mut a = src(Vec3::new(-4.0, 0.0, -10.0), Vec3::splat(2.0), 0.0);
+        a.sharp_power = 2;
+        let mut b = src(Vec3::new(4.0, 0.0, -10.0), Vec3::splat(2.0), 0.0);
+        b.sharp_power = 99; // clamped
+        let sources = vec![a, b];
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.tick(&sources, test_view_proj(w, h), lo, hi, false, ATTEN_K_DEFAULT);
+        for (i, p) in [(0usize, 2), (1, SHARP_POWER_MAX)] {
+            assert!(r.pipes_of(i).count() > 20);
+            for ((_, wt), ws) in r.pipes_of(i).zip(r.sharp_of(i)) {
+                assert_eq!(ws, base(wt, p), "source {}", i);
+            }
+        }
     }
 
     /// Two sources on one line of sight: what the receptor *shows* is the near
@@ -2107,7 +2154,7 @@ mod tests {
         let at = |r: &Retina, i: usize| r.pipes_of(i).zip(r.sharp_of(i))
             .find(|&((rc, _), _)| rc == centre).map(|((_, wt), ws)| (wt, ws)).expect("misses the centre");
         let ((wn, sn), (wf, sf)) = (at(&r, 0), at(&r, 1));
-        assert_eq!(sn, wn.powi(SHARP_POWER) + SHARP_FLOOR * wn, "nothing is in front of the near source");
+        assert_eq!(sn, base(wn, SHARP_POWER_MAX), "nothing is in front of the near source");
         assert!(8.0 * wn > RETINA_ISO);
         assert_eq!(sf, 0.0, "the far source is behind a surface");
 
@@ -2121,14 +2168,14 @@ mod tests {
         // Where the near source's footprint ends, the far one is all there is.
         let beside = r.pipes_of(1).zip(r.sharp_of(1))
             .find(|&((rc, _), _)| r.pipes_of(0).all(|(x, _)| x != rc)).expect("far source has no receptor of its own");
-        assert_eq!(beside.1, (beside.0).1.powi(SHARP_POWER) + SHARP_FLOOR * (beside.0).1);
+        assert_eq!(beside.1, base((beside.0).1, SHARP_POWER_MAX));
 
         // Less than an iso in front is not a surface: it dims in proportion.
         sources[0].density = 0.2 * RETINA_ISO;
         let mut r2 = Retina::new(w, h);
         r2.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
         let ((wn2, _), (wf2, sf2)) = (at(&r2, 0), at(&r2, 1));
-        let want = (wf2.powi(SHARP_POWER) + SHARP_FLOOR * wf2) * (1.0 - 0.2 * wn2);
+        let want = (base(wf2, SHARP_POWER_MAX)) * (1.0 - 0.2 * wn2);
         assert!((sf2 - want).abs() <= 1e-5 * want, "far sharp weight {} want {}", sf2, want);
     }
 
@@ -2158,7 +2205,7 @@ mod tests {
         let (wb, _) = at(0).expect("the ball's tail must reach the centre");
         assert!(wb > 0.0 && wb * 1.0 < 0.2 * RETINA_ISO, "want a faint tail, got w = {}", wb);
         let (wc, sc) = at(1).expect("misses the centre");
-        let base = wc.powi(SHARP_POWER) + SHARP_FLOOR * wc;
+        let base = base(wc, SHARP_POWER_MAX);
         assert!(sc > 0.8 * base, "a tail delivering {} hid what is behind it: {} of {}", wb, sc, base);
     }
 
@@ -2190,7 +2237,7 @@ mod tests {
         assert!(at(0).expect("A's flank misses the centre").0 > 0.3);
         assert!(at(1).is_none(), "B must not reach the centre receptor");
         let (wc, sc) = at(2).expect("C misses the centre");
-        let base = wc.powi(SHARP_POWER) + SHARP_FLOOR * wc;
+        let base = base(wc, SHARP_POWER_MAX);
         assert!((sc - base).abs() < 1e-4 * base, "C was dimmed by an unseen source: {} of {}", sc, base);
         let rec = r.receptors[centre as usize];
         assert!(rec.density_f() >= RETINA_ISO && rec.sharp_f() > 0.5 * rec.density_f(),
@@ -2212,7 +2259,7 @@ mod tests {
         for i in 0..2 {
             assert!(r.pipes_of(i).count() > 0);
             for ((_, wt), ws) in r.pipes_of(i).zip(r.sharp_of(i)) {
-                assert_eq!(ws, wt.powi(SHARP_POWER) + SHARP_FLOOR * wt, "source {} was dimmed", i);
+                assert_eq!(ws, base(wt, SHARP_POWER_MAX), "source {} was dimmed", i);
             }
         }
     }
