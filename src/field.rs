@@ -1260,8 +1260,14 @@ impl DiffField {
 
     fn spawn_demo_scene(&mut self) -> f32 {
         let center = FIELD_SIZE as f32 / 2.0;
-        // Dino faces +Z, centered in field
-        let base = glam::Vec3::new(center, center - 5.0, center);
+        // Dino faces +Z, centered in field. Lifted so it stands *on* the floor:
+        // a foot metaball is drawn out to its kernel cutoff, 2 cells below its
+        // centre, and the floor's unit kernels draw a slab whose top is ~1.5
+        // cells above the tiles. Unlifted, the foot centres sat at exactly the
+        // tiles' height and the feet were inside that slab — invisible since
+        // receptors show what is in front rather than what is densest.
+        const DINO_LIFT: f32 = 3.0;
+        let base = glam::Vec3::new(center, center - 5.0 + DINO_LIFT, center);
         let green = [0.2, 0.6, 0.15];       // body green
         let dark_green = [0.15, 0.45, 0.1]; // darker accents
         let belly = [0.5, 0.65, 0.3];       // lighter belly
@@ -1373,7 +1379,7 @@ impl DiffField {
         // ROCK — small boulder on the ground
         let rock_color = [0.4, 0.35, 0.25];
         self.fill_ellipsoid(
-            base + glam::Vec3::new(15.0, -4.5, 25.0),
+            base + glam::Vec3::new(15.0, -4.5 - DINO_LIFT, 25.0), // the rock stays on the ground
             glam::Vec3::new(15.0, 2.0, 15.0),
             rock_color, 0.15, 0.8, 0.01, GROUP_ROCK,
         );

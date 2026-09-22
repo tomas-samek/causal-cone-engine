@@ -239,7 +239,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             );
 
             // Warm belly tint (lower Y = more yellow/tan)
-            let belly_blend = smoothstep(252.0, 246.0, sample_pos.y);
+            // World heights: the dino stands DINO_LIFT (3) above its old base.
+            let belly_blend = smoothstep(255.0, 249.0, sample_pos.y);
             norm_color = mix(norm_color, norm_color * vec3<f32>(1.3, 1.15, 0.7), belly_blend * 0.3);
         }
 
