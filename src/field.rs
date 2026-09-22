@@ -2144,9 +2144,10 @@ mod tests {
         // seen there: catch it where it would enter, at the sources.
         assert!(field.sources.iter().all(|s| s.density.is_finite() && s.color.iter().all(|c| c.is_finite())),
             "non-finite source");
-        // Walker-group sources are drawable and linked
+        // Walker-group sources are drawable and linked — with pipes, or hidden
+        // behind the dino's own nearer metaballs and linked with none.
         let linked_walkers = field.entities.iter().enumerate()
-            .filter(|(i, e)| e.is_walker && r.pipes_of(*i).count() > 0).count();
+            .filter(|(i, e)| e.is_walker && (r.pipes_of(*i).count() > 0 || r.is_hidden(*i))).count();
         assert!(linked_walkers > 100, "only {} walker entities have pipes", linked_walkers);
         // Freeze the world: no motion, no animation. Lighting keeps
         // converging (consumption learning nudges mass boosts), so demand
@@ -2196,7 +2197,7 @@ mod tests {
         }
         let r = &field.retina;
         let taus: Vec<f32> = field.entities.iter().enumerate()
-            .filter(|(i, e)| e.is_walker && r.pipes_of(*i).count() > 0)
+            .filter(|(i, e)| e.is_walker && (r.pipes_of(*i).count() > 0 || r.is_hidden(*i)))
             .map(|(i, _)| r.transmittance(i))
             .collect();
         assert!(taus.len() >= 100, "only {} walker entities linked", taus.len());
@@ -2213,7 +2214,7 @@ mod tests {
         // And the half nearest the eye is the dino's visible skin: it has to
         // arrive nearly unattenuated, not merely "on average not zero".
         let mut by_depth: Vec<(f32, f32)> = field.entities.iter().enumerate()
-            .filter(|(i, e)| e.is_walker && r.pipes_of(*i).count() > 0)
+            .filter(|(i, e)| e.is_walker && (r.pipes_of(*i).count() > 0 || r.is_hidden(*i)))
             .map(|(i, _)| (r.depth_of(i), r.transmittance(i)))
             .collect();
         by_depth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());

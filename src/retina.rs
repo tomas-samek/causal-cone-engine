@@ -321,6 +321,13 @@ pub fn sharp_power_for(radius: f32, spacing: f32) -> i32 {
 /// would have density and nothing to colour it with. With the floor it falls
 /// back to the broad average exactly there, and nowhere a core reaches.
 pub const SHARP_FLOOR: f32 = 0.01;
+/// A source is *hidden* — linked with no pipes at all — when every receptor it
+/// reaches already holds this many isos of density in front of it. One iso
+/// would be enough for the picture as it stands at the relink; the rest is
+/// headroom, because a hidden source is not there to hold the receptor over
+/// the iso if the sources in front of it dim (a shadow passing over them)
+/// before the next full relink.
+pub const HIDDEN_AT: f32 = 4.0;
 /// A source hides another in the same receptor only from this many cells
 /// nearer the eye. Neighbours on one surface sit closer than a kernel radius
 /// in depth and must share the receptor, not fight over it.
@@ -397,7 +404,7 @@ impl Receptor {
 
 /// What an entity offers a pipe, in the field's own floats — before the
 /// footprint weight and before quantisation.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PipeState {
     pub density: f32,
     pub color: [f32; 3],
@@ -451,11 +458,33 @@ pub struct PipeQ {
     pub sharp: i32,
 }
 
+/// What `Retina::relink_kind` asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelinkKind {
+    None,
+    /// Only the dynamic sources: the camera held still.
+    Partial,
+    Full,
+}
+
+/// Grow the receptor rect `b` (u0, u1, v0, v1; empty when u0 > u1) to hold `r`.
+fn grow(b: &mut [u32; 4], r: [u32; 4]) {
+    *b = [b[0].min(r[0]), b[1].max(r[1]), b[2].min(r[2]), b[3].max(r[3])];
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RetinaStats {
     pub pipes_total: usize,
     pub pipes_sent: usize,
+    /// Sources `arrive` had to look at last tick: the ones whose offer or
+    /// weights changed. The rest were skipped without touching a pipe.
+    pub sources_arrived: usize,
+    /// Sources linked with no pipes because everything they reach is already
+    /// behind `HIDDEN_AT` isos of density.
+    pub hidden_sources: usize,
+    /// Relinks of either kind, and how many of them were partial.
     pub relinks: u64,
+    pub partial_relinks: u64,
     pub mean_trans: f32,
     pub relink_ms: f32,
     /// Where `relink_ms` went. `hash_build_ms` is `SpatialHash::update`, which
@@ -667,11 +696,31 @@ pub struct Retina {
     /// Occluder grid, kept across ticks so its static half is hashed once.
     hash: SpatialHash,
     /// Per-chunk pipe scratch, kept across relinks for its capacity:
-    /// (receptors, weights, per-entity counts). One entry per worker chunk, not
+    /// (receptors, weights, per-entity (count, receptor rect)). One entry per worker chunk, not
     /// per entity — 17k relink-time allocations is a cost of its own.
-    pipe_scratch: Vec<(Vec<u32>, Vec<f32>, Vec<u32>)>,
-    /// `link_front`'s per-receptor running density, kept for its capacity.
-    front_scratch: Vec<f32>,
+    pipe_scratch: Vec<(Vec<u32>, Vec<f32>, Vec<(u32, [u32; 4])>)>,
+    /// `link_front`'s per-receptor running densities (from every source, and
+    /// from the static ones alone), kept for their capacity.
+    front_scratch: (Vec<f32>, Vec<f32>),
+    /// Entity indices in the order their runs sit in the pipe arrays: the
+    /// static sources first (`static_entities` of them, `static_pipes` pipes),
+    /// then the movers. A partial relink cuts the arrays at that seam.
+    layout: Vec<u32>,
+    static_entities: usize,
+    static_pipes: usize,
+    /// `Source::is_static` as of the last full relink — which segment each
+    /// entity's pipes are in.
+    linked_static: Vec<bool>,
+    /// Receptor rect (u0, u1, v0, v1) each entity's pipes were cut from.
+    pipe_rect: Vec<[u32; 4]>,
+    /// Linked with no pipes: see `HIDDEN_AT`.
+    hidden: Vec<bool>,
+    /// The entity's pipe weights changed since `arrive` last ran.
+    weights_dirty: Vec<bool>,
+    /// What each entity offered when `arrive` last ran.
+    last_contrib: Vec<PipeState>,
+    /// Partial relink scratch: the receptors the movers left or entered.
+    dirty_mask: Vec<bool>,
     pub stats: RetinaStats,
     /// Set when any delta arrived since the renderer last uploaded.
     pub dirty: bool,
@@ -695,7 +744,16 @@ impl Retina {
             last_view_proj: None,
             hash: SpatialHash::default(),
             pipe_scratch: Vec::new(),
-            front_scratch: Vec::new(),
+            front_scratch: (Vec::new(), Vec::new()),
+            layout: Vec::new(),
+            static_entities: 0,
+            static_pipes: 0,
+            linked_static: Vec::new(),
+            pipe_rect: Vec::new(),
+            hidden: Vec::new(),
+            weights_dirty: Vec::new(),
+            last_contrib: Vec::new(),
+            dirty_mask: Vec::new(),
             stats: RetinaStats::default(),
             dirty: true,
         }
@@ -728,6 +786,13 @@ impl Retina {
         self.pipe_sharp[start..start + count].iter().copied()
     }
 
+    /// Test/diagnostic API: on the retina, but with no pipes — everything it
+    /// reaches is behind `HIDDEN_AT` isos of density.
+    #[allow(dead_code)]
+    pub fn is_hidden(&self, i: usize) -> bool {
+        self.hidden.get(i).copied().unwrap_or(false)
+    }
+
     /// Test/diagnostic API.
     #[allow(dead_code)]
     pub fn transmittance(&self, i: usize) -> f32 {
@@ -740,17 +805,20 @@ impl Retina {
         self.entity_depth.get(i).copied().unwrap_or(0.0)
     }
 
-    /// True when the picture's geometry has moved on the image plane since the
-    /// last relink — because the *camera* moved (the scene AABB's corners
-    /// project ≥ RELINK_SHIFT receptors away from where they did) or because a
-    /// *source* moved (its center projects ≥ RELINK_SHIFT receptors from where
-    /// it sat when it was linked).
+    /// What the picture's geometry asks for since the last relink.
     ///
-    /// The second half is not redundant: pipes are frozen between relinks, so
-    /// an animating scene under a motionless camera is a still image until the
-    /// trigger notices the sources themselves.
-    pub fn needs_relink(&self, sources: &[Source], view_proj: Mat4, aabb_min: Vec3, aabb_max: Vec3) -> bool {
-        let Some(last) = self.last_view_proj else { return true; };
+    /// - `Full` when the *camera* moved (the scene AABB's corners project
+    ///   ≥ RELINK_SHIFT receptors away from where they did), when the entity
+    ///   set changed shape, or when a source that was linked as static moved
+    ///   or stopped being static — every pipe is stale.
+    /// - `Partial` when the camera held still and only *dynamic* sources moved
+    ///   (their centre projects ≥ RELINK_SHIFT receptors from where it sat when
+    ///   it was linked). Pipes are frozen between relinks, so an animating
+    ///   scene under a motionless camera is a still image until this notices —
+    ///   but only the movers' pipes are stale, and the static scene, which is
+    ///   most of the pipes, stays linked.
+    pub fn relink_kind(&self, sources: &[Source], view_proj: Mat4, aabb_min: Vec3, aabb_max: Vec3) -> RelinkKind {
+        let Some(last) = self.last_view_proj else { return RelinkKind::Full; };
         if last != view_proj {
             for i in 0..8 {
                 let corner = Vec3::new(
@@ -761,66 +829,64 @@ impl Retina {
                 match (project(&last, self.width, self.height, corner),
                        project(&view_proj, self.width, self.height, corner)) {
                     (Some(a), Some(b)) => {
-                        if (a.0 - b.0).abs().max((a.1 - b.1).abs()) >= RELINK_SHIFT { return true; }
+                        if (a.0 - b.0).abs().max((a.1 - b.1).abs()) >= RELINK_SHIFT { return RelinkKind::Full; }
                     }
-                    _ => return true,
+                    _ => return RelinkKind::Full,
                 }
             }
         }
         // The entity set itself changed shape — nothing to compare against.
-        if self.last_centers.len() != sources.len() { return true; }
+        if self.last_centers.len() != sources.len() { return RelinkKind::Full; }
+        let mut kind = RelinkKind::None;
         for (i, s) in sources.iter().enumerate() {
+            // The pipe arrays keep static sources in a segment of their own; a
+            // source that changed sides is in the wrong one.
+            if s.is_static != self.linked_static[i] { return RelinkKind::Full; }
             let (lu, lv) = self.last_centers[i];
             // NaN: this source had no footprint at the last relink, so it has
             // no pipes to be stale. Whether it draws is `contribution`'s call.
             if !s.drawable || lu.is_nan() { continue; }
-            let Some((u, v, _)) = project(&view_proj, self.width, self.height, s.position) else { return true; };
-            if (u - lu).abs().max((v - lv).abs()) >= RELINK_SHIFT { return true; }
+            let moved = match project(&view_proj, self.width, self.height, s.position) {
+                Some((u, v, _)) => (u - lu).abs().max((v - lv).abs()) >= RELINK_SHIFT,
+                None => true,
+            };
+            if moved {
+                if s.is_static { return RelinkKind::Full; }
+                kind = RelinkKind::Partial;
+            }
         }
-        false
+        kind
     }
 
-    /// Full rebuild: drop every pipe (subtracting what it last sent — the
-    /// receptors are then exactly zero), re-project every drawable source,
-    /// recompute τ toward the eye. `aabb_min/max` bound the scene's geometry,
-    /// which is the only stretch of an entity→eye segment that can attenuate.
-    pub fn relink(&mut self, sources: &[Source], hash: &SpatialHash, view_proj: Mat4, eye: Vec3,
-                  aabb_min: Vec3, aabb_max: Vec3, atten_k: f32) {
+    /// Test API: does anything at all need relinking?
+    #[allow(dead_code)]
+    pub fn needs_relink(&self, sources: &[Source], view_proj: Mat4, aabb_min: Vec3, aabb_max: Vec3) -> bool {
+        self.relink_kind(sources, view_proj, aabb_min, aabb_max) != RelinkKind::None
+    }
+
+    /// Project `ents` and append their pipes to the SoA arrays, in that order.
+    /// Embarrassingly parallel: each footprint writes only its own
+    /// receptor/weight run. Chunks of entities fill scratch buffers in
+    /// parallel, then the chunks are concatenated in order — so the arrays come
+    /// out byte-for-byte what a serial loop over `ents` would produce
+    /// (row-major within a footprint), which is what the exactness tests pin.
+    /// Also records each entity's depth, projected centre and receptor rect.
+    fn append_pipes(&mut self, sources: &[Source], ents: &[u32], view_proj: &Mat4) -> (f32, f32) {
         let t0 = std::time::Instant::now();
         let (w, h) = (self.width, self.height);
-
-        // 1. Drop every pipe. Receptors are the exact sum of pipe_last, so
-        //    withdrawing all of it lands on zero — which is what the reset
-        //    below writes regardless. So only debug builds pay for the scatter;
-        //    they pay it to check that invariant, which is the whole point.
-        #[cfg(debug_assertions)]
-        {
-            for (k, &rc) in self.pipe_receptor.iter().enumerate() {
-                self.receptors[rc as usize].sub(&self.pipe_last[k]);
-            }
-            debug_assert!(self.receptors.iter().all(|r| *r == Receptor::default()),
-                "receptors not zero after dropping all pipes");
+        let fps: Vec<Option<Footprint>> = ents.par_iter()
+            .map(|&i| {
+                let s = &sources[i as usize];
+                if s.drawable { footprint(view_proj, w, h, s) } else { None }
+            })
+            .collect();
+        for (&i, f) in ents.iter().zip(&fps) {
+            self.entity_depth[i as usize] = f.as_ref().map(|f| f.depth).unwrap_or(0.0);
+            self.last_centers[i as usize] = f.as_ref().map(|f| (f.u, f.v)).unwrap_or((f32::NAN, f32::NAN));
         }
-        for r in &mut self.receptors { *r = Receptor::default(); }
-        let t_reset = t0.elapsed();
+        let t_fps = t0.elapsed().as_secs_f32() * 1000.0;
 
-        // 2–3. Project footprints.
-        let fps: Vec<Option<Footprint>> = sources.par_iter()
-            .map(|s| if s.drawable { footprint(&view_proj, w, h, s) } else { None })
-            .collect();
-        let n = sources.len();
-        self.entity_depth = fps.iter().map(|f| f.as_ref().map(|f| f.depth).unwrap_or(0.0)).collect();
-        self.last_centers = fps.iter()
-            .map(|f| f.as_ref().map(|f| (f.u, f.v)).unwrap_or((f32::NAN, f32::NAN)))
-            .collect();
-        let t_fps = t0.elapsed();
-
-        // 4. Pipes with feathered gaussian weights. Embarrassingly parallel:
-        //    each footprint writes only its own receptor/weight run. Chunks of
-        //    entities fill scratch buffers in parallel, then the chunks are
-        //    concatenated in order — so the SoA arrays come out byte-for-byte
-        //    what the serial loop produced (entity order, row-major within a
-        //    footprint), which is what the exactness tests pin down.
+        let n = ents.len();
         let chunks = (rayon::current_num_threads() * 8).max(1);
         let chunk_len = n.div_ceil(chunks).max(1);
         let n_chunks = n.div_ceil(chunk_len);
@@ -836,12 +902,12 @@ impl Retina {
                 counts.clear();
                 for fp in fps_chunk {
                     let before = recs.len() as u32;
-                    let Some(fp) = fp else { counts.push(0); continue; };
+                    let Some(fp) = fp else { counts.push((0, [0; 4])); continue; };
                     let u0 = fp.u0.floor().max(0.0) as i64;
                     let u1 = fp.u1.ceil().min(w as f32 - 1.0) as i64;
                     let v0 = fp.v0.floor().max(0.0) as i64;
                     let v1 = fp.v1.ceil().min(h as f32 - 1.0) as i64;
-                    if u0 > u1 || v0 > v1 { counts.push(0); continue; }
+                    if u0 > u1 || v0 > v1 { counts.push((0, [0; 4])); continue; }
                     for rv in v0..=v1 {
                         for ru in u0..=u1 {
                             let du = ru as f32 + 0.5 - fp.u;
@@ -852,46 +918,38 @@ impl Retina {
                             weights.push((-e).exp() * cutoff_window(e));
                         }
                     }
-                    counts.push(recs.len() as u32 - before);
+                    counts.push((recs.len() as u32 - before, [u0 as u32, u1 as u32, v0 as u32, v1 as u32]));
                 }
             });
 
-        self.pipe_start.clear();
-        self.pipe_start.resize(n, 0);
-        self.pipe_count.clear();
-        self.pipe_count.resize(n, 0);
-        let total: usize = self.pipe_scratch[..n_chunks].iter().map(|(r, _, _)| r.len()).sum();
-        self.pipe_receptor.clear();
-        self.pipe_receptor.reserve(total);
-        self.pipe_weight.clear();
-        self.pipe_weight.reserve(total);
-        let mut i = 0usize;
-        let mut base = 0u32;
+        let added: usize = self.pipe_scratch[..n_chunks].iter().map(|(r, _, _)| r.len()).sum();
+        self.pipe_receptor.reserve(added);
+        self.pipe_weight.reserve(added);
+        let mut at = 0usize;
+        let mut base = self.pipe_receptor.len() as u32;
         for (recs, weights, counts) in &self.pipe_scratch[..n_chunks] {
-            for &c in counts.iter() {
+            for &(c, rect) in counts.iter() {
+                let i = ents[at] as usize;
                 self.pipe_start[i] = base;
                 self.pipe_count[i] = c;
+                self.pipe_rect[i] = rect;
                 base += c;
-                i += 1;
+                at += 1;
             }
             self.pipe_receptor.extend_from_slice(recs);
             self.pipe_weight.extend_from_slice(weights);
         }
-        debug_assert_eq!(i, n, "chunked pipe counts did not cover every entity");
-        debug_assert_eq!(base as usize, total);
-        // Reuse the allocation: at ~577k pipes this buffer is ~23 MB, and
-        // handing it back to the allocator every relink is not free.
-        self.pipe_last.clear();
-        self.pipe_last.resize(total, PipeQ::default());
-        let t_pipes = t0.elapsed();
+        debug_assert_eq!(at, n, "chunked pipe counts did not cover every entity");
+        debug_assert_eq!(base as usize, self.pipe_receptor.len());
+        (t_fps, t0.elapsed().as_secs_f32() * 1000.0 - t_fps)
+    }
 
-
-        // 5. τ toward the eye — only for entities that actually got pipes
-        // (parallel). Measured at ~8.5 ms of a ~36 ms relink on the demo
-        // scene: a quarter of it. The serial pipe loop above is the cost.
+    /// τ toward the eye for every entity that has pipes (parallel); 1.0 for
+    /// the rest.
+    fn link_tau(&mut self, sources: &[Source], hash: &SpatialHash, eye: Vec3, aabb_min: Vec3, aabb_max: Vec3, atten_k: f32) {
         let pipe_count = &self.pipe_count;
         let aabb = Some((aabb_min, aabb_max));
-        self.entity_trans = (0..n).into_par_iter().map(|i| {
+        self.entity_trans = (0..sources.len()).into_par_iter().map(|i| {
             if pipe_count[i] > 0 {
                 // Relative threshold: an entity is not occluded by what it is
                 // already buried in. ρ_self is the density of *other* occluders
@@ -903,39 +961,216 @@ impl Retina {
                 segment_transmittance(sources, hash, sources[i].position, eye, &[i], atten_k, threshold, aabb)
             } else { 1.0 }
         }).collect();
-        let t_tau = t0.elapsed();
+    }
 
-        // 6. Sharp weights: what each pipe carries colour, normal, depth and
-        // skin with. After τ, because a source hides others only as far as it
-        // is seen itself.
-        self.link_front(sources);
-        let t_front = t0.elapsed();
+    /// Close the gaps hidden sources leave in the pipe arrays, from layout
+    /// position `from` on (everything before it is already tight). Order is
+    /// preserved; a hidden source ends up with no pipes.
+    fn compact_hidden(&mut self, from: usize) {
+        let Some(&first) = self.layout.get(from) else { return; };
+        let mut write = self.pipe_start[first as usize] as usize;
+        for pos in from..self.layout.len() {
+            let i = self.layout[pos] as usize;
+            let (start, count) = (self.pipe_start[i] as usize, self.pipe_count[i] as usize);
+            if self.hidden[i] {
+                self.pipe_start[i] = write as u32;
+                self.pipe_count[i] = 0;
+                continue;
+            }
+            if write != start {
+                self.pipe_receptor.copy_within(start..start + count, write);
+                self.pipe_weight.copy_within(start..start + count, write);
+                self.pipe_sharp.copy_within(start..start + count, write);
+            }
+            self.pipe_start[i] = write as u32;
+            write += count;
+        }
+        self.pipe_receptor.truncate(write);
+        self.pipe_weight.truncate(write);
+        self.pipe_sharp.truncate(write);
+    }
 
-        // 7. Bookkeeping.
-        self.last_view_proj = Some(view_proj);
+    fn finish_relink(&mut self, t0: std::time::Instant, phases: [f32; 5]) {
+        let [reset, fps, pipes, tau, front] = phases;
+        let n = self.pipe_count.len();
         let linked: Vec<f32> = (0..n).filter(|&i| self.pipe_count[i] > 0).map(|i| self.entity_trans[i]).collect();
         self.stats.relinks += 1;
         self.stats.pipes_total = self.pipe_receptor.len();
+        self.stats.hidden_sources = self.hidden.iter().filter(|&&h| h).count();
         self.stats.mean_trans = if linked.is_empty() { 1.0 } else { linked.iter().sum::<f32>() / linked.len() as f32 };
-        let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
-        self.stats.relink_footprint_ms = ms(t_fps - t_reset);
-        self.stats.relink_pipes_ms = ms(t_pipes - t_fps);
-        self.stats.relink_tau_ms = ms(t_tau - t_pipes);
-        self.stats.relink_front_ms = ms(t_front - t_tau);
+        self.stats.relink_footprint_ms = fps;
+        self.stats.relink_pipes_ms = pipes;
+        self.stats.relink_tau_ms = tau;
+        self.stats.relink_front_ms = front;
         // `tick` builds the hash; a direct `relink` was handed one, so the
         // number it last recorded says nothing about this call.
         self.stats.hash_build_ms = 0.0;
-        self.stats.relink_ms = ms(t0.elapsed());
+        self.stats.relink_ms = t0.elapsed().as_secs_f32() * 1000.0;
         log::debug!(
-            "relink {:.2} ms = reset {:.2} + footprints {:.2} + pipes {:.2} + τ {:.2} + front {:.2} + bookkeeping {:.2} ({} entities, {} pipes; hash build is `tick`'s, not counted here)",
-            self.stats.relink_ms, ms(t_reset), self.stats.relink_footprint_ms,
-            self.stats.relink_pipes_ms, self.stats.relink_tau_ms, self.stats.relink_front_ms,
-            self.stats.relink_ms - ms(t_front), n, self.stats.pipes_total,
+            "relink {:.2} ms = reset {:.2} + footprints {:.2} + pipes {:.2} + τ {:.2} + front {:.2} + bookkeeping {:.2} ({} entities, {} pipes, {} hidden; hash build is `tick`'s, not counted here)",
+            self.stats.relink_ms, reset, fps, pipes, tau, front,
+            self.stats.relink_ms - reset - fps - pipes - tau - front, n, self.stats.pipes_total, self.stats.hidden_sources,
         );
         self.dirty = true;
     }
 
-    /// Fill `pipe_sharp`. Two things happen to the footprint weight `w`:
+    /// Full rebuild: drop every pipe (subtracting what it last sent — the
+    /// receptors are then exactly zero), re-project every drawable source,
+    /// recompute τ toward the eye. `aabb_min/max` bound the scene's geometry,
+    /// which is the only stretch of an entity→eye segment that can attenuate.
+    pub fn relink(&mut self, sources: &[Source], hash: &SpatialHash, view_proj: Mat4, eye: Vec3,
+                  aabb_min: Vec3, aabb_max: Vec3, atten_k: f32) {
+        let t0 = std::time::Instant::now();
+        let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+
+        // 1. Drop every pipe. Receptors are the exact sum of pipe_last, so
+        //    withdrawing all of it lands on zero — which is what the reset
+        //    below writes regardless. So only debug builds pay for the scatter;
+        //    they pay it to check that invariant, which is the whole point.
+        #[cfg(debug_assertions)]
+        {
+            for (k, &rc) in self.pipe_receptor.iter().enumerate() {
+                self.receptors[rc as usize].sub(&self.pipe_last[k]);
+            }
+            debug_assert!(self.receptors.iter().all(|r| *r == Receptor::default()),
+                "receptors not zero after dropping all pipes");
+        }
+        for r in &mut self.receptors { *r = Receptor::default(); }
+        let t_reset = ms(t0.elapsed());
+
+        // 2. The layout of the pipe arrays: static sources first, the movers
+        //    after them, each in index order. A partial relink then only has
+        //    to cut the arrays at the seam and grow the tail back.
+        let n = sources.len();
+        self.layout.clear();
+        self.layout.extend((0..n as u32).filter(|&i| sources[i as usize].is_static));
+        self.static_entities = self.layout.len();
+        self.layout.extend((0..n as u32).filter(|&i| !sources[i as usize].is_static));
+        self.linked_static = sources.iter().map(|s| s.is_static).collect();
+        self.entity_depth = vec![0.0; n];
+        self.last_centers = vec![(f32::NAN, f32::NAN); n];
+        for v in [&mut self.pipe_start, &mut self.pipe_count] { v.clear(); v.resize(n, 0); }
+        self.pipe_rect.clear();
+        self.pipe_rect.resize(n, [0; 4]);
+        self.hidden.clear();
+        self.hidden.resize(n, false);
+        self.pipe_receptor.clear();
+        self.pipe_weight.clear();
+
+        // 3–4. Footprints and pipes.
+        let layout = std::mem::take(&mut self.layout);
+        let (t_fps, t_pipes) = self.append_pipes(sources, &layout, &view_proj);
+        self.layout = layout;
+
+        // 5. τ toward the eye. Measured at ~8.5 ms of a ~36 ms relink on the
+        //    demo scene.
+        let t = std::time::Instant::now();
+        self.link_tau(sources, hash, eye, aabb_min, aabb_max, atten_k);
+        let t_tau = ms(t.elapsed());
+
+        // 6. Sharp weights — after τ, because a source hides others only as
+        //    far as it is seen itself — and with them, which sources are
+        //    hidden outright. Those give their pipes back.
+        let t = std::time::Instant::now();
+        self.link_front(sources, None);
+        self.compact_hidden(0);
+        self.static_pipes = self.layout.get(self.static_entities)
+            .map(|&i| self.pipe_start[i as usize] as usize)
+            .unwrap_or(self.pipe_receptor.len());
+        // Reuse the allocation: at ~577k pipes this buffer is ~23 MB, and
+        // handing it back to the allocator every relink is not free.
+        self.pipe_last.clear();
+        self.pipe_last.resize(self.pipe_receptor.len(), PipeQ::default());
+        let t_front = ms(t.elapsed());
+
+        // 7. Bookkeeping. Every pipe is new: nothing may be skipped.
+        self.last_view_proj = Some(view_proj);
+        self.weights_dirty.clear();
+        self.weights_dirty.resize(n, true);
+        self.last_contrib.clear();
+        self.last_contrib.resize(n, PipeState::default());
+        self.finish_relink(t0, [t_reset, t_fps, t_pipes, t_tau, t_front]);
+    }
+
+    /// The camera held still and only dynamic sources moved: withdraw *their*
+    /// pipes, link them again where they are now, and repair the sharp weights
+    /// of the receptors they left or entered. The static scene's pipes — most
+    /// of them, and all of a near rock's millions — stay linked and, having
+    /// nothing new to say, send nothing.
+    ///
+    /// Works in the view the pipes were linked under (`last_view_proj`): the
+    /// camera may have drifted less than RELINK_SHIFT since, and the static
+    /// pipes are where that view put them.
+    fn relink_partial(&mut self, sources: &[Source], hash: &SpatialHash, aabb_min: Vec3, aabb_max: Vec3, atten_k: f32) {
+        let t0 = std::time::Instant::now();
+        let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+        let view_proj = self.last_view_proj.expect("partial relink before any full one");
+        let w = self.width;
+
+        // 1. Withdraw the movers, exactly, and cut the arrays at the seam.
+        let dirty = &mut self.dirty_mask;
+        dirty.clear();
+        dirty.resize(self.receptors.len(), false);
+        let mut bbox = [u32::MAX, 0, u32::MAX, 0];
+        for k in self.static_pipes..self.pipe_receptor.len() {
+            let rc = self.pipe_receptor[k];
+            self.receptors[rc as usize].sub(&self.pipe_last[k]);
+            dirty[rc as usize] = true;
+        }
+        let movers: Vec<u32> = self.layout[self.static_entities..].to_vec();
+        for &i in &movers {
+            let i = i as usize;
+            // A hidden mover kept no pipes, but where it was hidden is where
+            // the picture may change when it leaves.
+            if self.pipe_count[i] > 0 || self.hidden[i] { grow(&mut bbox, self.pipe_rect[i]); }
+            self.pipe_count[i] = 0;
+            self.hidden[i] = false;
+        }
+        self.pipe_receptor.truncate(self.static_pipes);
+        self.pipe_weight.truncate(self.static_pipes);
+        self.pipe_sharp.truncate(self.static_pipes);
+        self.pipe_last.truncate(self.static_pipes);
+        let t_reset = ms(t0.elapsed());
+
+        // 2. Link them where they are now.
+        let (t_fps, t_pipes) = self.append_pipes(sources, &movers, &view_proj);
+        self.pipe_sharp.resize(self.pipe_receptor.len(), 0.0);
+        for &i in &movers {
+            if self.pipe_count[i as usize] > 0 { grow(&mut bbox, self.pipe_rect[i as usize]); }
+        }
+        for k in self.static_pipes..self.pipe_receptor.len() {
+            self.dirty_mask[self.pipe_receptor[k] as usize] = true;
+        }
+        // A mover hidden last time left no pipes to mark: its whole rect is
+        // suspect. (Cheap — it is a rect of booleans.)
+        if bbox[0] <= bbox[1] && bbox[2] <= bbox[3] {
+            for v in bbox[2]..=bbox[3] {
+                for u in bbox[0]..=bbox[1] { self.dirty_mask[(v * w + u) as usize] = true; }
+            }
+        }
+
+        // 3. τ for everyone: the movers changed what stands between the static
+        //    scene and the eye too. A static source whose τ changed has a new
+        //    contribution, and `arrive` will notice.
+        let t = std::time::Instant::now();
+        let eye = eye_from_view_proj(view_proj);
+        self.link_tau(sources, hash, eye, aabb_min, aabb_max, atten_k);
+        let t_tau = ms(t.elapsed());
+
+        // 4. Sharp weights, in the touched receptors only.
+        let t = std::time::Instant::now();
+        self.link_front(sources, Some(bbox));
+        self.compact_hidden(self.static_entities);
+        self.pipe_last.resize(self.pipe_receptor.len(), PipeQ::default());
+        for &i in &movers { self.weights_dirty[i as usize] = true; }
+        let t_front = ms(t.elapsed());
+
+        self.stats.partial_relinks += 1;
+        self.finish_relink(t0, [t_reset, t_fps, t_pipes, t_tau, t_front]);
+    }
+
+    /// Fill `pipe_sharp`, and decide which sources are hidden outright. Two
+    /// things happen to the footprint weight `w`:
     ///
     /// - it is **sharpened** to `wᵖ + SHARP_FLOOR·w`, `p` the source's own
     ///   `sharp_power`, so a receptor shows the sources whose cores cover it
@@ -958,6 +1193,15 @@ impl Retina {
     ///   dino. And a source the eye cannot see (τ = 0) delivers nothing, so it
     ///   hides nothing; with opacity it punched black holes in the tail.
     ///
+    /// A source **all** of whose pipes sit behind `HIDDEN_AT` isos of density
+    /// is *hidden*: it could only add density to receptors that are drawn
+    /// without it, and the display reads nothing of density but "≥ iso". It is
+    /// flagged here and `compact_hidden` takes its pipes away — for a near
+    /// rock, a shell of 1-cell kernels 0.8 apart, that is the back and the
+    /// underside. A static source counts only *static* density in front of it:
+    /// what a mover hides must come back the moment the mover steps aside, and
+    /// a partial relink never relinks the static scene.
+    ///
     /// This is the front-to-back compositing the sum cannot do on its own — but
     /// done here, on the weights, where it costs the sum nothing: weights are
     /// constants between relinks, so arrival is still delta-only and exact.
@@ -967,12 +1211,21 @@ impl Retina {
     /// `entity_trans` is a different question (is the *source* visible from
     /// the eye, along one 3D segment); this one is per receptor.
     ///
-    /// Density is untouched, so silhouettes are exactly what they were.
-    fn link_front(&mut self, sources: &[Source]) {
+    /// Density is untouched, so silhouettes are what they were.
+    ///
+    /// `within` = `Some(rect)` is the partial form: only receptors flagged in
+    /// `dirty_mask` (all inside `rect`) are recomputed. For those the sums run
+    /// over the same sources in the same order as the full sweep, so they come
+    /// out the same; a static pipe whose weight changed marks its entity for
+    /// `arrive`.
+    fn link_front(&mut self, sources: &[Source], within: Option<[u32; 4]>) {
         // Sources nearest first; ties break on the index, so the order — and
         // with it every float sum below — is deterministic.
+        let overlaps = |r: [u32; 4], b: [u32; 4]| r[0] <= b[1] && b[0] <= r[1] && r[2] <= b[3] && b[2] <= r[3];
         let mut order: Vec<u32> = (0..self.pipe_count.len() as u32)
-            .filter(|&i| self.pipe_count[i as usize] > 0).collect();
+            .filter(|&i| self.pipe_count[i as usize] > 0)
+            .filter(|&i| within.map_or(true, |b| overlaps(self.pipe_rect[i as usize], b)))
+            .collect();
         order.sort_unstable_by(|&a, &b| {
             self.entity_depth[a as usize].total_cmp(&self.entity_depth[b as usize]).then(a.cmp(&b))
         });
@@ -983,33 +1236,62 @@ impl Retina {
         // `depth − FRONT_MARGIN` rises along the sweep, so a second cursor
         // trails behind and pours sources in as they fall that far back. Every
         // pipe is touched twice, in its own entity's contiguous run, and the
-        // accumulator is one float per receptor: this is memory-sequential,
-        // where regrouping the pipes by receptor was a scatter of all of them
-        // — the largest phase of a relink once a near object ran the pipe
-        // count into the millions.
-        let in_front = &mut self.front_scratch;
+        // accumulators are one float per receptor: this is memory-sequential,
+        // where regrouping the pipes by receptor was a scatter of all of them.
+        let partial = within.is_some();
+        let n_rec = self.receptors.len();
+        let (in_front, in_front_static) = (&mut self.front_scratch.0, &mut self.front_scratch.1);
         in_front.clear();
-        in_front.resize(self.receptors.len(), 0.0);
-        self.pipe_sharp.clear();
-        self.pipe_sharp.resize(self.pipe_receptor.len(), 0.0);
+        in_front.resize(n_rec, 0.0);
+        in_front_static.clear();
+        in_front_static.resize(if partial { 0 } else { n_rec }, 0.0);
+        if !partial {
+            self.pipe_sharp.clear();
+            self.pipe_sharp.resize(self.pipe_receptor.len(), 0.0);
+        }
+        let dirty = &self.dirty_mask;
         let mut behind = 0usize;
         for &i in &order {
             let i = i as usize;
             while self.entity_depth[order[behind] as usize] < self.entity_depth[i] - FRONT_MARGIN {
                 let j = order[behind] as usize;
+                behind += 1;
+                // A hidden source only adds to receptors already past
+                // HIDDEN_AT isos: it changes no weight, and it will have no
+                // pipes to be poured from at the next partial sweep.
+                if self.hidden[j] { continue; }
                 // What `contribution` will offer: the density j delivers.
                 let delivered = sources[j].density * self.entity_trans[j];
                 let (start, count) = (self.pipe_start[j] as usize, self.pipe_count[j] as usize);
+                let is_static = self.linked_static[j];
                 for k in start..start + count {
-                    in_front[self.pipe_receptor[k] as usize] += delivered * self.pipe_weight[k];
+                    let rc = self.pipe_receptor[k] as usize;
+                    if partial && !dirty[rc] { continue; }
+                    let d = delivered * self.pipe_weight[k];
+                    in_front[rc] += d;
+                    if is_static && !partial { in_front_static[rc] += d; }
                 }
-                behind += 1;
             }
             let p = sources[i].sharp_power.clamp(1, SHARP_POWER_MAX);
             let (start, count) = (self.pipe_start[i] as usize, self.pipe_count[i] as usize);
+            let is_static = self.linked_static[i];
+            let mut exposed = false;
+            let mut changed = false;
             for k in start..start + count {
-                let dim = (1.0 - in_front[self.pipe_receptor[k] as usize] / RETINA_ISO).max(0.0);
-                self.pipe_sharp[k] = dim * sharp_base(self.pipe_weight[k], p);
+                let rc = self.pipe_receptor[k] as usize;
+                if partial && !dirty[rc] { exposed = true; continue; }
+                let sharp = (1.0 - in_front[rc] / RETINA_ISO).max(0.0) * sharp_base(self.pipe_weight[k], p);
+                changed |= sharp != self.pipe_sharp[k];
+                self.pipe_sharp[k] = sharp;
+                let cover = if is_static && !partial { in_front_static[rc] } else { in_front[rc] };
+                exposed |= cover < HIDDEN_AT * RETINA_ISO;
+            }
+            if partial {
+                // The static scene is never relinked here, so it is never
+                // hidden here either; the movers are judged afresh.
+                if is_static { self.weights_dirty[i] |= changed; } else { self.hidden[i] = !exposed; }
+            } else {
+                self.hidden[i] = !exposed;
             }
         }
     }
@@ -1017,22 +1299,33 @@ impl Retina {
     /// What entity `i` offers its pipes this tick (before the footprint
     /// weight). A source that stopped drawing offers zero, so its pipes
     /// withdraw what they last sent.
+    ///
+    /// Snapped to the pipes' own fixed point. The field's lighting never quite
+    /// stops moving — a source's density keeps twitching in its seventh digit —
+    /// and an offer that is *equal* to last tick's is what lets `arrive` skip
+    /// the source without looking at a single pipe. Snapping here, before the
+    /// weights, keeps that exact: same offer, same weights, same pipes.
     fn contribution(&self, i: usize, s: &Source) -> PipeState {
         if !s.drawable { return PipeState::default(); }
+        let snap = |x: f32| (x * Q_ONE).round() / Q_ONE;
         let d = s.density * self.entity_trans[i];
         PipeState {
-            density: d,
-            color: [s.color[0] * self.entity_trans[i], s.color[1] * self.entity_trans[i], s.color[2] * self.entity_trans[i]],
-            normal: s.normal * d,
-            depth: self.entity_depth[i] * d,
+            density: snap(d),
+            color: [snap(s.color[0] * self.entity_trans[i]), snap(s.color[1] * self.entity_trans[i]), snap(s.color[2] * self.entity_trans[i])],
+            normal: Vec3::new(snap(s.normal.x * d), snap(s.normal.y * d), snap(s.normal.z * d)),
+            depth: (self.entity_depth[i] * d * Q_DEPTH_ONE).round() / Q_DEPTH_ONE,
             // Density-weighted, exactly like `depth`: the receptor sums it and
-            // the renderer divides by density to get a fraction back.
-            skin: if s.skin { d } else { 0.0 },
-            sharp: d,
+            // the renderer divides by `sharp` to get a fraction back.
+            skin: if s.skin { snap(d) } else { 0.0 },
+            sharp: snap(d),
         }
     }
 
     /// Phase 3′: every pipe whose quantised value changed sends `new − last`.
+    /// A source whose offer is what it was last tick, through weights that are
+    /// what they were, has nothing to send and is skipped whole — so a settled
+    /// scene costs its entity count, not its pipe count.
+    ///
     /// Parallel over entities; receptors are shared by many entities, so a
     /// chunk of entities accumulates into a scratch image of its own. The
     /// chunking is by worker thread, not by rayon's adaptive splitting: a
@@ -1043,35 +1336,43 @@ impl Retina {
     pub fn arrive(&mut self, sources: &[Source]) -> usize {
         let n_rec = self.receptors.len();
         let n = sources.len().min(self.pipe_count.len());
+        debug_assert_eq!(n, self.layout.len());
 
         // Contributions first (needs &self), then the per-entity mutable views
-        // of pipe_last (contiguous, ascending) — direct field borrows, no unsafe.
+        // of pipe_last (contiguous, in layout order) — direct field borrows, no
+        // unsafe. Only sources with something to say get a view.
         let contribs: Vec<PipeState> = (0..n).map(|i| self.contribution(i, &sources[i])).collect();
-        let mut slices: Vec<&mut [PipeQ]> = Vec::with_capacity(n);
+        let mut work: Vec<(usize, &mut [PipeQ])> = Vec::new();
         let mut rest: &mut [PipeQ] = &mut self.pipe_last;
-        for i in 0..n {
+        for &i in &self.layout {
+            let i = i as usize;
             let (head, tail) = rest.split_at_mut(self.pipe_count[i] as usize);
-            slices.push(head);
             rest = tail;
+            if !head.is_empty() && (self.weights_dirty[i] || contribs[i] != self.last_contrib[i]) {
+                work.push((i, head));
+            }
         }
+        debug_assert!(rest.is_empty(), "pipe runs do not tile pipe_last");
+        self.stats.sources_arrived = work.len();
 
         let pipe_start = &self.pipe_start;
         let pipe_receptor = &self.pipe_receptor;
         let pipe_weight = &self.pipe_weight;
         let pipe_sharp = &self.pipe_sharp;
 
-        // One contiguous entity range per chunk — one chunk per worker thread,
-        // fewer when a full scratch image each would blow ARRIVE_SCRATCH_BUDGET_BYTES.
-        // The scratch image is allocated on the range's first delta, so a
-        // settled scene allocates nothing and adds nothing.
-        let chunk_len = n.div_ceil(arrive_chunks(n, n_rec, rayon::current_num_threads())).max(1);
-        let parts: Vec<(Option<Vec<Receptor>>, usize)> = slices.par_chunks_mut(chunk_len)
-            .enumerate()
-            .map(|(c, chunk)| {
+        // One contiguous run of the work list per chunk — one chunk per worker
+        // thread, fewer when a full scratch image each would blow
+        // ARRIVE_SCRATCH_BUDGET_BYTES. The scratch image is allocated on the
+        // chunk's first delta, so a settled scene allocates nothing and adds
+        // nothing.
+        let m = work.len();
+        let chunk_len = m.div_ceil(arrive_chunks(m, n_rec, rayon::current_num_threads())).max(1);
+        let parts: Vec<(Option<Vec<Receptor>>, usize)> = work.par_chunks_mut(chunk_len)
+            .map(|chunk| {
                 let mut scratch: Option<Vec<Receptor>> = None;
                 let mut sent = 0usize;
-                for (off_i, last) in chunk.iter_mut().enumerate() {
-                    let i = c * chunk_len + off_i;
+                for (i, last) in chunk.iter_mut() {
+                    let i = *i;
                     let start = pipe_start[i] as usize;
                     for (off, l) in last.iter_mut().enumerate() {
                         let k = start + off;
@@ -1104,6 +1405,8 @@ impl Retina {
                 }
             });
         }
+        self.last_contrib = contribs;
+        for d in &mut self.weights_dirty { *d = false; }
         if sent > 0 { self.dirty = true; }
         self.stats.pipes_sent = sent;
         sent
@@ -1111,16 +1414,21 @@ impl Retina {
 
     /// One retina step: relink if the view or the links moved, then arrive.
     pub fn tick(&mut self, sources: &[Source], view_proj: Mat4, aabb_min: Vec3, aabb_max: Vec3, force_relink: bool, atten_k: f32) {
-        if force_relink || self.needs_relink(sources, view_proj, aabb_min, aabb_max) {
+        let kind = if force_relink { RelinkKind::Full } else { self.relink_kind(sources, view_proj, aabb_min, aabb_max) };
+        if kind != RelinkKind::None {
             // The hash lives in the retina so its static half survives the
-            // tick; take it out for the duration so `relink` can borrow `self`
-            // mutably, and hand it straight back.
+            // tick; take it out for the duration so the relink can borrow
+            // `self` mutably, and hand it straight back.
             let mut hash = std::mem::take(&mut self.hash);
             let t0 = std::time::Instant::now();
             hash.update(sources);
             let build_ms = t0.elapsed().as_secs_f32() * 1000.0;
-            let eye = eye_from_view_proj(view_proj);
-            self.relink(sources, &hash, view_proj, eye, aabb_min, aabb_max, atten_k);
+            if kind == RelinkKind::Full {
+                let eye = eye_from_view_proj(view_proj);
+                self.relink(sources, &hash, view_proj, eye, aabb_min, aabb_max, atten_k);
+            } else {
+                self.relink_partial(sources, &hash, aabb_min, aabb_max, atten_k);
+            }
             self.stats.hash_build_ms = build_ms;
             self.hash = hash;
         }
@@ -1145,11 +1453,12 @@ impl Retina {
         let above = self.receptors.iter().filter(|r| r.density_f() >= RETINA_ISO).count();
         let max_d = self.receptors.iter().map(|r| r.density_f()).fold(0.0f32, f32::max);
         log::info!(
-            "Retina {}x{}: {} receptors ≥ iso ({:.1}%), max density {:.2}; pipes {} total / {} sent last tick; mean τ {:.3}; {} relinks (last {:.2} ms)",
+            "Retina {}x{}: {} receptors ≥ iso ({:.1}%), max density {:.2}; pipes {} total / {} sent last tick by {} sources; {} sources hidden; mean τ {:.3}; {} relinks, {} of them partial (last {:.2} ms)",
             self.width, self.height, above,
             100.0 * above as f64 / self.receptors.len().max(1) as f64, max_d,
-            self.stats.pipes_total, self.stats.pipes_sent, self.stats.mean_trans,
-            self.stats.relinks, self.stats.relink_ms,
+            self.stats.pipes_total, self.stats.pipes_sent, self.stats.sources_arrived,
+            self.stats.hidden_sources, self.stats.mean_trans,
+            self.stats.relinks, self.stats.partial_relinks, self.stats.relink_ms,
         );
         log::info!(
             "Retina relink breakdown: hash build {:.2} ms + relink {:.2} ms (footprints {:.2}, pipes {:.2}, τ {:.2})",
@@ -1792,6 +2101,7 @@ mod tests {
     /// concatenated. The layout that comes out has to be the one the serial
     /// loop produced: entity order, row-major within a footprint, `pipe_start`
     /// the prefix sum of `pipe_count`. Enough sources here to span many chunks.
+    /// Hidden sources are in the layout with an empty run.
     #[test]
     fn chunked_pipe_build_matches_the_serial_layout() {
         let (w, h) = (63u32, 35u32);
@@ -1814,8 +2124,10 @@ mod tests {
         let mut want_rec: Vec<u32> = Vec::new();
         let mut want_w: Vec<f32> = Vec::new();
         let mut want_start: Vec<u32> = Vec::new();
-        for s in &sources {
+        assert!(r.hidden.iter().any(|&x| x) && !r.hidden.iter().all(|&x| x), "want some hidden, some not");
+        for (i, s) in sources.iter().enumerate() {
             want_start.push(want_rec.len() as u32);
+            if r.hidden[i] { continue; }
             let Some(fp) = footprint(&vp, w, h, s) else { continue; };
             let u0 = fp.u0.floor().max(0.0) as i64;
             let u1 = fp.u1.ceil().min(w as f32 - 1.0) as i64;
@@ -2280,6 +2592,155 @@ mod tests {
                 assert!(x.sharp_f() > 1e-4, "receptor {} has density {} but sharp {}", i, x.density_f(), x.sharp_f());
             }
         }
+    }
+
+    /// A static wall with a mover in front of it and a second static source the
+    /// wall hides. Opacity 0 everywhere: τ is 1, so the pictures below depend
+    /// on the pipes and their weights alone.
+    fn wall_scene() -> Vec<Source> {
+        let mut wall = src(Vec3::new(0.0, 0.0, -20.0), Vec3::splat(6.0), 0.0);
+        wall.density = 10.0;
+        wall.is_static = true;
+        let mut buried = src(Vec3::new(0.5, 0.0, -30.0), Vec3::splat(1.0), 0.0);
+        buried.density = 3.0;
+        buried.is_static = true;
+        let mut beside = src(Vec3::new(14.0, 0.0, -30.0), Vec3::splat(2.0), 0.0);
+        beside.density = 3.0;
+        beside.is_static = true;
+        let mut mover = src(Vec3::new(-3.0, 1.0, -10.0), Vec3::splat(1.0), 0.0);
+        mover.density = 5.0;
+        mover.color = [5.0, 0.0, 0.0];
+        vec![wall, buried, beside, mover]
+    }
+
+    /// A source everything of which is behind HIDDEN_AT isos of density gives
+    /// its pipes back; one that pokes out keeps all of them. What the picture
+    /// shows does not change: only density above the iso, which nothing reads.
+    #[test]
+    fn a_source_wholly_behind_a_surface_is_linked_with_no_pipes() {
+        let (w, h) = (63u32, 35u32);
+        let sources = wall_scene();
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.tick(&sources, test_view_proj(w, h), lo, hi, false, ATTEN_K_DEFAULT);
+        assert_eq!(r.pipes_of(1).count(), 0, "the buried source kept its pipes");
+        assert!(r.pipes_of(0).count() > 0 && r.pipes_of(2).count() > 0 && r.pipes_of(3).count() > 0);
+        assert_eq!(r.stats.hidden_sources, 1);
+        assert_receptors_match(&r, &sources);
+
+        // The same scene without the buried source draws the same picture.
+        let mut without = sources.clone();
+        without[1].drawable = false;
+        let mut r2 = Retina::new(w, h);
+        r2.tick(&without, test_view_proj(w, h), lo, hi, false, ATTEN_K_DEFAULT);
+        assert_eq!(r.receptors, r2.receptors);
+    }
+
+    /// What only a *mover* hides must stay linked: the mover will step aside,
+    /// and a partial relink never relinks the static scene.
+    #[test]
+    fn a_static_source_hidden_only_by_a_mover_keeps_its_pipes() {
+        let (w, h) = (63u32, 35u32);
+        let mut sources = wall_scene();
+        sources[0].is_static = false; // the wall is a mover now
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.tick(&sources, test_view_proj(w, h), lo, hi, false, ATTEN_K_DEFAULT);
+        assert!(r.pipes_of(1).count() > 0, "a static source was hidden by a mover");
+        assert_eq!(r.stats.hidden_sources, 0);
+        // It is still *dimmed* by the mover: behind a surface it shows nothing.
+        assert!(r.sharp_of(1).all(|ws| ws == 0.0));
+    }
+
+    /// Camera still, a mover moves: only its pipes are relinked, and the
+    /// picture is exactly the one a full relink of the same scene draws.
+    #[test]
+    fn a_partial_relink_draws_what_a_full_one_would() {
+        let (w, h) = (63u32, 35u32);
+        let vp = test_view_proj(w, h);
+        let mut sources = wall_scene();
+        let (lo, hi) = (Vec3::new(-30.0, -10.0, -40.0), Vec3::new(30.0, 10.0, -5.0));
+        let mut r = Retina::new(w, h);
+        r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        let static_pipes: Vec<Vec<(u32, f32)>> = (0..3).map(|i| r.pipes_of(i).collect()).collect();
+
+        for step in 1..=6 {
+            sources[3].position.x += 1.1;
+            assert_eq!(r.relink_kind(&sources, vp, lo, hi), RelinkKind::Partial);
+            r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+            assert_eq!(r.stats.partial_relinks, step);
+            assert_eq!(r.stats.relinks, 1 + step);
+            assert_receptors_match(&r, &sources);
+
+            let mut fresh = Retina::new(w, h);
+            fresh.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+            assert_eq!(fresh.stats.partial_relinks, 0);
+            for i in 0..sources.len() {
+                assert_eq!(r.pipes_of(i).collect::<Vec<_>>(), fresh.pipes_of(i).collect::<Vec<_>>(), "step {} source {} pipes", step, i);
+                assert_eq!(r.sharp_of(i).collect::<Vec<_>>(), fresh.sharp_of(i).collect::<Vec<_>>(), "step {} source {} sharp weights", step, i);
+            }
+            assert_eq!(r.receptors, fresh.receptors, "step {}", step);
+        }
+        // The static scene was never touched.
+        for i in 0..3 {
+            assert_eq!(r.pipes_of(i).collect::<Vec<_>>(), static_pipes[i]);
+        }
+
+        // A static source that moves, or a camera that does, is a full relink.
+        sources[2].position.x -= 1.0;
+        assert_eq!(r.relink_kind(&sources, vp, lo, hi), RelinkKind::Full);
+        sources[2].position.x += 1.0;
+        let shove = Mat4::from_translation(Vec3::new(0.5, 0.0, 0.0));
+        assert_eq!(r.relink_kind(&sources, vp * shove, lo, hi), RelinkKind::Full);
+    }
+
+    /// A mover that walks behind the wall becomes hidden, and comes back out.
+    #[test]
+    fn a_mover_can_hide_and_reappear_across_partial_relinks() {
+        let (w, h) = (63u32, 35u32);
+        let vp = test_view_proj(w, h);
+        let mut sources = wall_scene();
+        sources[3].position = Vec3::new(20.0, 0.0, -30.0);
+        let (lo, hi) = (Vec3::new(-30.0, -10.0, -40.0), Vec3::new(30.0, 10.0, -5.0));
+        let mut r = Retina::new(w, h);
+        r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        assert!(r.pipes_of(3).count() > 0);
+        let mut was_hidden = false;
+        for _ in 0..40 {
+            sources[3].position.x -= 1.0;
+            r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+            assert_receptors_match(&r, &sources);
+            let mut fresh = Retina::new(w, h);
+            fresh.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+            assert_eq!(r.receptors, fresh.receptors, "mover at x = {}", sources[3].position.x);
+            was_hidden |= r.pipes_of(3).count() == 0 && r.stats.hidden_sources == 2;
+        }
+        assert!(was_hidden, "the mover never hid behind the wall");
+        assert!(r.pipes_of(3).count() > 0, "the mover never came back out");
+        assert!(r.stats.partial_relinks >= 39);
+    }
+
+    /// A settled scene costs nothing per pipe: a source whose offer and
+    /// weights are what they were is skipped whole.
+    #[test]
+    fn arrive_skips_sources_with_nothing_new_to_say() {
+        let (w, h) = (63u32, 35u32);
+        let vp = test_view_proj(w, h);
+        let mut sources = wall_scene();
+        let (lo, hi) = box_of(&sources);
+        let mut r = Retina::new(w, h);
+        r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        assert_eq!(r.stats.sources_arrived, 3, "every linked source arrives once");
+        r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        assert_eq!((r.stats.sources_arrived, r.stats.pipes_sent), (0, 0));
+        // Below the pipes' fixed point: not a new offer.
+        sources[2].density += 4e-6;
+        r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        assert_eq!(r.stats.sources_arrived, 0);
+        sources[2].density += 0.5;
+        r.tick(&sources, vp, lo, hi, false, ATTEN_K_DEFAULT);
+        assert_eq!(r.stats.sources_arrived, 1);
+        assert_receptors_match(&r, &sources);
     }
 
     #[test]
