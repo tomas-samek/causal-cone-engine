@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://tomas-samek.github.io/banners/dark/causal-cone-engine.svg">
+  <img alt="causal-cone-engine: Light is delivered, not gathered" src="https://tomas-samek.github.io/banners/light/causal-cone-engine.svg" width="100%">
+</picture>
+
 # Causal Cone Engine
 
 > A personal pet project — an experimental renderer, built for fun and exploration.
