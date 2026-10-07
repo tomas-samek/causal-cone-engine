@@ -9,6 +9,8 @@ Entities push light along a graph of connections, one hop per tick, and the
 observer is a **receptor array** on the image plane that those same pipes feed.
 What you see is what has already arrived at it.
 
+🌐 **More projects and writing:** [tomas-samek.github.io](https://tomas-samek.github.io/)
+
 ## Build & Run
 
 ```bash
